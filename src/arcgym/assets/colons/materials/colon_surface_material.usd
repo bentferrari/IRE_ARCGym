@@ -1,0 +1,50 @@
+#usda 1.0
+(
+    defaultPrim = "Root"
+    doc = """Generated from Composed Stage of root layer /home/hans/projects/arcgym/src/arcgym/assets/colons/materials/colon_surface_material.usd
+"""
+    upAxis = "Z"
+)
+
+def Xform "Root"
+{
+    def Material "OmniSurface"
+    {
+        token outputs:mdl:displacement.connect = </Root/OmniSurface/Shader.outputs:out>
+        token outputs:mdl:surface.connect = </Root/OmniSurface/Shader.outputs:out>
+        token outputs:mdl:volume.connect = </Root/OmniSurface/Shader.outputs:out>
+        custom uniform bool paused = 0 (
+            customData = {
+                bool nonpersistant = 1
+            }
+            hidden = true
+        )
+        token ui:displayGroup = "Material Graphs"
+        token ui:displayName = "OmniSurface"
+        int ui:order = 1024
+        uniform token[] xformOpOrder = []
+
+        def Shader "Shader"
+        {
+            uniform token info:implementationSource = "sourceAsset"
+            uniform asset info:mdl:sourceAsset = @OmniSurface.mdl@
+            uniform token info:mdl:sourceAsset:subIdentifier = "OmniSurface"
+            asset inputs:diffuse_reflection_color_image = @../textures/colon_texture_test.png@ (
+                colorSpace = "auto"
+            )
+            float inputs:diffuse_reflection_weight = 0.39999998
+            bool inputs:enable_diffuse_transmission = 1
+            float inputs:specular_reflection_roughness = 0.099999994
+            float inputs:specular_reflection_weight = 0.099999994
+            float inputs:subsurface_weight = 0.19999999
+            int inputs:uvw_projection_mode = 6
+            float inputs:uvw_s_scale = 10
+            float inputs:uvw_t_scale = 10
+            int inputs:uvw_texture_coordinate_system = 1
+            token outputs:out (
+                renderType = "material"
+            )
+        }
+    }
+}
+

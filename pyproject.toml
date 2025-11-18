@@ -1,0 +1,47 @@
+[project]
+name = "arcgym"
+version = "0.1.0"
+description = "Colon Simulation Gym using IsaacLab"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "isaaclab>=2.1.0",
+    "isaacsim[all,extscache]==4.5.0",
+    "isaaclab>=2.1.0",
+    "numpy>=1.26.4",
+    "pip",
+    "usd-core>=25.5.1",
+    "rsl-rl-lib",
+    "seaborn>=0.13.2",
+    "sane-rich-logging>=1.0.3",
+    "stable-baselines3>=2.7.0",
+    "opencv-python>=4.11.0.86",
+    "pillow>=11.0.0",
+    #"depth-anything-v2",
+]
+
+[tool.uv.sources]
+isaacsim = [
+    { index = "nvidia-pypi" }
+]
+isaaclab = [
+    { index = "nvidia-pypi" }
+]
+rsl-rl = { git = "https://github.com/leggedrobotics/rsl_rl.git", tag = "v2.0.0" }
+#depth-anything-v2 = { git = "https://github.com/DepthAnything/Depth-Anything-V2.git" }
+
+[[tool.uv.index]]
+name = "nvidia-pypi"
+url = "https://pypi.nvidia.com"
+explicit = true
+
+[project.scripts]
+isaac-run = "arcgym.scripts.run_isaac:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/arcgym"]
+
