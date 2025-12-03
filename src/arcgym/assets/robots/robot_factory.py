@@ -1,6 +1,7 @@
 from arcgym.assets.robots.base_robot import BaseRobot
 from arcgym.assets.robots.capsule import RobotEndoscopeCapsule
 from arcgym.assets.robots.robot_endoscope_soft import RobotEndoscopeChain
+from arcgym.assets.robots.magnetic_endoscope import RobotEndoscopeChain
 
 class RobotFactory:
     def __init__(self, config: dict, device="cuda"):
@@ -12,6 +13,8 @@ class RobotFactory:
         if self.robot_type == "capsule":
             self.isaac_robot_cfg = RobotEndoscopeCapsule.make_isaac_config(self.config)
         elif self.robot_type == "soft_endoscope":
+            self.isaac_robot_cfg = RobotEndoscopeChain.make_isaac_config(self.config)
+        elif self.robot_type == "magnetic_endoscope":
             self.isaac_robot_cfg = RobotEndoscopeChain.make_isaac_config(self.config)
         else:
             raise ValueError(f"Unknown robot type in config: {self.robot_type}")
@@ -29,6 +32,8 @@ class RobotFactory:
         if self.robot_type == "capsule":
             return RobotEndoscopeCapsule(scene, self.config, self.isaac_robot_cfg, init_pos, init_rot, self.device)
         elif self.robot_type == "soft_endoscope":
+            return RobotEndoscopeChain(scene, self.config, self.isaac_robot_cfg, init_pos, init_rot, self.device)
+        elif self.robot_type == "magnetic_endoscope":
             return RobotEndoscopeChain(scene, self.config, self.isaac_robot_cfg, init_pos, init_rot, self.device)
         else:
             raise ValueError(f"Unknown robot type: {self.robot_type}")

@@ -5,17 +5,15 @@ import pdb
 import numpy as np
 import gymnasium as gym
 from gymnasium.spaces import Box, Dict, Discrete
-from pxr import Usd, UsdGeom, UsdPhysics, Gf, Sdf, UsdShade
+from pxr import Usd, UsdGeom, UsdPhysics, Gf, Sdf, UsdShade, PhysxSchema
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.sensors import CameraCfg, TiledCamera, TiledCameraCfg
 from isaaclab.sim.spawners.lights import SphereLightCfg
 from isaaclab.sensors import ContactSensorCfg, ContactSensor
-from isaaclab.utils.math import quat_from_euler_xyz, combine_frame_transforms
+from isaaclab.utils.math import quat_apply
 from arcgym.assets.robots.base_robot import BaseRobot
 from isaaclab.actuators import ImplicitActuatorCfg
-from isaaclab.utils.math import quat_apply
-from isaaclab.utils.math import quat_from_euler_xyz, quat_mul
 
 class RobotEndoscopeChain(BaseRobot):
     def __init__(self, scene, config, isaac_cfg, init_pos, init_rot, device):
@@ -47,10 +45,13 @@ class RobotEndoscopeChain(BaseRobot):
             logging.info("Camera created")
 
         logging.info("Creating front light...")
-        light_paths = f"/World/envs/env_.*/Robot/tip_light"
+        # Attach light to passive_0 at the camera position (+X end)
+        light_paths = "/World/envs/env_.*/Robot/passive_0/front_light"
+        link_height = self.config["robot_config"].get("link_height", 0.05)
         self.egolight = sim_utils.spawn_light(
             prim_path=light_paths,
-            cfg=self.isaac_cfg.light_cfg
+            cfg=self.isaac_cfg.light_cfg,
+            translation=(link_height, 0.0, 0.0)  # Same position as camera at +X end
         )
         logging.info("Light created")
 
@@ -59,63 +60,55 @@ class RobotEndoscopeChain(BaseRobot):
         logging.info("Continuum robot registered with scene")
 
     def _build_robot(self):
-        """Build multi-segment continuum robot with passive + active sections."""
+        """Build multi-segment continuum robot with 20 passive links and a 6-DoF distal link."""
         robot_config = self.config["robot_config"]
         PASSIVE_COLOR = Gf.Vec3f(0.5, 0.5, 0.5)  # Grey
-        BASE_COLOR    = Gf.Vec3f(0.8, 0.2, 0.2)  # Red
-        ACTIVE_COLOR  = Gf.Vec3f(0.2, 0.8, 0.2)  # Green
-        num_passive = robot_config.get("num_passive_segments", robot_config.get("num_passive_links", 20))
-        num_active = robot_config.get("num_active_segments", robot_config.get("num_active_links", 5))
-        
-        logging.info(f"Building robot with num_passive={num_passive}, num_active={num_active}")
+        BASE_COLOR    = Gf.Vec3f(0.8, 0.2, 0.2)  # Red (unused now but kept)
+        ACTIVE_COLOR  = Gf.Vec3f(0.2, 0.8, 0.2)  # Green (unused now but kept)
+
+        # Original config values (kept for compatibility, but overridden)
+        num_passive_cfg = robot_config.get("num_passive_segments", robot_config.get("num_passive_links", 20))
+        num_active_cfg = robot_config.get("num_active_segments", robot_config.get("num_active_links", 5))
+
+        # === Enforce: 20 links total, all passive, last link on D6 joint ===
+        num_links_total = robot_config.get("num_links_total", 20)
+        num_passive = num_links_total
+        num_active = 0  # no active section anymore
+
+        logging.info(f"Building robot with TOTAL_LINKS={num_links_total} (num_passive={num_passive}, num_active={num_active})")
         
         link_radius = robot_config.get("link_radius", 0.01)
         link_height = robot_config.get("link_height", 0.05)
         passive_stiffness = robot_config.get("passive_stiffness", 1e5)
         passive_damping = robot_config.get("passive_damping", 1e3)
-        active_stiffness = robot_config.get("active_stiffness", 1e6)
-        active_damping = robot_config.get("active_damping", 1e4)
 
-        self.num_joints = num_passive - 1 + num_active
-        self.active_joint_indices = list(range(num_passive - 1, num_passive - 1 + num_active))
+        # 20 links -> 19 joints in the chain. All passive, no "active" joint indices.
+        self.num_joints = num_passive - 1
+        self.active_joint_indices = []  # all joints passive; no actively-driven section
         
         logging.info(f"Active joint indices: {self.active_joint_indices}, count: {len(self.active_joint_indices)}")
 
-        prim_paths = f"/World/envs/env_.*/Robot"
+        # Articulation root at passive_0 (the tip with camera)
+        prim_paths = f"/World/envs/env_.*/Robot/passive_0"
 
         # === Define Actuators ===
         actuators = {}
 
-        # Passive joints
+        # Passive joints with PD actuators
+        # passive_0 is the root (no joint)
+        # passive_1 onwards connect via revolute joints (passive_1_joint, passive_2_joint, ...)
         for i in range(1, num_passive):
             joint_name = f"passive_{i}_joint"
             actuators[joint_name] = ImplicitActuatorCfg(
                 joint_names_expr=[f".*{joint_name}"],
-                effort_limit=1e10,
-                velocity_limit=100.0,
+                effort_limit=1e1,
+                velocity_limit=10.0,
                 stiffness=passive_stiffness,
                 damping=passive_damping,
             )
 
-        # Base joint
-        actuators["base_joint"] = ImplicitActuatorCfg(
-            joint_names_expr=[".*base_joint"],
-            effort_limit=1e10,
-            velocity_limit=100.0,
-            stiffness=passive_stiffness,
-            damping=passive_damping,
-        )
-
-        # Active joints
-        for i in range(1, num_active + 1):
-            joint_name = f"link_{i}_joint"
-            actuators[joint_name] = ImplicitActuatorCfg(
-                joint_names_expr=[f".*{joint_name}"],
-                effort_limit=1e10,
-                velocity_limit=100.0,
-                stiffness=active_stiffness,
-                damping=active_damping,
-            )
+        # No base_joint, no active joints anymore
+        # (All links passively follow the root via revolute joints with PD actuators)
 
         # === Build USD ===
         stage = self.scene.stage
@@ -124,97 +117,50 @@ class RobotEndoscopeChain(BaseRobot):
         for env_id in range(self.num_envs):
             env_path = f"/World/envs/env_{env_id}/Robot"
 
-            # Root - Make it a rigid body so articulation root is properly defined
-            root_prim = UsdGeom.Xform.Define(stage, env_path)
-            root_prim_obj = root_prim.GetPrim()
-            UsdPhysics.ArticulationRootAPI.Apply(root_prim_obj)
-            
-            # The root should NOT be a rigid body if the first link is the actual rigid body
-            # This was causing the issue - remove these lines:
-            # UsdPhysics.RigidBodyAPI.Apply(root_prim_obj)
-            # mass_api = UsdPhysics.MassAPI.Apply(root_prim_obj)
-            # mass_api.CreateDensityAttr().Set(100.0)
+            # Build chain with passive_0 as the root
+            # Structure: passive_0 (root, with camera) → passive_1 → passive_2 → ... → passive_19
 
             prev_link_path = None
 
-            # --- Passive Backbone ---
             for i in range(num_passive):
                 link_name = f"passive_{i}"
                 link_path = f"{env_path}/{link_name}"
-                pos = Gf.Vec3f(-link_height * (num_passive - i - 0.5), 0.0, link_radius)
-                self._create_link(stage, link_path, link_radius, link_height, pos,color=PASSIVE_COLOR)
+                # Generate robot along -X direction: passive_0 at x≈0, passive_1 at x≈-a, passive_2 at x≈-2a, etc.
+                pos = Gf.Vec3f(-(i + 0.5) * link_height, 0.0, link_radius)
+                self._create_link(stage, link_path, link_radius, link_height, pos, color=PASSIVE_COLOR)
 
-                if i > 0:
+                if i == 0:
+                    # passive_0: articulation root (with camera and light at +X end)
+                    link_prim = stage.GetPrimAtPath(link_path)
+                    UsdPhysics.ArticulationRootAPI.Apply(link_prim)
+                else:
+                    # passive_1 onwards: revolute joints connecting to previous link
+                    # Connect at -X end of previous link to +X end of current link
                     axis = "Z" if i % 2 == 1 else "Y"
                     self._create_revolute_joint(
                         stage=stage,
                         joint_name=f"{link_name}_joint",
                         body0_path=prev_link_path,
                         body1_path=link_path,
-                        local_pos0=Gf.Vec3f(link_height / 2, 0, 0),
-                        local_pos1=Gf.Vec3f(-link_height / 2, 0, 0),
+                        local_pos0=Gf.Vec3f(-link_height / 2, 0, 0),  # -X end of previous link
+                        local_pos1=Gf.Vec3f(link_height / 2, 0, 0),   # +X end of current link
                         axis=axis,
                         stiffness=passive_stiffness,
                         damping=passive_damping,
                         target_pos=0.0
                     )
+
                 prev_link_path = link_path
 
-            # --- Base Link ---
-            base_path = f"{env_path}/base_link"
-            base_pos = Gf.Vec3f(0.0, 0.0, link_radius)
-            self._create_link(stage, base_path, link_radius, link_height, base_pos,color=BASE_COLOR)
+            # --- No Base Link / Active Links / Tip ---
+            # passive_0 is the root, passive_19 is the distal end
 
-            axis = "Z" if num_passive % 2 == 1 else "Y"
-            self._create_revolute_joint(
-                stage=stage,
-                joint_name="base_joint",
-                body0_path=prev_link_path,
-                body1_path=base_path,
-                local_pos0=Gf.Vec3f(link_height / 2, 0, 0),
-                local_pos1=Gf.Vec3f(-link_height / 2, 0, 0),
-                axis=axis,
-                stiffness=passive_stiffness,
-                damping=passive_damping,
-                target_pos=0.0
-            )
-            prev_link_path = base_path
-
-            # --- Active Links ---
-            for i in range(1, num_active + 1):
-                link_name = f"link_{i}"
-                link_path = f"{env_path}/{link_name}"
-                pos = Gf.Vec3f(link_height * i, 0.0, link_radius)
-                self._create_link(stage, link_path, link_radius, link_height, pos, color=ACTIVE_COLOR)
-
-                axis = "Z" if i % 2 == 1 else "Y"
-                self._create_revolute_joint(
-                    stage=stage,
-                    joint_name=f"{link_name}_joint",
-                    body0_path=prev_link_path,
-                    body1_path=link_path,
-                    local_pos0=Gf.Vec3f(link_height / 2, 0, 0),
-                    local_pos1=Gf.Vec3f(-link_height / 2, 0, 0),
-                    axis=axis,
-                    stiffness=active_stiffness,
-                    damping=active_damping,
-                    target_pos=0.0
-                )
-                prev_link_path = link_path
-
-            # --- Tip Mount ---
-            tip_path = f"{env_path}/tip"
-            tip_prim = UsdGeom.Xform.Define(stage, tip_path)
-            tip_prim.AddTranslateOp().Set(Gf.Vec3f(link_height / 2, 0, 0))
-
-            # # --- Create a hollow tube around the robot for this env ---
+            # --- Create a hollow tube around the robot for this env ---
             # tube_path = f"{env_path}/Tube"
-            # # position: center the tube on robot base; adjust Z or other axis if needed
             # tube_pos = Gf.Vec3f(0.2882,  0.2539, 0.0)  # tweak so tube encloses the robot
-            # # choose sizes to enclose your robot (example values - tune to your robot dimensions)
-            # inner_r = link_radius + 0.009    # slightly larger than robot outer radius
+            # inner_r = link_radius + 0.009
             # thickness = 0.003
-            # length = (num_passive + num_active+15) * link_height  # span whole robot
+            # length = (num_passive + 15) * link_height  # span whole robot
             # self._create_hollow_tube(stage, tube_path,
             #                          inner_radius=inner_r,
             #                          thickness=thickness,
@@ -225,7 +171,6 @@ class RobotEndoscopeChain(BaseRobot):
             #                          position=tube_pos,
             #                          color=Gf.Vec3f(0.9, 0.9, 0.9),
             #                          static=True)
-
 
             # Diagnostic: list children under this environment to help detect missing prims
             try:
@@ -240,7 +185,6 @@ class RobotEndoscopeChain(BaseRobot):
                 logging.warning(f"Failed listing children for env {env_id}: {e}")
 
         # === ArticulationCfg ===
-        # The spawn=None tells IsaacLab that USD prims already exist
         articulation_cfg = ArticulationCfg(
             prim_path=prim_paths,
             spawn=None,  # USD already created above
@@ -253,13 +197,12 @@ class RobotEndoscopeChain(BaseRobot):
         )
 
         # Create the Articulation object
-        # The scene's setup will properly initialize it later
         self.robot = Articulation(articulation_cfg)
 
         logging.info(f"Articulation created with {len(actuators)} actuator groups")
 
     def _create_link(self, stage, path, radius, height, position, color: Gf.Vec3f):
-        cyl = UsdGeom.Cylinder.Define(stage, path)
+        cyl = UsdGeom.Capsule.Define(stage, path)
         cyl.CreateRadiusAttr().Set(radius)
         cyl.CreateHeightAttr().Set(height)
         cyl.CreateAxisAttr().Set("X")
@@ -275,8 +218,13 @@ class RobotEndoscopeChain(BaseRobot):
         UsdPhysics.RigidBodyAPI.Apply(prim)
         UsdPhysics.CollisionAPI.Apply(prim)
         mass_api = UsdPhysics.MassAPI.Apply(prim)
-        mass_api.CreateDensityAttr().Set(1000.0)
-        
+        #mass_api.CreateDensityAttr().Set(1000.0)
+        mass_api.CreateMassAttr().Set(100)
+
+        # Disable gravity for this rigid body
+        physx_rigid_body_api = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+        physx_rigid_body_api.CreateDisableGravityAttr().Set(False)
+
         # Enable contact reporting
         prim.SetCustomData({"physxContactReport:enabled": True})
 
@@ -292,12 +240,61 @@ class RobotEndoscopeChain(BaseRobot):
         joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0))
         joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0))
 
+        # Set joint limits to prevent excessive bending
+        # Limit to ±30 degrees (±0.524 radians)
+        joint.CreateLowerLimitAttr().Set(-1.0)  # degrees
+        joint.CreateUpperLimitAttr().Set(1.0)   # degrees
+
         drive = UsdPhysics.DriveAPI.Apply(joint.GetPrim(), "angular")
         drive.CreateTypeAttr().Set("position")
         drive.CreateTargetPositionAttr().Set(target_pos)
         drive.CreateStiffnessAttr().Set(stiffness)
         drive.CreateDampingAttr().Set(damping)
-        drive.CreateMaxForceAttr().Set(1e10)
+        drive.CreateMaxForceAttr().Set(1e2)
+
+    def _create_d6_joint(self, stage, joint_name, body0_path, body1_path,
+                        local_pos0, local_pos1):
+        """
+        Create a PhysX D6-like free joint using UsdPhysics.Joint + PhysxJointAPI
+        compatible with IsaacLab (no CreateMotionXXXRel helpers).
+        Distal link is fully free relative to previous link.
+        """
+
+        joint_path = f"{body0_path}/{joint_name}"
+
+        # 1. Generic USD joint prim
+        joint = UsdPhysics.Joint.Define(stage, joint_path)
+        prim = joint.GetPrim()
+
+        # 2. Attach PhysX joint API
+        physx_joint = PhysxSchema.PhysxJointAPI.Apply(prim)
+
+        # 3. Attach bodies
+        joint.CreateBody0Rel().SetTargets([body0_path])
+        joint.CreateBody1Rel().SetTargets([body1_path])
+
+        # 4. Local frames
+        joint.CreateLocalPos0Attr().Set(local_pos0)
+        joint.CreateLocalPos1Attr().Set(local_pos1)
+        joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0))
+        joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0))
+
+        # 5. Set all 6 motions to "free"
+        # Linear DOF: X Y Z
+        prim.CreateAttribute("physics:linear:motionX", Sdf.ValueTypeNames.Token).Set("free")
+        prim.CreateAttribute("physics:linear:motionY", Sdf.ValueTypeNames.Token).Set("free")
+        prim.CreateAttribute("physics:linear:motionZ", Sdf.ValueTypeNames.Token).Set("free")
+
+        # Angular DOF: X, Y, Z
+        prim.CreateAttribute("physics:angular:motionX", Sdf.ValueTypeNames.Token).Set("free")
+        prim.CreateAttribute("physics:angular:motionY", Sdf.ValueTypeNames.Token).Set("free")
+        prim.CreateAttribute("physics:angular:motionZ", Sdf.ValueTypeNames.Token).Set("free")
+
+        return prim
+
+
+
+
 
 # ----------------------- paste below _create_revolute_joint -----------------------
     def _create_hollow_tube(self, stage, path, inner_radius=0.02, thickness=0.002,
@@ -438,9 +435,10 @@ class RobotEndoscopeChain(BaseRobot):
         camera_height, camera_width = robot_config["camera_resolution"]
 
         num_active_segments = robot_config.get("num_active_segments", robot_config.get("num_active_links", 5))
-
+        link_height = robot_config.get("link_height", 0.5)
+        # Camera attached to passive_0 (the free-floating tip with D6 joint)
         CAMERA_CFG = TiledCameraCfg(
-            prim_path="/World/envs/env_.*/Robot/tip/front_cam",
+            prim_path="/World/envs/env_.*/Robot/passive_0/front_cam",
             update_period=camera_update_period,
             height=camera_height,
             width=camera_width,
@@ -452,11 +450,17 @@ class RobotEndoscopeChain(BaseRobot):
                 clipping_range=robot_config["front_camera_clipping_range"],
             ),
             offset=TiledCameraCfg.OffsetCfg(
-                pos=(0.03, 0.0, 0.0),
-                rot=(1, 0, 0, 0),
-                convention="world"
+                # Put camera directly in front of the capsule tip
+                pos=(link_height, 0.0, 0.0),
+
+                # Rotate camera 90° around Y-axis so it looks along +X axis
+                rot=(0.5, 0.5, -0.5, -0.5),
+
+                # Offset is relative to passive_0 frame
+                convention="local"
             ),
         )
+
 
         LIGHT_CFG = SphereLightCfg(
             color=robot_config["front_light_color"],
@@ -477,120 +481,68 @@ class RobotEndoscopeChain(BaseRobot):
 
     def apply_action(self, actions: torch.Tensor, action_scale: float = 1.0) -> None:
         """
-        Apply 6-DoF action to continuum robot.
-        
-        Actions:
-            [0] left/right (NOT USED)
-            [1] up/down (NOT USED)
-            [2] forward/backward (NOT IMPLEMENTED - needs prismatic joint)
-            [3] Δpitch_total → total pitch bend (rad/s)
-            [4] Δyaw_total → total yaw bend (rad/s)
-            [5] roll/twist (NOT IMPLEMENTED - needs root rotation control)
+        Apply 6-DoF velocity commands directly to the robot root (passive_0).
+
+        Actions (per env):
+            [0] v_left_right   (m/s along local +Y, -Y)
+            [1] v_up_down      (m/s along local +Z, -Z)
+            [2] v_forward_back (m/s along local +X, -X)
+            [3] ω_roll         (rad/s around local X)
+            [4] ω_pitch        (rad/s around local Y)
+            [5] ω_yaw          (rad/s around local Z)
+
+        passive_0 (with camera) is the articulation root. The rest of the chain passively follows.
         """
         if not self._is_initialized:
             logging.warning("Cannot apply action - robot not initialized yet")
             return
-        
-        # Extract action components
-        forward_velocity = actions[:, 2]  # m/s (positive = forward, negative = backward)
-        forward_velocity = forward_velocity * action_scale
-        pitch_rate = actions[:, 3]    # rad/s
-        yaw_rate = actions[:, 4]      # rad/s
-        roll_rate = actions[:, 5]         # rad/s
-        # Time step for velocity integration
-        dt = 0.1  # Adjust based on your control frequency
-        
-        # ============================================================
-        # 1. FORWARD/BACKWARD TRANSLATION
-        # ============================================================
-        # Get current root position and orientation
 
-        current_root_state = self.robot.data.root_state_w.clone()
-        current_pos = current_root_state[:, :3]  # (num_envs, 3)
-        current_quat = current_root_state[:, 3:7]  # (num_envs, 4) - (w, x, y, z)
-        
-        # Convert quaternion to rotation matrix to get forward direction
-        # Forward direction is along the robot's X-axis in local frame
-        
-        # Local X-axis (forward direction in robot frame)
-        local_forward = torch.tensor([1.0, 0.0, 0.0], device=self.device).repeat(self.num_envs, 1)
-        
+        # Scale actions
+        actions = actions * action_scale
+
+        v_lr   = actions[:, 0]  # left/right
+        v_ud   = actions[:, 1]  # up/down
+        v_fb   = actions[:, 2]  # forward/back
+        w_roll = actions[:, 3]  # roll
+        w_pitch= actions[:, 4]  # pitch
+        w_yaw  = actions[:, 5]  # yaw
+
+        # Get current orientation to transform velocities from local to world frame
+        current_quat = self.robot.data.root_state_w[:, 3:7]  # (num_envs, 4)
+
+        # ------------------------------------------------------------
+        # 1. LINEAR VELOCITY (transform from local to world frame)
+        # ------------------------------------------------------------
+        # Local velocity vector [forward, left/right, up/down]
+        local_linear_vel = torch.stack([v_fb, v_lr, v_ud], dim=1)  # (num_envs, 3)
+
         # Transform to world frame
-        world_forward = quat_apply(current_quat, local_forward)
-        
-        # Calculate translation
-        translation = world_forward * forward_velocity.unsqueeze(1) * dt
-        new_pos = current_pos + translation
-        
-        # Update root position
-        new_root_state = current_root_state.clone()
-        new_root_state[:, :3] = new_pos
+        world_linear_vel = quat_apply(current_quat, local_linear_vel)
 
-        # ============================================================
-        # 2. ROLL/TWIST ROTATION
-        # ============================================================
-        # Create incremental roll quaternion around X-axis (longitudinal axis)
+        # ------------------------------------------------------------
+        # 2. ANGULAR VELOCITY (transform from local to world frame)
+        # ------------------------------------------------------------
+        # Local angular velocity vector [roll, pitch, yaw]
+        local_angular_vel = torch.stack([w_roll, w_pitch, w_yaw], dim=1)  # (num_envs, 3)
 
-        roll_angle = roll_rate * dt  # Convert rate to angle
-        roll_quat = quat_from_euler_xyz(
-            roll_angle, 
-            torch.zeros_like(roll_angle), 
-            torch.zeros_like(roll_angle)
-        )  # (num_envs, 4)
-        
-        # Combine with current orientation
-        new_quat = quat_mul(current_quat, roll_quat)
-        new_root_state[:, 3:7] = new_quat
-        
-        # Write the new root state to simulation
-        self.robot.write_root_state_to_sim(new_root_state)
+        # Transform to world frame
+        world_angular_vel = quat_apply(current_quat, local_angular_vel)
 
-        # ============================================================
-        # 3. PITCH AND YAW BENDING (existing logic)
-        # ============================================================
-        # Get current joint positions
-        current_joint_pos = self.robot.data.joint_pos[:, self.active_joint_indices]
-        
-        # Identify Y-axis (pitch) and Z-axis (yaw) joints
-        y_joints = []  # Pitch joints
-        z_joints = []  # Yaw joints
-        
-        for local_idx in range(len(self.active_joint_indices)):
-            link_num = local_idx + 1
-            if link_num % 2 == 1:
-                z_joints.append(local_idx)
-            else:
-                y_joints.append(local_idx)
-        
-        # Calculate target position increments
-        new_joint_pos = current_joint_pos.clone()
-        
-        if len(y_joints) > 0:
-            pitch_per_joint = (pitch_rate * dt) / len(y_joints)
-            for idx in y_joints:
-                new_joint_pos[:, idx] += pitch_per_joint
-        
-        if len(z_joints) > 0:
-            yaw_per_joint = (yaw_rate * dt) / len(z_joints)
-            for idx in z_joints:
-                new_joint_pos[:, idx] += yaw_per_joint
-        
-        # Clamp to joint limits
-        max_angle = math.pi / 4
-        new_joint_pos = torch.clamp(new_joint_pos, -max_angle, max_angle)
-        
-        # Apply smoothing
-        smoothing = 3
-        smoothed_pos = current_joint_pos + smoothing * (new_joint_pos - current_joint_pos)
-        
-        # Set joint targets
-        self.robot.set_joint_position_target(smoothed_pos, joint_ids=self.active_joint_indices)
+        # ------------------------------------------------------------
+        # 3. WRITE VELOCITIES TO SIMULATION
+        # ------------------------------------------------------------
+        # Combine into root velocity: [linear_vel (3), angular_vel (3)]
+        root_velocity = torch.cat([world_linear_vel, world_angular_vel], dim=1)  # (num_envs, 6)
+
+        # Write directly to simulation
+        self.robot.write_root_velocity_to_sim(root_velocity)
+
 
     def get_observation(self, use_pose_in_obs=False, use_camera=None) -> dict:
         use_camera = use_camera if use_camera is not None else self.use_camera
         obs = {}
 
-        if self._is_initialized:
+        if self._is_initialized and len(self.active_joint_indices) > 0:
             active_pos = self.robot.data.joint_pos[:, self.active_joint_indices]
             obs["joint_pos"] = active_pos
         else:

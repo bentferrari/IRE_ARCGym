@@ -192,11 +192,11 @@ class ARCIsaacEnv(DirectRLEnv):
         self.robot = self.robot_factory.build_robot(
             scene=self.scene,
             init_pos=(0.22, 0.16, 0.4),
-            init_rot=(0, 1, 0, 1),
-            #init_rot=(1, 0, 0, 0),
+            #init_rot=(0, 1, 0, 1),
+            init_rot=(1, 0, 0, 0),
             )
 
-        self.colon = ColonModel(self.scene, cfg=self.cfg.colon_cfg, init_pos=(0.1,0,0.2), init_rot=(1,0,0,0), is_rigid=False)
+        self.colon = ColonModel(self.scene, cfg=self.cfg.colon_cfg, init_pos=(0.5,0.5,0.1), init_rot=(0.5, 0.5, 0.5, 0.5), is_rigid=False)
 
         # Note: Keeping this here to show how to add a physics callback.
         # Register the callback

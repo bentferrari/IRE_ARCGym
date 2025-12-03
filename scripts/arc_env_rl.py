@@ -100,7 +100,7 @@ env_config = {
     "env_spacing" : 0.5,
     "num_envs" : args_cli.num_envs,
     "replicate_physics" : False,
-    "action_scale" : 0.05,
+    "action_scale" : 1,
     "debug_vis" : False,
     "episode_length_s" : 20.0,
     "constraint_point_A": 1,  # Distance from robot tip to constraint point A along the robot's local z-axis
@@ -115,21 +115,24 @@ reward_config = {
 }
 
 robot_config = {
-    "robot_type" : "soft_endoscope", # "capsule" or "soft_endoscope"
+    "robot_type" : "magnetic_endoscope", # "capsule" or "soft_endoscope" or "magnetic_endoscope"
     # Capsule config 
     "capsule_radius" : 0.004,
     "capsule_height" : 0.012,
     "collision_contact_offset" : 0.0001,
     "collision_rest_offset" : 0.0,
     # Soft endoscope specific parameters (from original soft_endoscope.py)
-    "num_passive_links" : 20,
+    "num_passive_links" : 5,
     "num_active_links" : 5,
-    "link_radius" : 0.005,
-    "link_height" : 0.008,
-    "passive_stiffness" : 1e6,
+    "num_links_total" : 40,
+    "link_radius" : 0.03,
+    "link_height" : 0.1,
+    "passive_stiffness" : 1e2,
     "passive_damping" : 1e3,
     "active_stiffness" : 1e8,
     "active_damping" : 1e3,
+    "max_linear_velocity": 1,
+    "max_angular_velocity": 1,
     #"link_density" : 0.1,
     # Camera and light configuration
     "camera_resolution" : (128, 128),
@@ -155,7 +158,7 @@ simulation_config = {
     # - ``"cpu"``: Use CPU.
     # - ``"cuda"``: Use GPU, where the device ID is inferred from :class:`~isaaclab.app.AppLauncher`'s config.
     # - ``"cuda:N"``: Use GPU, where N is the device ID. For example, "cuda:0".
-    "dt" : 1.0 / 120.0,
+    "dt" : 1.0 / 240.0,
     # The physics simulation time-step (in seconds). Default is 0.0167 seconds.
     "render_interval": 4,
     # The number of physics simulation steps per rendering step. Default is 1.
@@ -227,7 +230,7 @@ physx_config = {
     #     Each physics actor in Omniverse specifies its own solver iteration count. The solver takes
     #     the number of iterations specified by the actor with the highest iteration and clamps it to
     #     the range ``[min_position_iteration_count, max_position_iteration_count]``.
-    "max_position_iteration_count" : 255,
+    "max_position_iteration_count" : 32,
     # Maximum number of solver position iterations (rigid bodies, cloth, particles etc.). Default is 255.
     # .. note::
     #     Each physics actor in Omniverse specifies its own solver iteration count. The solver takes
@@ -239,7 +242,7 @@ physx_config = {
     #     Each physics actor in Omniverse specifies its own solver iteration count. The solver takes
     #     the number of iterations specified by the actor with the highest iteration and clamps it to
     #     the range ``[min_velocity_iteration_count, max_velocity_iteration_count]``.
-    "max_velocity_iteration_count" : 255,
+    "max_velocity_iteration_count" : 32,
     # Maximum number of solver velocity iterations (rigid bodies, cloth, particles etc.). Default is 255.
     # .. note::
     #     Each physics actor in Omniverse specifies its own solver iteration count. The solver takes

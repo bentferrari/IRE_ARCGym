@@ -28,28 +28,31 @@ COLON_GEOM_USD_CFG = UsdFileCfg(
                 scale=(0.001, 0.001, 0.001),
                 deformable_props=sim_utils.DeformableBodyPropertiesCfg(rest_offset=0.0, 
                                                                        contact_offset=0.001, 
-                                                                       self_collision=True, 
+                                                                       self_collision=False, 
                                                                        collision_simplification=False,
-                                                                       simulation_hexahedral_resolution=10,     #simulation mesh resolution, default 10
+                                                                       simulation_hexahedral_resolution=8,     #simulation mesh resolution, default 10
                                                                        ),
                 visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.7, 0.3, 0.3)),
         )
 
 COLON_GEOM_MESH_CFG = MeshFileCfg(
                 file_path=obj_model_full_path,
-                scale=(0.001, 0.001, 0.001),
-                mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
+                scale=(0.01, 0.01, 0.01),
+                mass_props=sim_utils.MassPropertiesCfg(mass=50.0),
                 deformable_props=sim_utils.DeformableBodyPropertiesCfg(rest_offset=0.0, 
-                                                                       contact_offset=0.0001, 
-                                                                       self_collision=True, 
+                                                                       contact_offset=0.001, 
+                                                                       self_collision=False, 
                                                                        collision_simplification=False,
-                                                                       simulation_hexahedral_resolution=16, #16,    #simulation mesh resolution, default 10
+                                                                       simulation_hexahedral_resolution=6, #16,    #simulation mesh resolution, default 10
+                                                                       #sleep_damping=0.5,
+                                                                       vertex_velocity_damping=5.0,
                                                                        ),
                 #visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.7, 0.3, 0.3), opacity=1),  #seems not easy to get semi-transparent vis, have to turn on interactive rendering?
                 visual_material=UsdFileCfg(usd_path=shader_full_path),
                 physics_material=DeformableBodyMaterialCfg(
-                        youngs_modulus=30000,
-                        poissons_ratio=0.45,
+                        youngs_modulus=1000,
+                        poissons_ratio=0.49, 
+                        elasticity_damping=0.6,
                         ),
                 
         )
@@ -64,7 +67,7 @@ COLON_CFG = DeformableObjectCfg(
 
 COLON_GEOM_MESH_RIGID_CFG = MeshFileCfg(
     file_path=obj_model_full_path,
-    scale=(0.001, 0.001, 0.001),
+    scale=(0.01, 0.01, 0.01),
     mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
         kinematic_enabled=True,
@@ -167,11 +170,11 @@ class ColonModelCfg:
     colon_body_cfg = COLON_CFG
     colon_body_rigid_cfg = COLON_RIGID_CFG
 
-    colon_attach_rectum_cfg = COLON_ENV_ATTACH_RECTUM_CFG
-    colon_attach_descend_cfg = COLON_ENV_ATTACH_DECEND_CFG
-    colon_attach_splenic_cfg = COLON_ENV_ATTACH_SPLENIC_CFG
-    colon_attach_hepatic_cfg = COLON_ENV_ATTACH_HEPATIC_CFG
-    colon_attach_cecum_cfg = COLON_ENV_ATTACH_CECUM_CFG
+    # colon_attach_rectum_cfg = COLON_ENV_ATTACH_RECTUM_CFG
+    # colon_attach_descend_cfg = COLON_ENV_ATTACH_DECEND_CFG
+    # colon_attach_splenic_cfg = COLON_ENV_ATTACH_SPLENIC_CFG
+    # colon_attach_hepatic_cfg = COLON_ENV_ATTACH_HEPATIC_CFG
+    # colon_attach_cecum_cfg = COLON_ENV_ATTACH_CECUM_CFG
 
 
 class ColonModel:
@@ -201,19 +204,19 @@ class ColonModel:
                 self.scene.deformable_objects['colon'] = self.colon_body
 
     def _spawn_colon_env_objs(self):
-        self.cfg.colon_attach_rectum_cfg.replace(init_state=RigidObjectCfg.InitialStateCfg(pos=(0, 0.2, 0.1)))
+        self.cfg.colon_attach_rectum_cfg.replace(init_state=RigidObjectCfg.InitialStateCfg(pos=(0, 2, 1)))
         self.colon_attach_rectum = RigidObject(cfg=self.cfg.colon_attach_rectum_cfg)
 
-        self.cfg.colon_attach_descend_cfg = COLON_ENV_ATTACH_DECEND_CFG.replace(init_state=RigidObjectCfg.InitialStateCfg(pos=(0, 0.2, 0.25)))
+        self.cfg.colon_attach_descend_cfg = COLON_ENV_ATTACH_DECEND_CFG.replace(init_state=RigidObjectCfg.InitialStateCfg(pos=(0, 2, 2.5)))
         self.colon_attach_descend = RigidObject(cfg=self.cfg.colon_attach_descend_cfg)
 
-        self.cfg.colon_attach_splenic_cfg = COLON_ENV_ATTACH_SPLENIC_CFG.replace(init_state=RigidObjectCfg.InitialStateCfg(pos=(0, 0.2, 0.4)))
+        self.cfg.colon_attach_splenic_cfg = COLON_ENV_ATTACH_SPLENIC_CFG.replace(init_state=RigidObjectCfg.InitialStateCfg(pos=(0, 2, 4)))
         self.colon_attach_splenic = RigidObject(cfg=self.cfg.colon_attach_splenic_cfg)
 
-        self.cfg.colon_attach_hepatic_cfg = COLON_ENV_ATTACH_HEPATIC_CFG.replace(init_state=RigidObjectCfg.InitialStateCfg(pos=(0.5, 0.2, 0.4)))
+        self.cfg.colon_attach_hepatic_cfg = COLON_ENV_ATTACH_HEPATIC_CFG.replace(init_state=RigidObjectCfg.InitialStateCfg(pos=(5, 2, 4)))
         self.colon_attach_hepatic = RigidObject(cfg=self.cfg.colon_attach_hepatic_cfg)
 
-        self.cfg.colon_attach_cecum_cfg = COLON_ENV_ATTACH_CECUM_CFG.replace(init_state=RigidObjectCfg.InitialStateCfg(pos=(0.25, 0.2, 0.25)))
+        self.cfg.colon_attach_cecum_cfg = COLON_ENV_ATTACH_CECUM_CFG.replace(init_state=RigidObjectCfg.InitialStateCfg(pos=(2.5, 2, 2.5)))
         self.colon_attach_cecum = RigidObject(cfg=self.cfg.colon_attach_cecum_cfg)
     
     def _attach_colon_env_objs(self):
@@ -277,17 +280,24 @@ class ColonModel:
 
     def get_entry_pos(self, env_ids: torch.Tensor = None) -> torch.Tensor:
         """Get entry positions based on lowest mesh vertices."""
-        #bottom_center = torch.tensor([0.2882, 0.2539, 0.3108]).to(self.colon_body.data.nodal_state_w.device)
-        bottom_center = torch.tensor([0.2882, 0.2539, 0.3108]).to(self.colon_body.data.nodal_state_w.device)
-        bottom_center -= torch.tensor([0.2927, 0.1686, 0.4606]).to(self.colon_body.data.nodal_state_w.device)
-        
-        #entry_pos = torch.tensor([0.7893,  0.0091,  0.2963]).to(self.colon_body.data.nodal_state_w.device)
-        entry_pos = torch.tensor([0.7893,  0.0091,  0.1]).to(self.colon_body.data.nodal_state_w.device)
-        delta_trans = torch.tensor([[0.0, 0.0, 0.0], 
-                                    [0.0, 0.5, 0.0],
-                                    [-0.5, 0.0, 0.0],
-                                    [-0.5, 0.5, 0.0],
-                                    [-1.0, 0.0, 0.0]]).to(self.colon_body.data.nodal_state_w.device)
+        # Get device from appropriate data attribute based on rigid/deformable
+        if self.is_rigid:
+            device = self.colon_body.data.body_state_w.device
+        else:
+            device = self.colon_body.data.nodal_state_w.device
+
+        #bottom_center = torch.tensor([0.2882, 0.2539, 0.3108]).to(device)
+        bottom_center = torch.tensor([0.2882, 0.2539, 0.3108]).to(device)
+        bottom_center -= torch.tensor([0.2927, 0.1686, 0.4606]).to(device)
+
+        #entry_pos = torch.tensor([0.7893,  0.0091,  0.2963]).to(device)
+        entry_pos = torch.tensor([2,  0.5,  0.3]).to(device)
+        delta_trans = torch.tensor([[0.0, 0.0, 0.0],
+                                    # [0.0, 0.5, 0.0],
+                                    # [-0.5, 0.0, 0.0],
+                                    # [-0.5, 0.5, 0.0],
+                                    # [-1.0, 0.0, 0.0]
+                                    ]).to(device)
         #print("entry_pos + delta_trans:", entry_pos + delta_trans)
         #print("self.colon_body.data.root_pos_w:", self.colon_body.data.root_pos_w)
         
@@ -298,7 +308,6 @@ class ColonModel:
     def get_targets(self, env_ids: torch.Tensor = None) -> torch.Tensor:
         entry_positions = self.get_entry_pos(env_ids)
         #print("entry_positions:", entry_positions)
-        xyz = self.colon_body.data.nodal_state_w[0,:,:3]
         #env_translation = self.colon_body.data.nodal_state_w[:, 0, :3] - xyz[0, :]
         # base_target = torch.tensor(
         #         [[entry_positions[0,0], entry_positions[0,1], entry_positions[0,2]],
@@ -335,4 +344,4 @@ class ColonModel:
         self.colon_body.reset(env_ids)
         
         # Reapply nodal attachments
-        self._attach_colon_nodals()
+        #self._attach_colon_nodals()
