@@ -25,6 +25,7 @@ class PerEnvRewardCallback(BaseCallback):
         self.episode_lengths = {}
         self.episode_counts = {}
         self.episode_stresses = {}  # Track colon stress per episode
+        self.episode_successes = {}  # Track success/failure for each episode
 
     def _on_step(self) -> bool:
         """
@@ -69,11 +70,29 @@ class PerEnvRewardCallback(BaseCallback):
                         self.episode_rewards[env_idx] = []
                         self.episode_lengths[env_idx] = []
                         self.episode_stresses[env_idx] = []
+                        self.episode_successes[env_idx] = []
                         self.episode_counts[env_idx] = 0
 
                     self.episode_rewards[env_idx].append(episode_reward)
                     self.episode_lengths[env_idx].append(episode_length)
                     self.episode_counts[env_idx] += 1
+
+                    # Check if episode was successful (goal_reached)
+                    is_success = False
+
+                    # Debug: Print what's in info for goal_reached
+                    if self.verbose > 0 and self.episode_counts[env_idx] <= 3:
+                        print(f"Debug - Env {env_idx}: 'goal_reached' in info: {'goal_reached' in info}")
+                        if 'goal_reached' in info:
+                            print(f"  goal_reached type: {type(info['goal_reached'])}")
+                            print(f"  goal_reached value: {info['goal_reached']}")
+
+                    if 'goal_reached' in info:
+                        is_success = bool(info['goal_reached'])
+                        if self.verbose > 0 and is_success:
+                            print(f"SUCCESS detected in env {env_idx}!")
+
+                    self.episode_successes[env_idx].append(1 if is_success else 0)
 
                     # Get and log colon stress if available
                     # First try to get it from info dict (most reliable)
@@ -87,16 +106,9 @@ class PerEnvRewardCallback(BaseCallback):
 
                     if 'colon_stress' in info and info['colon_stress'] is not None:
                         try:
-                            stress_tensor = info['colon_stress']
-                            if torch.is_tensor(stress_tensor):
-                                if env_idx < len(stress_tensor):
-                                    stress_value = float(stress_tensor[env_idx].cpu().item())
-                                    if self.verbose > 0:
-                                        print(f"Got stress from info (tensor): {stress_value}")
-                            elif isinstance(stress_tensor, (list, np.ndarray)):
-                                stress_value = float(stress_tensor[env_idx])
-                                if self.verbose > 0:
-                                    print(f"Got stress from info (list/array): {stress_value}")
+                            stress_value = float(info['colon_stress'])
+                            if self.verbose > 0:
+                                print(f"Got stress from info: {stress_value}")
                         except Exception as e:
                             print(f"Error extracting stress from info: {e}")
                             import traceback
@@ -121,6 +133,18 @@ class PerEnvRewardCallback(BaseCallback):
                     self.logger.record(f'rollout_per_env/env_{env_idx}_length', episode_length)
                     self.logger.record(f'rollout_per_env/env_{env_idx}_episode_count', self.episode_counts[env_idx])
 
+                    # Calculate success rate over last 10 episodes
+                    if len(self.episode_successes[env_idx]) >= 10:
+                        recent_successes_10 = self.episode_successes[env_idx][-10:]
+                    else:
+                        recent_successes_10 = self.episode_successes[env_idx]
+
+                    success_rate_10 = np.mean(recent_successes_10) if recent_successes_10 else 0.0
+
+                    # Log success rate
+                    self.logger.record(f'rollout_per_env/env_{env_idx}_success_rate_10ep', success_rate_10)
+                    self.logger.record(f'rollout_per_env/env_{env_idx}_is_success', 1 if is_success else 0)
+
                     # Log running statistics (mean over last 100 episodes per env)
                     if len(self.episode_rewards[env_idx]) >= 100:
                         recent_rewards = self.episode_rewards[env_idx][-100:]
@@ -140,9 +164,10 @@ class PerEnvRewardCallback(BaseCallback):
                         self.logger.record(f'rollout_per_env/env_{env_idx}_mean_colon_stress_100ep', np.mean(recent_stresses))
 
                     if self.verbose > 0:
-                        stress_str = f", Stress={stress_value:.2f}" if current_stress is not None and env_idx < len(current_stress) else ""
+                        stress_str = f", Stress={stress_value:.2f}" if stress_value is not None else ""
+                        success_str = f", Success={is_success}, SR10={success_rate_10:.1%}"
                         print(f"Env {env_idx} - Episode {self.episode_counts[env_idx]}: "
-                              f"Reward={episode_reward:.2f}, Length={episode_length}{stress_str}")
+                              f"Reward={episode_reward:.2f}, Length={episode_length}{stress_str}{success_str}")
 
         return True
 
@@ -158,12 +183,21 @@ class PerEnvRewardCallback(BaseCallback):
             for env_idx in sorted(self.episode_counts.keys()):
                 mean_reward = np.mean(self.episode_rewards[env_idx])
                 mean_length = np.mean(self.episode_lengths[env_idx])
+
+                # Calculate overall success rate
+                if env_idx in self.episode_successes and self.episode_successes[env_idx]:
+                    overall_success_rate = np.mean(self.episode_successes[env_idx])
+                    success_str = f", Success Rate={overall_success_rate:.1%}"
+                else:
+                    success_str = ""
+
                 stress_str = ""
                 if env_idx in self.episode_stresses and self.episode_stresses[env_idx]:
                     mean_stress = np.mean(self.episode_stresses[env_idx])
                     stress_str = f", Mean Stress={mean_stress:.2f}"
+
                 print(f"  Env {env_idx}: {self.episode_counts[env_idx]} episodes, "
-                      f"Mean Reward={mean_reward:.2f}, Mean Length={mean_length:.2f}{stress_str}")
+                      f"Mean Reward={mean_reward:.2f}, Mean Length={mean_length:.2f}{success_str}{stress_str}")
 
 
 class TrainingMetricsCallback(BaseCallback):

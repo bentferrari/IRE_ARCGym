@@ -392,8 +392,25 @@ class Sb3VecEnvWrapper(VecEnv):
 
             # Add colon_stress to all envs if available in extras
             if "colon_stress" in extras and extras["colon_stress"] is not None:
-                for idx in range(self.num_envs):
-                    infos[idx]["colon_stress"] = extras["colon_stress"]
+                colon_stress_tensor = extras["colon_stress"]
+                if isinstance(colon_stress_tensor, torch.Tensor):
+                    colon_stress_np = colon_stress_tensor.detach().cpu().numpy()
+                    for idx in range(self.num_envs):
+                        infos[idx]["colon_stress"] = float(colon_stress_np[idx])
+                else:
+                    for idx in range(self.num_envs):
+                        infos[idx]["colon_stress"] = extras["colon_stress"]
+
+            # Add goal_reached to all envs if available in extras
+            if "goal_reached" in extras and extras["goal_reached"] is not None:
+                goal_reached_tensor = extras["goal_reached"]
+                if isinstance(goal_reached_tensor, torch.Tensor):
+                    goal_reached_np = goal_reached_tensor.detach().cpu().numpy()
+                    for idx in range(self.num_envs):
+                        infos[idx]["goal_reached"] = bool(goal_reached_np[idx])
+                else:
+                    for idx in range(self.num_envs):
+                        infos[idx]["goal_reached"] = extras["goal_reached"]
 
             for idx in reset_ids:
                 # fill-in episode monitoring info

@@ -247,6 +247,10 @@ class ARCIsaacEnv(DirectRLEnv):
         if hasattr(self.reward_function, 'goal_reached_per_env') and self.reward_function.goal_reached_per_env is not None:
             self.goal_reached = self.reward_function.goal_reached_per_env.clone()
 
+        # IMPORTANT: Save goal_reached to extras BEFORE _reset_idx() gets called
+        # This ensures we capture the success state for environments that just finished
+        self.extras["goal_reached"] = self.goal_reached.clone()
+
         self.previous_states = current_states
         self.latest_rewards = rewards
         return rewards
@@ -597,8 +601,9 @@ class ARCIsaacEnv(DirectRLEnv):
         except Exception:
             colon_stress = None
 
+        # Note: goal_reached is already in self.extras (set in _get_rewards)
+        # and gets passed through super().step() into info
         info_extras = {
-            "goal_reached" : self.goal_reached,
             "l2_norm" : self.latest_l2_norm,
             "colon_stress" : colon_stress,
             }

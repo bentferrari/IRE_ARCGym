@@ -144,7 +144,7 @@ env_config = {
     "replicate_physics" : False,
     "action_scale" : 1,
     "debug_vis" : False,
-    "episode_length_s" : 1.0,
+    "episode_length_s" : 1.0,   # short episode for testing
     "constraint_point_A": 1,  # Distance from robot tip to constraint point A along the robot's local z-axis
 }
 
