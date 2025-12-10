@@ -79,8 +79,13 @@ class RobotEndoscopeCapsule(BaseRobot):
                     contact_offset=robot_config["collision_contact_offset"],
                     rest_offset=robot_config["collision_rest_offset"],
                 ),
-                #visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.2, 0.2, 0.9)),
-                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 0.0), opacity=0.0),
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(1.0, 0.5, 0.0),
+                    emissive_color=(1.0, 0.3, 0.0),
+                    metallic=0.0,
+                    roughness=0.5,
+                    opacity=1.0
+                ),
                 axis='Z',
                 activate_contact_sensors=True,             
             ),
@@ -101,8 +106,8 @@ class RobotEndoscopeCapsule(BaseRobot):
                     clipping_range=robot_config["front_camera_clipping_range"], 
                 ),
                 offset=TiledCameraCfg.OffsetCfg(
-                    pos=(0.0, 0.0, 9/4*robot_config["capsule_radius"]), # TODO: Should this not be calculated both from height and radius of capsule
-                    rot=(1, 0, 0, 0),
+                    pos=(0.0, 0.0, robot_config["capsule_height"]), # Position at top of capsule
+                    rot=(1, 0, 0, 0), # Identity rotation - camera points in +Z direction
                 ),
         )
 

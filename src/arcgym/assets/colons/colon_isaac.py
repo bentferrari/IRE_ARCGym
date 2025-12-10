@@ -23,19 +23,30 @@ obj_model_full_path = os.path.join(model_folder, "noncollapsed_0000_shell.obj")
 shader_full_path = os.path.join(model_folder, "materials/colon_surface_material.usd")
 
 
-COLON_GEOM_USD_CFG = UsdFileCfg(
-                usd_path=model_full_path,
+COLON_GEOM_MESH_CFG = MeshFileCfg(
+                file_path=obj_model_full_path,
                 scale=(0.001, 0.001, 0.001),
-                deformable_props=sim_utils.DeformableBodyPropertiesCfg(rest_offset=0.0, 
-                                                                       contact_offset=0.001, 
-                                                                       self_collision=False, 
+                mass_props=sim_utils.MassPropertiesCfg(mass=10.0),
+                deformable_props=sim_utils.DeformableBodyPropertiesCfg(
+                                                                       rest_offset=0.0,        # Increased from 0.0 to prevent tunneling
+                                                                       contact_offset=0.001,     # Increased from 0.0001 for better collision detection
+                                                                       self_collision=False,
                                                                        collision_simplification=False,
-                                                                       simulation_hexahedral_resolution=8,     #simulation mesh resolution, default 10
+                                                                       simulation_hexahedral_resolution=1, #16,    #simulation mesh resolution, default 10
+                                                                       #sleep_damping=0.5,
+                                                                       vertex_velocity_damping=5.0,
                                                                        ),
-                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.7, 0.3, 0.3)),
+                #visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.7, 0.3, 0.3), opacity=1),  #seems not easy to get semi-transparent vis, have to turn on interactive rendering?
+                visual_material=UsdFileCfg(usd_path=shader_full_path),
+                physics_material=DeformableBodyMaterialCfg(
+                        youngs_modulus=100000,
+                        poissons_ratio=0.49,
+                        elasticity_damping=30,
+                        ),
+
         )
 
-COLON_GEOM_MESH_CFG = MeshFileCfg(
+COLON_GEOM_MESH_CFG_endoscope = MeshFileCfg(
                 file_path=obj_model_full_path,
                 scale=(0.01, 0.01, 0.01),
                 mass_props=sim_utils.MassPropertiesCfg(mass=10.0),
@@ -61,6 +72,14 @@ COLON_GEOM_MESH_CFG = MeshFileCfg(
 COLON_CFG = DeformableObjectCfg(
         prim_path="/World/envs/env_.*/Colon",
         spawn=COLON_GEOM_MESH_CFG,
+        init_state=DeformableObjectCfg.InitialStateCfg(pos=(0.1, 0, 2)),
+        #rot=FLAT_ROTATION_Y,
+        debug_vis=False, #this can be turned on/off for debugging visual markers, for instance, white spheres will be created if kinematic targets are set     
+)
+
+COLON_CFG_endoscope = DeformableObjectCfg(
+        prim_path="/World/envs/env_.*/Colon",
+        spawn=COLON_GEOM_MESH_CFG_endoscope,
         init_state=DeformableObjectCfg.InitialStateCfg(pos=(0.1, 0, 2)),
         #rot=FLAT_ROTATION_Y,
         debug_vis=False, #this can be turned on/off for debugging visual markers, for instance, white spheres will be created if kinematic targets are set     
@@ -167,8 +186,8 @@ COLON_ENV_ATTACH_CECUM_CFG = RigidObjectCfg(
 class ColonModelCfg:
     is_rigid = False
     
-    geom_mesh_cfg = COLON_GEOM_MESH_CFG
     colon_body_cfg = COLON_CFG
+    colon_body_cfg_endoscope = COLON_CFG_endoscope
     colon_body_rigid_cfg = COLON_RIGID_CFG
 
     colon_attach_rectum_cfg = COLON_ENV_ATTACH_RECTUM_CFG
@@ -179,9 +198,11 @@ class ColonModelCfg:
 
 
 class ColonModel:
-    def __init__(self, scene, cfg: ColonModelCfg, init_pos=(0,0,2), init_rot=FLAT_ROTATION_Y, is_rigid=False):
+    def __init__(self, scene, cfg: ColonModelCfg, cfg1: dict, init_pos=(0,0,2), init_rot=FLAT_ROTATION_Y, is_rigid=False):
         self.scene = scene
         self.cfg = cfg
+        self.cfg1 = cfg1
+        self.robot_config = cfg1["robot_config"]  # Store robot_config as instance attribute
         self.is_rigid = is_rigid
         self.colon_body = None
         self.init_pos = init_pos
@@ -191,6 +212,8 @@ class ColonModel:
         self._setup()
 
     def _setup(self):
+        robot_type = self.robot_config.get("robot_type", None)
+        print("robot_type", robot_type)
         if self.colon_body is None:
             if self.is_rigid:
                 # Remove this line: from isaaclab.assets import RigidObject
@@ -199,10 +222,17 @@ class ColonModel:
                 ))
                 self.scene.rigid_objects['colon'] = self.colon_body
             else:
-                self.colon_body = DeformableObject(cfg=self.cfg.colon_body_cfg.replace(
-                    init_state=DeformableObjectCfg.InitialStateCfg(pos=self.init_pos, rot=self.init_rot)
-                ))
-                self.scene.deformable_objects['colon'] = self.colon_body
+                if robot_type == "capsule":
+                    self.colon_body = DeformableObject(cfg=self.cfg.colon_body_cfg.replace(
+                        init_state=DeformableObjectCfg.InitialStateCfg(pos=self.init_pos, rot=self.init_rot)
+                    ))
+                    self.scene.deformable_objects['colon'] = self.colon_body
+                else:
+                    self.colon_body = DeformableObject(cfg=self.cfg.colon_body_cfg_endoscope.replace(
+                        init_state=DeformableObjectCfg.InitialStateCfg(pos=self.init_pos, rot=self.init_rot)
+                    ))
+                    self.scene.deformable_objects['colon'] = self.colon_body
+
 
     def _spawn_colon_env_objs(self):
         self.cfg.colon_attach_rectum_cfg.replace(init_state=RigidObjectCfg.InitialStateCfg(pos=(0, 2, 1)))
@@ -340,15 +370,27 @@ class ColonModel:
         bottom_center = torch.tensor([0.2882, 0.2539, 0.3108]).to(device)
         bottom_center -= torch.tensor([0.2927, 0.1686, 0.4606]).to(device)
 
-        entry_pos = torch.tensor([2.3976, 2.9910, 0.5599]).to(device)
-        #x=2.7809, y=3.3909, z=0.6099
-        #entry_pos = torch.tensor([7.7809,  0.4000,  0.3]).to(device)
-        delta_trans = torch.tensor([[0.0, 0.0, 0.0],
-                                    # [0.0, 5, 0.0],
-                                    # [-5, 0.0, 0.0],
-                                    # [-5, 5, 0.0],
-                                    # [-10, 0.0, 0.0]
-                                    ]).to(device)
+        # 5_envs_endoscope: 7.4029,  0.5015,  0.5500
+        # 1_env_endoscope: 2.3976, 2.9910, 0.5599
+        # 5_envs_capsule: 1.0783, 0.5391, 0.1505
+        robot_type = self.robot_config.get("robot_type", None)
+        if robot_type == "capsule":
+            entry_pos = torch.tensor([1.1899, 0.4953, 0.1229]).to(device)
+            delta_trans = torch.tensor([[0.0, 0.0, 0.0],
+                                        [0.0, 0.5, 0.0],
+                                        [-0.5, 0.0, 0.0],
+                                        [-0.5, 0.5, 0.0],
+                                        [-1.0, 0.0, 0.0]
+                                        ]).to(device)
+        else:
+            entry_pos = torch.tensor([7.4029,  0.5015,  0.5500]).to(device)
+            delta_trans = torch.tensor([[0.0, 0.0, 0.0],
+                                        [0.0, 5, 0.0],
+                                        [-5, 0.0, 0.0],
+                                        [-5, 5, 0.0],
+                                        [-10, 0.0, 0.0]
+                                        ]).to(device)
+
         #print("entry_pos + delta_trans:", entry_pos + delta_trans)
         #print("self.colon_body.data.root_pos_w:", self.colon_body.data.root_pos_w)
         
@@ -443,6 +485,15 @@ class ColonModel:
 
             return lowest_positions
 
+    def print_all_lowest_positions(self):
+        """Print the lowest position for all environments."""
+        lowest_positions = self.get_all_lowest_positions()
+        print("All colons' lowest positions:")
+        for env_id in range(lowest_positions.shape[0]):
+            pos = lowest_positions[env_id]
+            print(f"  Env {env_id}: x={pos[0]:.4f}, y={pos[1]:.4f}, z={pos[2]:.4f}")
+        return lowest_positions
+
     def reset(self, env_ids: torch.Tensor = None):
         """Reset colon to initial state."""
         if env_ids is None:
@@ -456,4 +507,5 @@ class ColonModel:
 
         # Print the lowest position after reset (for environment 0)
         if 0 in env_ids or env_ids.numel() == self.colon_body.num_instances:
-            self.print_lowest_position(env_id=0)
+            self.print_all_lowest_positions()
+        print("reset!!!!!!!!!!!!!!!!!!")

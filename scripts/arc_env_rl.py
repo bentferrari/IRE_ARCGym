@@ -35,6 +35,8 @@ from stable_baselines3 import PPO, DQN, SAC
 from stable_baselines3.common.callbacks import CheckpointCallback, LogEveryNTimesteps
 from stable_baselines3.common.vec_env import VecNormalize
 
+from arcgym.utils.callbacks import PerEnvRewardCallback
+
 from isaaclab.envs import (
     DirectRLEnvCfg,
 )
@@ -91,31 +93,8 @@ learning_config = {
     "batch_size" : 1024,
     "verbose" : True,
 }
-
-env_config = {
-    "discrete_action_space" : False, # currently unsupported TODO: Figure out if this is something we want to be determinable from the outside, or if it is a property of the robot implementation.
-    "use_pose" : False,
-    "use_camera" : True,
-    "render_mode" : "rgb_array",
-    "env_spacing" : 5,
-    "num_envs" : args_cli.num_envs,
-    "replicate_physics" : False,
-    "action_scale" : 1,
-    "debug_vis" : False,
-    "episode_length_s" : 20.0,
-    "constraint_point_A": 1,  # Distance from robot tip to constraint point A along the robot's local z-axis
-}
-
-reward_config = {
-    "reward_type" : "depth_goal", #"test_reward_action",#"depth_goal",#"default",#,
-    "reward_scale" : 1.0,
-    "eps" : 0.025,
-    "running_penalty" : -0.1,
-    "goal_reward" : 50.0,
-}
-
 robot_config = {
-    "robot_type" : "magnetic_endoscope", # "capsule" or "soft_endoscope" or "magnetic_endoscope"
+    "robot_type" : "capsule", # "capsule" or "soft_endoscope" or "magnetic_endoscope"
     # Capsule config 
     "capsule_radius" : 0.004,
     "capsule_height" : 0.012,
@@ -149,6 +128,32 @@ robot_config = {
     "joint_stiffness": 1e4,  # Adjust for desired compliance
     "joint_damping": 1e3,
     "joint_friction": 0.1
+}
+if robot_config["robot_type"] == "capsule":
+    env_spacing = 0.5
+else:
+    env_spacing = 5
+
+env_config = {
+    "discrete_action_space" : False, # currently unsupported TODO: Figure out if this is something we want to be determinable from the outside, or if it is a property of the robot implementation.
+    "use_pose" : False,
+    "use_camera" : True,
+    "render_mode" : "rgb_array",
+    "env_spacing" : env_spacing,
+    "num_envs" : args_cli.num_envs,
+    "replicate_physics" : False,
+    "action_scale" : 1,
+    "debug_vis" : False,
+    "episode_length_s" : 1.0,
+    "constraint_point_A": 1,  # Distance from robot tip to constraint point A along the robot's local z-axis
+}
+
+reward_config = {
+    "reward_type" : "depth_goal", #"test_reward_action",#"depth_goal",#"default",#,
+    "reward_scale" : 1.0,
+    "eps" : 0.025,
+    "running_penalty" : -0.1,
+    "goal_reward" : 50.0,
 }
 
 simulation_config = {
@@ -423,10 +428,12 @@ if args_cli.train:
         save_path=model_save_path,
         name_prefix=f"ppo_arc_checkpoint_{timestamp}"
     )
-    
+
     log_callback = LogEveryNTimesteps(n_steps=500)
 
-    model.learn(learning_config["total_timesteps"], callback=[checkpoint_callback, log_callback])
+    per_env_reward_callback = PerEnvRewardCallback(verbose=1)
+
+    model.learn(learning_config["total_timesteps"], callback=[checkpoint_callback, log_callback, per_env_reward_callback])
     
     final_model_path = os.path.join(model_save_path, f"ppo_arc_final_{timestamp}")
     model.save(final_model_path)

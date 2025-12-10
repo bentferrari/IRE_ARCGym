@@ -156,10 +156,14 @@ class PointToPointLineDistanceReward(RewardFunction):
 class DepthDistanceReward(RewardFunction):
     def __init__(self, eps, reward_scale, **kwargs):
         self.reward_scale = reward_scale
+        self.goal_reached_per_env = None  # Will store per-environment goal status
 
     def reset(self, initial_positions, goals):
         self.initial_positions = initial_positions
         self.goals = goals
+        # Reset goal_reached status for all environments
+        num_envs = len(initial_positions)
+        self.goal_reached_per_env = torch.zeros(num_envs, dtype=torch.bool, device=initial_positions.device)
 
     def __call__(self, action, current_states, _previous_states):
         # obs = current_states["obs"] why cannot access obs?
@@ -170,6 +174,13 @@ class DepthDistanceReward(RewardFunction):
         goals = self.goals
         entry_poss = self.initial_positions
         rewards = []
+
+        # Reset goal_reached status for this step
+        if self.goal_reached_per_env is None:
+            num_envs = len(robot_positions)
+            self.goal_reached_per_env = torch.zeros(num_envs, dtype=torch.bool, device=robot_positions.device)
+        else:
+            self.goal_reached_per_env.fill_(False)
 
         for i, (robot_position, depth_img, goal, entry_pos) in enumerate(zip(robot_positions, depth_images, goals, entry_poss)):
             # print("robot_position:", robot_position)
@@ -224,12 +235,12 @@ class DepthDistanceReward(RewardFunction):
             #     reward = -1
             if d2target < 0.02:
                 reward = 1
-                self.goal_reached = True
-                print("Goal reached!")
-            print("reward", reward) 
+                self.goal_reached_per_env[i] = True
+                print(f"Goal reached in environment {i}!")
+            print("reward", reward)
             rewards.append(torch.tensor(reward,
                                  dtype=torch.float32,
-                                 device='cuda' if torch.cuda.is_available() else 'cpu')) 
+                                 device='cuda' if torch.cuda.is_available() else 'cpu'))
             #rewards.append(reward)
 
         return torch.stack(rewards)

@@ -540,12 +540,12 @@ class RobotEndoscopeChain(BaseRobot):
         self.robot.write_root_velocity_to_sim(root_velocity)
 
         # Get accumulated stress from colon after applying action
-        if self.colon is not None:
-            try:
-                stress = self.colon.get_accumulated_stress()
-                print(f"Colon accumulated stress: {stress}")
-            except Exception as e:
-                logging.debug(f"Could not get colon stress: {e}")
+        # if self.colon is not None:
+        #     try:
+        #         stress = self.colon.get_accumulated_stress()
+        #         print(f"Colon accumulated stress: {stress}")
+        #     except Exception as e:
+        #         logging.debug(f"Could not get colon stress: {e}")
 
 
     def get_observation(self, use_pose_in_obs=False, use_camera=None) -> dict:

@@ -390,6 +390,11 @@ class Sb3VecEnvWrapper(VecEnv):
         if self.fast_variant:
             infos = [{} for _ in range(self.num_envs)]
 
+            # Add colon_stress to all envs if available in extras
+            if "colon_stress" in extras and extras["colon_stress"] is not None:
+                for idx in range(self.num_envs):
+                    infos[idx]["colon_stress"] = extras["colon_stress"]
+
             for idx in reset_ids:
                 # fill-in episode monitoring info
                 infos[idx]["episode"] = {

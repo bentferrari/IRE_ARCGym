@@ -193,11 +193,11 @@ class ARCIsaacEnv(DirectRLEnv):
         self.robot = self.robot_factory.build_robot(
             scene=self.scene,
             init_pos=(0.22, 0.16, 0.4),
-            init_rot=(0, 1, 0, 1),
-            #init_rot=(1, 0, 0, 0),
+            #init_rot=(0, 1, 0, 1),
+            init_rot=(1, 0, 0, 0),
             )
 
-        self.colon = ColonModel(self.scene, cfg=self.cfg.colon_cfg, init_pos=(0.5,0.5,0.1), #init_rot=(0.5, 0.5, 0.5, 0.5),
+        self.colon = ColonModel(self.scene, cfg=self.cfg.colon_cfg, cfg1=self.config,  init_pos=(0.5,0.5,0.1), #init_rot=(0.5, 0.5, 0.5, 0.5),
         init_rot=(1.0, 0.0, 0.0, 0.0), is_rigid=False)
 
         # Pass colon reference to robot for stress calculation
@@ -243,6 +243,10 @@ class ARCIsaacEnv(DirectRLEnv):
 
         rewards = self.reward_function(self.actions, current_states, self.previous_states)
 
+        # Update goal_reached status from reward function if available
+        if hasattr(self.reward_function, 'goal_reached_per_env') and self.reward_function.goal_reached_per_env is not None:
+            self.goal_reached = self.reward_function.goal_reached_per_env.clone()
+
         self.previous_states = current_states
         self.latest_rewards = rewards
         return rewards
@@ -272,8 +276,7 @@ class ARCIsaacEnv(DirectRLEnv):
         #pdb.set_trace()
         pose=self.robot.get_pose()
         print("robot_pose",pose)
-        
-        #robot_positions = self.robot.get_pose()[:, 0, :3]
+
         robot_positions = self.robot.get_pose()[:, :3]
         depth_data = self.robot.get_depth()
 
@@ -452,39 +455,6 @@ class ARCIsaacEnv(DirectRLEnv):
 
         return obs, extras
 
-    # def _reset_idx(self, env_ids: Sequence[int]):
-    #     # Reset colon
-    #     self.colon.reset(env_ids)
-        
-    #     # CRITICAL: Step to update colon state
-    #     self.sim.step()
-        
-    #     # Get entry positions AFTER stepping
-    #     self.entry_positions = self.colon.get_entry_pos(env_ids)
-    #     self.targets = self.colon.get_targets(env_ids)
-
-    #     self.reward_function.reset(
-    #         initial_positions=self.entry_positions,
-    #         goals=self.targets,
-    #     )
-        
-    #     # Set robot position
-    #     self.robot.set_pos(self.entry_positions)
-        
-    #     # Write and forward
-    #     self.scene.write_data_to_sim()
-    #     self.sim.forward()
-        
-    #     # Reset robot
-    #     self.robot.reset(env_ids)
-
-    #     self.goal_reached[env_ids] = False
-    #     self.hit_wall[env_ids] = False
-    #     self.truncate_now[env_ids] = False
-
-    #     # Call parent reset
-    #     super()._reset_idx(env_ids)
-
     def _reset_idx(self, env_ids: Sequence[int]):
         # Call parent reset FIRST. This resets the scene and all actors to default.
         super()._reset_idx(env_ids)
@@ -621,9 +591,16 @@ class ARCIsaacEnv(DirectRLEnv):
                 # Silently catch errors if contact sensor is not available
                 pass
 
+        # Get colon stress for logging
+        try:
+            colon_stress = self.colon.get_accumulated_stress()
+        except Exception:
+            colon_stress = None
+
         info_extras = {
             "goal_reached" : self.goal_reached,
             "l2_norm" : self.latest_l2_norm,
+            "colon_stress" : colon_stress,
             }
         info.update(info_extras)
 
