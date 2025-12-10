@@ -16,13 +16,14 @@ from arcgym.assets.robots.base_robot import BaseRobot
 from isaaclab.actuators import ImplicitActuatorCfg
 
 class RobotEndoscopeChain(BaseRobot):
-    def __init__(self, scene, config, isaac_cfg, init_pos, init_rot, device):
+    def __init__(self, scene, config, isaac_cfg, init_pos, init_rot, device, colon=None):
         self.config = config
         self.isaac_cfg = isaac_cfg
         self.scene = scene
         self.device = device
         self.use_camera = config["env_config"].get("use_camera", False)
         self.num_envs = scene.num_envs
+        self.colon = colon  # Reference to ColonModel for stress calculation
 
         logging.info(f"Initializing Continuum Snake Robot at pos: {init_pos}")
 
@@ -79,7 +80,7 @@ class RobotEndoscopeChain(BaseRobot):
         
         link_radius = robot_config.get("link_radius", 0.01)
         link_height = robot_config.get("link_height", 0.05)
-        passive_stiffness = robot_config.get("passive_stiffness", 1e5)
+        passive_stiffness = robot_config.get("passive_stiffness", 1e2)
         passive_damping = robot_config.get("passive_damping", 1e3)
 
         # 20 links -> 19 joints in the chain. All passive, no "active" joint indices.
@@ -223,7 +224,7 @@ class RobotEndoscopeChain(BaseRobot):
 
         # Disable gravity for this rigid body
         physx_rigid_body_api = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
-        physx_rigid_body_api.CreateDisableGravityAttr().Set(False)
+        physx_rigid_body_api.CreateDisableGravityAttr().Set(True)
 
         # Enable contact reporting
         prim.SetCustomData({"physxContactReport:enabled": True})
@@ -453,8 +454,8 @@ class RobotEndoscopeChain(BaseRobot):
                 # Put camera directly in front of the capsule tip
                 pos=(link_height, 0.0, 0.0),
 
-                # Rotate camera 90° around Y-axis so it looks along +X axis
-                rot=(0.5, 0.5, -0.5, -0.5),
+                # Rotate camera 90° around Y-axis so it looks along +X axis, then 180° around X-axis (upside down)
+                rot=(-0.5, 0.5, 0.5, -0.5),
 
                 # Offset is relative to passive_0 frame
                 convention="local"
@@ -499,13 +500,14 @@ class RobotEndoscopeChain(BaseRobot):
 
         # Scale actions
         actions = actions * action_scale
+        print("actions", actions)
 
         v_lr   = actions[:, 0]  # left/right
         v_ud   = actions[:, 1]  # up/down
         v_fb   = actions[:, 2]  # forward/back
-        w_roll = actions[:, 3]  # roll
-        w_pitch= actions[:, 4]  # pitch
-        w_yaw  = actions[:, 5]  # yaw
+        w_roll = actions[:, 5]  # roll
+        w_pitch= -actions[:, 3]  # pitch
+        w_yaw  = actions[:, 4]  # yaw
 
         # Get current orientation to transform velocities from local to world frame
         current_quat = self.robot.data.root_state_w[:, 3:7]  # (num_envs, 4)
@@ -537,16 +539,26 @@ class RobotEndoscopeChain(BaseRobot):
         # Write directly to simulation
         self.robot.write_root_velocity_to_sim(root_velocity)
 
+        # Get accumulated stress from colon after applying action
+        if self.colon is not None:
+            try:
+                stress = self.colon.get_accumulated_stress()
+                print(f"Colon accumulated stress: {stress}")
+            except Exception as e:
+                logging.debug(f"Could not get colon stress: {e}")
+
 
     def get_observation(self, use_pose_in_obs=False, use_camera=None) -> dict:
         use_camera = use_camera if use_camera is not None else self.use_camera
         obs = {}
 
-        if self._is_initialized and len(self.active_joint_indices) > 0:
-            active_pos = self.robot.data.joint_pos[:, self.active_joint_indices]
-            obs["joint_pos"] = active_pos
-        else:
-            obs["joint_pos"] = torch.zeros((self.num_envs, len(self.active_joint_indices)), device=self.device)
+        # Only include joint_pos if there are active joints
+        if len(self.active_joint_indices) > 0:
+            if self._is_initialized:
+                active_pos = self.robot.data.joint_pos[:, self.active_joint_indices]
+                obs["joint_pos"] = active_pos
+            else:
+                obs["joint_pos"] = torch.zeros((self.num_envs, len(self.active_joint_indices)), device=self.device)
 
         if use_camera and hasattr(self, 'egocamera'):
             if hasattr(self.egocamera.data, 'output') and "rgb" in self.egocamera.data.output:
@@ -585,8 +597,70 @@ class RobotEndoscopeChain(BaseRobot):
         if init_rot is not None:
             self.init_rot = torch.tensor(init_rot, device=self.device)
 
-    def reset(self, env_ids: torch.Tensor = None) -> None:
-        """Reset robot to initial pose."""
+    def generate_random_joint_positions(
+        self,
+        num_configs: int = None,
+        max_angle: float = 0.5,
+        smoothness: float = 0.8,
+    ) -> torch.Tensor:
+        """Generate reasonable random joint configurations for the robot.
+
+        Creates smooth, physically plausible joint configurations by using adjacent
+        joint correlation to avoid sharp bends.
+
+        Args:
+            num_configs: Number of configurations to generate. If None, generates for all envs.
+            max_angle: Maximum joint angle in radians. Default: 0.5 (~28.6 degrees)
+            smoothness: Smoothness factor (0-1). Higher values create smoother curves.
+                       0 = completely random, 1 = very smooth gradual bending.
+
+        Returns:
+            Random joint positions. Shape: (num_configs, num_joints)
+        """
+        if num_configs is None:
+            num_configs = self.num_envs
+
+        num_joints = self.robot.num_joints
+
+        # Generate base random values
+        joint_positions = torch.randn(num_configs, num_joints, device=self.device)
+
+        # Apply smoothing by correlating adjacent joints
+        if smoothness > 0:
+            # Apply exponential moving average across joints for smooth bending
+            smoothed = torch.zeros_like(joint_positions)
+            alpha = 1.0 - smoothness  # Convert to decay factor
+
+            for env_idx in range(num_configs):
+                smoothed[env_idx, 0] = joint_positions[env_idx, 0]
+                for joint_idx in range(1, num_joints):
+                    # Exponential moving average: smooth blend with previous joint
+                    smoothed[env_idx, joint_idx] = (
+                        alpha * joint_positions[env_idx, joint_idx] +
+                        (1 - alpha) * smoothed[env_idx, joint_idx - 1]
+                    )
+
+            joint_positions = smoothed
+
+        # Normalize and scale to desired range
+        # Clamp to reasonable values first
+        joint_positions = torch.clamp(joint_positions, -3.0, 3.0)
+
+        # Scale to max_angle range
+        joint_positions = joint_positions * (max_angle / 3.0)
+        print("initial_joint",joint_positions)
+
+        return joint_positions
+
+    def reset(self, env_ids: torch.Tensor = None, joint_positions: torch.Tensor = None) -> None:
+        """Reset robot to initial pose with specified joint positions.
+
+        Args:
+            env_ids: Environment indices to reset. If None, resets all environments.
+            joint_positions: Desired joint positions for reset. Shape: (len(env_ids), num_joints).
+                           If None, resets to zero joint positions (straight configuration).
+                           Can pass 'random' as a string to generate random configurations.
+        """
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
 
@@ -606,16 +680,225 @@ class RobotEndoscopeChain(BaseRobot):
 
         # Write state to simulation
         self.robot.write_root_state_to_sim(root_state, env_ids)
-        
-        # Reset joint positions to zero
-        joint_pos = torch.zeros((len(env_ids), self.robot.num_joints), device=self.device)
+
+        # Set joint positions (zero, random, or specified values) with zero velocities
+        if joint_positions is None:
+            joint_pos = torch.zeros((len(env_ids), self.robot.num_joints), device=self.device)
+        elif isinstance(joint_positions, str) and joint_positions.lower() == 'random':
+            # Generate random smooth configurations
+            joint_pos = self.generate_random_joint_positions(num_configs=len(env_ids))
+        else:
+            # Validate shape
+            if joint_positions.shape != (len(env_ids), self.robot.num_joints):
+                raise ValueError(
+                    f"joint_positions shape {joint_positions.shape} doesn't match expected shape "
+                    f"({len(env_ids)}, {self.robot.num_joints})"
+                )
+            joint_pos = joint_positions.to(self.device)
+
         joint_vel = torch.zeros((len(env_ids), self.robot.num_joints), device=self.device)
+
+        # Write joint state to simulation first
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
-        
-        # Reset the articulation internal state
-        self.robot.reset(env_ids)
-        
+
+        # Compute and set individual link states based on joint configuration using forward kinematics
+        # This directly sets each link's pose in the simulation to match the joint configuration
+        self._reset_link_states_directly(env_ids, joint_pos)
+
         # Mark as initialized after first reset
         if not self._is_initialized:
             self._is_initialized = True
             logging.info("Robot initialization completed after first reset")
+
+    def _reset_link_states_directly(self, env_ids: torch.Tensor, joint_positions: torch.Tensor) -> None:
+        """Directly set each link's state in simulation based on joint configuration.
+
+        This method computes each link's position and orientation using forward kinematics,
+        then directly writes these poses to the PhysX simulation, bypassing joint constraints.
+        This ensures links are immediately positioned correctly without waiting for physics settling.
+
+        Args:
+            env_ids: Environment indices to reset.
+            joint_positions: Joint positions for the configuration. Shape: (len(env_ids), num_joints).
+        """
+        from isaaclab.utils import math as math_utils
+
+        link_radius = self.config["robot_config"].get("link_radius", 0.01)
+        link_height = self.config["robot_config"].get("link_height", 0.05)
+
+        # Get the root state for calculating relative link positions
+        root_state = self.robot.data.root_state_w[env_ids]
+        root_pos = root_state[:, :3]  # (len(env_ids), 3)
+        root_quat = root_state[:, 3:7]  # (len(env_ids), 4) - (w, x, y, z)
+
+        # Compute all link poses using forward kinematics
+        link_poses = self._compute_forward_kinematics(
+            root_pos, root_quat, joint_positions, link_height, link_radius
+        )
+
+        # Access the PhysX view to directly set body transforms
+        physx_view = self.robot.root_physx_view
+
+        # Convert env_ids to the format expected by PhysX
+        if isinstance(env_ids, torch.Tensor):
+            physx_env_ids = env_ids.cpu().numpy()
+        else:
+            physx_env_ids = env_ids
+
+        # Try to directly set link transforms in PhysX
+        # This bypasses the joint constraints and directly positions each body
+        try:
+            # Get all body transforms for the environments
+            # Shape: (num_envs, num_bodies, 7) where 7 = [pos(3), quat(4) in xyzw]
+            num_bodies = self.robot.num_bodies
+
+            # Convert quaternions from wxyz to xyzw for PhysX
+            link_poses_xyzw = link_poses.clone()
+            link_poses_xyzw[:, :, 3:] = math_utils.convert_quat(link_poses_xyzw[:, :, 3:], to="xyzw")
+
+            # Set body poses for all links at once
+            # Reshape to (num_envs * num_bodies, 7) for batch setting
+            all_poses = link_poses_xyzw.reshape(-1, 7)
+            all_velocities = torch.zeros((len(env_ids) * num_bodies, 6), device=self.device)
+
+            # Create body indices: [0, 1, 2, ..., num_bodies-1] repeated for each env
+            body_indices = torch.arange(num_bodies, device=self.device).repeat(len(env_ids))
+
+            # Create env indices: [env_0]*num_bodies + [env_1]*num_bodies + ...
+            env_indices_repeated = torch.repeat_interleave(
+                torch.tensor(physx_env_ids, device=self.device), num_bodies
+            ).cpu().numpy()
+
+            # Try the batch set method
+            if hasattr(physx_view, 'set_link_transforms'):
+                physx_view.set_link_transforms(
+                    all_poses,
+                    link_indices=body_indices.cpu().numpy(),
+                    indices=env_indices_repeated
+                )
+                physx_view.set_link_velocities(
+                    all_velocities,
+                    link_indices=body_indices.cpu().numpy(),
+                    indices=env_indices_repeated
+                )
+                logging.debug(f"Successfully set link transforms for {len(env_ids)} environments")
+            else:
+                # Fallback: Set each link individually
+                logging.debug("Using per-link transform setting (no batch API available)")
+                for link_idx in range(num_bodies):
+                    link_pose = link_poses_xyzw[:, link_idx, :]
+                    link_vel = torch.zeros((len(env_ids), 6), device=self.device)
+
+                    if hasattr(physx_view, 'set_body_transforms'):
+                        for i, env_id in enumerate(physx_env_ids):
+                            physx_view.set_body_transforms(
+                                link_pose[i:i+1],
+                                body_indices=[link_idx],
+                                indices=[env_id]
+                            )
+                            physx_view.set_body_velocities(
+                                link_vel[i:i+1],
+                                body_indices=[link_idx],
+                                indices=[env_id]
+                            )
+                    else:
+                        if link_idx == 0:
+                            logging.warning(
+                                "PhysX view doesn't support direct link transform setting. "
+                                "Relying on joint positions only. Links may take time to settle."
+                            )
+                        break
+
+        except (AttributeError, RuntimeError, TypeError) as e:
+            logging.debug(f"Could not directly set link states: {e}. Using joint-based positioning.")
+            # Not a critical error - joint positions will still work, just may need settling time
+
+    def _compute_forward_kinematics(
+        self,
+        root_pos: torch.Tensor,
+        root_quat: torch.Tensor,
+        joint_positions: torch.Tensor,
+        link_height: float,
+        link_radius: float,
+    ) -> torch.Tensor:
+        """Compute forward kinematics to get link poses from joint positions.
+
+        This computes the world position and orientation of each link based on the
+        kinematic chain and joint angles.
+
+        Args:
+            root_pos: Root link positions. Shape: (num_envs, 3)
+            root_quat: Root link orientations (w,x,y,z). Shape: (num_envs, 4)
+            joint_positions: Joint angles. Shape: (num_envs, num_joints)
+            link_height: Length of each link
+            link_radius: Radius of each link
+
+        Returns:
+            Link poses (position + quaternion) for all links. Shape: (num_envs, num_bodies, 7)
+        """
+        from isaaclab.utils import math as math_utils
+
+        num_envs = len(root_pos)
+        num_bodies = self.robot.num_bodies
+
+        # Initialize output: (num_envs, num_bodies, 7) where 7 = [pos(3), quat(4)]
+        link_poses = torch.zeros((num_envs, num_bodies, 7), device=self.device)
+
+        # Link 0 (passive_0) is the root - its pose is the root pose
+        link_poses[:, 0, :3] = root_pos
+        link_poses[:, 0, 3:7] = root_quat
+
+        # For subsequent links, compute pose based on previous link and joint angle
+        # Joint i connects link i-1 to link i
+        for link_idx in range(1, num_bodies):
+            joint_idx = link_idx - 1  # Joint index (joint_1 connects passive_0 to passive_1)
+
+            # Get previous link's pose
+            prev_pos = link_poses[:, link_idx - 1, :3]
+            prev_quat = link_poses[:, link_idx - 1, 3:7]
+
+            # Joint rotation axis alternates between Y and Z
+            # passive_1 (joint_idx=0) uses Z, passive_2 (joint_idx=1) uses Y, etc.
+            if joint_idx % 2 == 0:
+                axis = "Z"
+            else:
+                axis = "Y"
+
+            # Get joint angle for this joint
+            joint_angle = joint_positions[:, joint_idx]  # (num_envs,)
+
+            # Create rotation quaternion for the joint angle
+            if axis == "Z":
+                # Rotation around Z axis
+                axis_vec = torch.tensor([0.0, 0.0, 1.0], device=self.device)
+            else:  # axis == "Y"
+                # Rotation around Y axis
+                axis_vec = torch.tensor([0.0, 1.0, 0.0], device=self.device)
+
+            # Create quaternion from axis-angle
+            joint_quat = math_utils.quat_from_angle_axis(joint_angle, axis_vec.repeat(num_envs, 1))
+
+            # Local offset from previous link center to joint (at -X end of previous link)
+            local_offset_to_joint = torch.zeros((num_envs, 3), device=self.device)
+            local_offset_to_joint[:, 0] = -link_height / 2  # Joint at -X end
+
+            # Transform to world frame
+            world_offset_to_joint = quat_apply(prev_quat, local_offset_to_joint)
+            joint_pos = prev_pos + world_offset_to_joint
+
+            # Current link orientation = previous orientation * joint rotation
+            current_quat = math_utils.quat_mul(prev_quat, joint_quat)
+
+            # Local offset from joint to current link center (at +X end of current link in local frame)
+            local_offset_to_center = torch.zeros((num_envs, 3), device=self.device)
+            local_offset_to_center[:, 0] = link_height / 2  # Link center at +X/2 from joint
+
+            # Transform to world frame using current orientation
+            world_offset_to_center = quat_apply(current_quat, local_offset_to_center)
+            current_pos = joint_pos + world_offset_to_center
+
+            # Store link pose
+            link_poses[:, link_idx, :3] = current_pos
+            link_poses[:, link_idx, 3:7] = current_quat
+
+        return link_poses

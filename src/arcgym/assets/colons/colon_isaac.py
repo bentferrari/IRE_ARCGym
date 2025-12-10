@@ -38,23 +38,24 @@ COLON_GEOM_USD_CFG = UsdFileCfg(
 COLON_GEOM_MESH_CFG = MeshFileCfg(
                 file_path=obj_model_full_path,
                 scale=(0.01, 0.01, 0.01),
-                mass_props=sim_utils.MassPropertiesCfg(mass=50.0),
-                deformable_props=sim_utils.DeformableBodyPropertiesCfg(rest_offset=0.0, 
-                                                                       contact_offset=0.001, 
-                                                                       self_collision=False, 
+                mass_props=sim_utils.MassPropertiesCfg(mass=10.0),
+                deformable_props=sim_utils.DeformableBodyPropertiesCfg(
+                                                                       rest_offset=0.0,        # Increased from 0.0 to prevent tunneling
+                                                                       contact_offset=0.001,     # Increased from 0.0001 for better collision detection
+                                                                       self_collision=False,
                                                                        collision_simplification=False,
-                                                                       simulation_hexahedral_resolution=6, #16,    #simulation mesh resolution, default 10
+                                                                       simulation_hexahedral_resolution=1, #16,    #simulation mesh resolution, default 10
                                                                        #sleep_damping=0.5,
                                                                        vertex_velocity_damping=5.0,
                                                                        ),
                 #visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.7, 0.3, 0.3), opacity=1),  #seems not easy to get semi-transparent vis, have to turn on interactive rendering?
                 visual_material=UsdFileCfg(usd_path=shader_full_path),
                 physics_material=DeformableBodyMaterialCfg(
-                        youngs_modulus=1000,
-                        poissons_ratio=0.49, 
-                        elasticity_damping=0.6,
+                        youngs_modulus=100000,
+                        poissons_ratio=0.49,
+                        elasticity_damping=30,
                         ),
-                
+
         )
 
 COLON_CFG = DeformableObjectCfg(
@@ -170,11 +171,11 @@ class ColonModelCfg:
     colon_body_cfg = COLON_CFG
     colon_body_rigid_cfg = COLON_RIGID_CFG
 
-    # colon_attach_rectum_cfg = COLON_ENV_ATTACH_RECTUM_CFG
-    # colon_attach_descend_cfg = COLON_ENV_ATTACH_DECEND_CFG
-    # colon_attach_splenic_cfg = COLON_ENV_ATTACH_SPLENIC_CFG
-    # colon_attach_hepatic_cfg = COLON_ENV_ATTACH_HEPATIC_CFG
-    # colon_attach_cecum_cfg = COLON_ENV_ATTACH_CECUM_CFG
+    colon_attach_rectum_cfg = COLON_ENV_ATTACH_RECTUM_CFG
+    colon_attach_descend_cfg = COLON_ENV_ATTACH_DECEND_CFG
+    colon_attach_splenic_cfg = COLON_ENV_ATTACH_SPLENIC_CFG
+    colon_attach_hepatic_cfg = COLON_ENV_ATTACH_HEPATIC_CFG
+    colon_attach_cecum_cfg = COLON_ENV_ATTACH_CECUM_CFG
 
 
 class ColonModel:
@@ -277,6 +278,55 @@ class ColonModel:
         if self._env_translation is None:
             self._env_translation = self.colon_body.data.root_pos_w - self.colon_body.data.root_pos_w[0]
         return self._env_translation
+    
+    def get_accumulated_stress(self, env_ids: torch.Tensor = None) -> torch.Tensor:
+        """
+        Calculates the total accumulated Von Mises stress on the colon.
+        
+        For Deformable: Returns sum of Von Mises stress across all mesh elements.
+        For Rigid: Returns 0.0 (requires ContactSensor for true force).
+        
+        Returns:
+            torch.Tensor: Shape (num_envs,), containing the scalar stress score.
+        """
+        if self.is_rigid:
+            # Rigid bodies do not have internal stress. 
+            # You must use a ContactSensor to get forces for rigid bodies.
+            if env_ids is None:
+                return torch.zeros(self.colon_body.num_instances, device=self.colon_body.device)
+            return torch.zeros(len(env_ids), device=self.colon_body.device)
+
+        else:
+            # 1. Access the Stress Tensor
+            # Shape: (num_instances, num_elements, 3, 3)
+            # The property 'sim_element_stress_w' automatically fetches data from the PhysX view
+            stress_tensor = self.colon_body.data.sim_element_stress_w
+            
+            if env_ids is not None:
+                stress_tensor = stress_tensor[env_ids]
+
+            # 2. Extract Components for Von Mises Calculation
+            s11 = stress_tensor[..., 0, 0]
+            s22 = stress_tensor[..., 1, 1]
+            s33 = stress_tensor[..., 2, 2]
+            s12 = stress_tensor[..., 0, 1]
+            s23 = stress_tensor[..., 1, 2]
+            s31 = stress_tensor[..., 2, 0]
+
+            # 3. Calculate Von Mises Stress
+            # Formula: sqrt(0.5 * [(s11-s22)^2 + (s22-s33)^2 + (s33-s11)^2 + 6*(s12^2 + s23^2 + s31^2)])
+            von_mises = torch.sqrt(0.5 * (
+                (s11 - s22)**2 + 
+                (s22 - s33)**2 + 
+                (s33 - s11)**2 + 
+                6.0 * (s12**2 + s23**2 + s31**2)
+            ))
+
+            # 4. Sum over all elements to get total "impact" score per environment
+            # Shape: (num_envs,)
+            total_stress = torch.sum(von_mises, dim=1)
+            
+            return total_stress
 
     def get_entry_pos(self, env_ids: torch.Tensor = None) -> torch.Tensor:
         """Get entry positions based on lowest mesh vertices."""
@@ -290,13 +340,14 @@ class ColonModel:
         bottom_center = torch.tensor([0.2882, 0.2539, 0.3108]).to(device)
         bottom_center -= torch.tensor([0.2927, 0.1686, 0.4606]).to(device)
 
-        #entry_pos = torch.tensor([0.7893,  0.0091,  0.2963]).to(device)
-        entry_pos = torch.tensor([2,  0.5,  0.3]).to(device)
+        entry_pos = torch.tensor([2.3976, 2.9910, 0.5599]).to(device)
+        #x=2.7809, y=3.3909, z=0.6099
+        #entry_pos = torch.tensor([7.7809,  0.4000,  0.3]).to(device)
         delta_trans = torch.tensor([[0.0, 0.0, 0.0],
-                                    # [0.0, 0.5, 0.0],
-                                    # [-0.5, 0.0, 0.0],
-                                    # [-0.5, 0.5, 0.0],
-                                    # [-1.0, 0.0, 0.0]
+                                    # [0.0, 5, 0.0],
+                                    # [-5, 0.0, 0.0],
+                                    # [-5, 5, 0.0],
+                                    # [-10, 0.0, 0.0]
                                     ]).to(device)
         #print("entry_pos + delta_trans:", entry_pos + delta_trans)
         #print("self.colon_body.data.root_pos_w:", self.colon_body.data.root_pos_w)
@@ -335,13 +386,74 @@ class ColonModel:
         print("targets", targets)
         return torch.stack(targets)
 
+    def get_lowest_position(self, env_id: int = 0) -> torch.Tensor:
+        """Get the lowest (minimum Z coordinate) position of the colon.
+
+        Args:
+            env_id: Environment index to query. Default is 0.
+
+        Returns:
+            Tensor of shape (3,) containing [x, y, z] of the lowest point.
+        """
+        if self.is_rigid:
+            # For rigid body, use body state
+            # This might not give us individual vertices, so we use the body position
+            body_pos = self.colon_body.data.body_state_w[env_id, :3]
+            return body_pos
+        else:
+            # For deformable body, get all nodal positions
+            nodal_positions = self.colon_body.data.nodal_state_w[env_id, :, :3]  # Shape: (num_nodes, 3)
+
+            # Find the node with minimum Z coordinate
+            z_coords = nodal_positions[:, 2]
+            min_z_idx = torch.argmin(z_coords)
+            lowest_pos = nodal_positions[min_z_idx]
+
+            return lowest_pos
+
+    def print_lowest_position(self, env_id: int = 0):
+        """Print the lowest position of the colon.
+
+        Args:
+            env_id: Environment index to query. Default is 0.
+        """
+        lowest_pos = self.get_lowest_position(env_id)
+        print(f"Colon lowest position (env {env_id}): x={lowest_pos[0]:.4f}, y={lowest_pos[1]:.4f}, z={lowest_pos[2]:.4f}")
+        return lowest_pos
+
+    def get_all_lowest_positions(self) -> torch.Tensor:
+        """Get the lowest position for all environments.
+
+        Returns:
+            Tensor of shape (num_envs, 3) containing [x, y, z] of lowest point for each env.
+        """
+        if self.is_rigid:
+            # For rigid body
+            return self.colon_body.data.body_state_w[:, :3]
+        else:
+            # For deformable body
+            num_envs = self.colon_body.data.nodal_state_w.shape[0]
+            lowest_positions = torch.zeros((num_envs, 3), device=self.colon_body.device)
+
+            for env_id in range(num_envs):
+                nodal_positions = self.colon_body.data.nodal_state_w[env_id, :, :3]
+                z_coords = nodal_positions[:, 2]
+                min_z_idx = torch.argmin(z_coords)
+                lowest_positions[env_id] = nodal_positions[min_z_idx]
+
+            return lowest_positions
+
     def reset(self, env_ids: torch.Tensor = None):
         """Reset colon to initial state."""
         if env_ids is None:
             env_ids = torch.arange(self.colon_body.num_instances, device=self.colon_body.device)
-        
+
         # Reset the existing deformable object
         self.colon_body.reset(env_ids)
-        
+
         # Reapply nodal attachments
-        #self._attach_colon_nodals()
+        self._attach_colon_nodals()
+
+        # Print the lowest position after reset (for environment 0)
+        if 0 in env_ids or env_ids.numel() == self.colon_body.num_instances:
+            self.print_lowest_position(env_id=0)

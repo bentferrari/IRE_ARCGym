@@ -71,19 +71,20 @@ def make_isaac_env_cfg(config: dict, robot_factory) -> ARCIsaacEnvCfg:
 
         ui_window_class_type = ARCEnvWindow
 
-        terrain = TerrainImporterCfg(
-            prim_path="/World/ground",
-            terrain_type="plane",
-            collision_group=-1,
-            physics_material=sim_utils.RigidBodyMaterialCfg(
-                friction_combine_mode="average",
-                restitution_combine_mode="average",
-                static_friction=1.0,
-                dynamic_friction=1.0,
-                restitution=0.0,
-            ),
-            debug_vis=debug_vis,
-        )
+        # Ground plane removed - no terrain in scene
+        # terrain = TerrainImporterCfg(
+        #     prim_path="/World/ground",
+        #     terrain_type="plane",
+        #     collision_group=-1,
+        #     physics_material=sim_utils.RigidBodyMaterialCfg(
+        #         friction_combine_mode="average",
+        #         restitution_combine_mode="average",
+        #         static_friction=1.0,
+        #         dynamic_friction=1.0,
+        #         restitution=0.0,
+        #     ),
+        #     debug_vis=debug_vis,
+        # )
 
         scene: InteractiveSceneCfg = InteractiveSceneCfg(
             num_envs=env_config["num_envs"],
@@ -192,11 +193,16 @@ class ARCIsaacEnv(DirectRLEnv):
         self.robot = self.robot_factory.build_robot(
             scene=self.scene,
             init_pos=(0.22, 0.16, 0.4),
-            #init_rot=(0, 1, 0, 1),
-            init_rot=(1, 0, 0, 0),
+            init_rot=(0, 1, 0, 1),
+            #init_rot=(1, 0, 0, 0),
             )
 
-        self.colon = ColonModel(self.scene, cfg=self.cfg.colon_cfg, init_pos=(0.5,0.5,0.1), init_rot=(0.5, 0.5, 0.5, 0.5), is_rigid=False)
+        self.colon = ColonModel(self.scene, cfg=self.cfg.colon_cfg, init_pos=(0.5,0.5,0.1), #init_rot=(0.5, 0.5, 0.5, 0.5),
+        init_rot=(1.0, 0.0, 0.0, 0.0), is_rigid=False)
+
+        # Pass colon reference to robot for stress calculation
+        if hasattr(self.robot, 'colon'):
+            self.robot.colon = self.colon
 
         # Note: Keeping this here to show how to add a physics callback.
         # Register the callback
@@ -205,10 +211,11 @@ class ARCIsaacEnv(DirectRLEnv):
         #if self.sim.physics_callback_exists("camera_control"):
         #    self.sim.remove_physics_callback("camera_control")
         #self.sim.add_physics_callback("camera_control", camera_controller.physics_callback)
-        
-        self.cfg.terrain.num_envs = self.scene.cfg.num_envs
-        self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
-        self.terrain = self.cfg.terrain.class_type(self.cfg.terrain)
+
+        # Terrain setup commented out - no ground plane in scene
+        # self.cfg.terrain.num_envs = self.scene.cfg.num_envs
+        # self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
+        # self.terrain = self.cfg.terrain.class_type(self.cfg.terrain)
 
         self.scene.clone_environments(copy_from_source=False)
 
@@ -399,14 +406,33 @@ class ARCIsaacEnv(DirectRLEnv):
         
         # Set robot positions based on colon entry points
         self.robot.set_pos(self.entry_positions)
-        
+
         # CRITICAL: Write data to sim and forward kinematics
         self.scene.write_data_to_sim()
         self.sim.forward()
-        
-        # Then reset robot (which will now have valid data)
+
+        # Generate initial joint configurations
+        # Check if random initialization is enabled in config
+        use_random_init = self.config.get("env_config", {}).get("random_initial_configuration", True)
+
+        if use_random_init:
+            # Generate random initial joint configurations for diversity
+            # This creates different starting poses for the robot instead of always straight
+            max_angle = self.config.get("env_config", {}).get("init_max_joint_angle", 0.3)
+            smoothness = self.config.get("env_config", {}).get("init_joint_smoothness", 0.85)
+
+            initial_joint_positions = self.robot.generate_random_joint_positions(
+                num_configs=len(env_ids),
+                max_angle=max_angle,    # Moderate bending (~17 degrees per joint default)
+                smoothness=smoothness    # Smooth, natural curves
+            )
+        else:
+            # Use straight configuration (all zeros)
+            initial_joint_positions = None
+
+        # Reset robot with the configuration (which will now have valid data)
+        #self.robot.reset(env_ids, joint_positions=initial_joint_positions)
         self.robot.reset(env_ids)
-        
         # Final step to ensure everything is synchronized
         self.sim.step()
 
@@ -587,6 +613,14 @@ class ARCIsaacEnv(DirectRLEnv):
             # return observations, rewards, resets and extras
             return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
         """
+        # Print contact forces every 100 steps
+        if self.common_step_counter % 100 == 0:
+            try:
+                self.colon.print_contact_forces()
+            except Exception as e:
+                # Silently catch errors if contact sensor is not available
+                pass
+
         info_extras = {
             "goal_reached" : self.goal_reached,
             "l2_norm" : self.latest_l2_norm,

@@ -137,23 +137,23 @@ class RobotEndoscopeCapsule(BaseRobot):
 
     def apply_action(self, actions: torch.Tensor, action_scale: float = 1.0) -> None:
         """Apply 6DOF velocity actions with collision-safe scaling."""
-        pose = self.get_pose()
+        pose = self.get_pose()  # Shape: (num_envs, 13)
         if pose is None or pose.numel() == 0:
             logging.warning("Warning: Invalid pose data, skipping action application")
             return
-            
-        robot_orient = pose[:, :, 3:7].squeeze(1)  # (num_envs, 4)
-        
+
+        robot_orient = pose[:, 3:7]  # (num_envs, 4) - extract quaternion
+
         actions_scaled = actions * action_scale # (num_evns, 6) * (1,) -> (num_evns, 6)
-        
+
         actions_scaled[:, :3] *= 0.05
         actions_scaled[:, 3:] *= 1.0
-        
+
         twist_local_lin = quat_apply(robot_orient, actions_scaled[:, :3])
         twist_local_ang = quat_apply(robot_orient, actions_scaled[:, 3:])
-        
+
         twist = torch.cat((twist_local_lin, twist_local_ang), dim=-1)
-        
+
         self.capsule.write_root_velocity_to_sim(twist)
 
     def get_observation(self, use_pose_in_obs, use_camera) -> torch.Tensor:
@@ -185,7 +185,14 @@ class RobotEndoscopeCapsule(BaseRobot):
         return obs
 
     def get_pose(self):
-        return self.capsule.data.body_state_w 
+        """Get robot pose. Returns shape (num_envs, 13) for consistency with articulated robots.
+
+        The capsule has only one body, so we squeeze out the body dimension.
+        Returns: tensor of shape (num_envs, 13) with [pos(3), quat(4), lin_vel(3), ang_vel(3)]
+        """
+        body_state = self.capsule.data.body_state_w  # Shape: (num_envs, num_bodies, 13)
+        # For capsule robot, there's only 1 body, so squeeze out the body dimension
+        return body_state[:, 0, :]  # Shape: (num_envs, 13) 
 
     def get_depth(self):
         if (not hasattr(self.egocamera, 'data') or self.egocamera.data is None or not hasattr(self.egocamera.data, 'output') or "depth" not in self.egocamera.data.output):
@@ -206,11 +213,32 @@ class RobotEndoscopeCapsule(BaseRobot):
         if init_rot is not None:
             raise NotImplementedError("Initializing rotation is not implemented yet")
 
-    def reset(self, env_ids: torch.Tensor = None) -> None:
-        """Reset robot to initial pose and zero velocities."""
-        # Get default root state 
+    def generate_random_joint_positions(self, num_configs: int = None, max_angle: float = 0.5, smoothness: float = 0.8) -> None:
+        """Capsule robot has no joints, so return None.
+
+        This method exists for compatibility with the articulated robot interface,
+        but returns None since the capsule is a rigid body with no joints.
+
+        Args:
+            num_configs: Number of configurations (ignored)
+            max_angle: Maximum joint angle (ignored)
+            smoothness: Smoothness factor (ignored)
+
+        Returns:
+            None
+        """
+        return None
+
+    def reset(self, env_ids: torch.Tensor = None, joint_positions: torch.Tensor = None) -> None:
+        """Reset robot to initial pose and zero velocities.
+
+        Args:
+            env_ids: Environment indices to reset
+            joint_positions: Ignored for capsule robot (no joints)
+        """
+        # Get default root state
         root_state = self.capsule.data.default_root_state[env_ids].clone()
-        
+
         # Set positions based on whether we have per-env positions
         if self.env_init_pos is not None:
             # Use per-environment positions (already in world coordinates!)
@@ -223,17 +251,17 @@ class RobotEndoscopeCapsule(BaseRobot):
             # Use default position for all environments (need to add origins)
             origins = self.scene.env_origins[env_ids]
             root_state[:, :3] = origins + torch.tensor(self.init_pos, device=self.device)
-        
+
         base_rot = torch.tensor(self.init_rot, device=self.device).repeat(len(env_ids), 1)
 
         root_state[:, 3:7] = base_rot
 
         # Zero out velocities
         root_state[:, 7:] = 0.0
-        
+
         # Write to simulation
         self.capsule.write_root_pose_to_sim(root_state[:, :7], env_ids)
         self.capsule.write_root_velocity_to_sim(root_state[:, 7:], env_ids)
-        
+
         # Reset internal buffers
         self.capsule.reset(env_ids)
