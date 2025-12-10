@@ -94,7 +94,7 @@ learning_config = {
     "verbose" : True,
 }
 robot_config = {
-    "robot_type" : "capsule", # "capsule" or "soft_endoscope" or "magnetic_endoscope"
+    "robot_type" : "magnetic_endoscope", # "capsule" or "soft_endoscope" or "magnetic_endoscope"
     # Capsule config 
     "capsule_radius" : 0.004,
     "capsule_height" : 0.012,

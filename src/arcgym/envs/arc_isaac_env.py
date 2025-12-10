@@ -130,7 +130,7 @@ class ARCIsaacEnv(DirectRLEnv):
 
     def __init__(self, cfg: ARCIsaacEnvCfg, robot_factory: RobotFactory, config: dict, **kwargs):
         self.robot_factory = robot_factory
-
+        self.robot_config = config["robot_config"]
         self.config = config
         self.env_config = config["env_config"]
         self.reward_config = config["reward_config"]
@@ -189,12 +189,16 @@ class ARCIsaacEnv(DirectRLEnv):
 
     def _setup_scene(self):
         self.stage = stage_utils.get_current_stage()
-
+        robot_type = self.robot_config.get("robot_type", None)
+        if robot_type == "capsule":
+            init_rot = (1, 0, 0, 0)
+        else:
+            init_rot=(0, 1, 0, 1)
         self.robot = self.robot_factory.build_robot(
             scene=self.scene,
             init_pos=(0.22, 0.16, 0.4),
             #init_rot=(0, 1, 0, 1),
-            init_rot=(1, 0, 0, 0),
+            init_rot=init_rot,
             )
 
         self.colon = ColonModel(self.scene, cfg=self.cfg.colon_cfg, cfg1=self.config,  init_pos=(0.5,0.5,0.1), #init_rot=(0.5, 0.5, 0.5, 0.5),
