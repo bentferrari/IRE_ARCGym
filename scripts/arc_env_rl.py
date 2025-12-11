@@ -35,7 +35,7 @@ from stable_baselines3 import PPO, DQN, SAC
 from stable_baselines3.common.callbacks import CheckpointCallback, LogEveryNTimesteps
 from stable_baselines3.common.vec_env import VecNormalize
 
-from arcgym.utils.callbacks import PerEnvRewardCallback
+from arcgym.utils.callbacks import PerEnvRewardCallback, TrajectoryDataSaver
 
 from isaaclab.envs import (
     DirectRLEnvCfg,
@@ -70,10 +70,12 @@ log_dir = f"./logs/ppo_arc_{timestamp}/"
 tensorboard_log = f"./tensorboard_logs/ppo_arc_{timestamp}/"
 model_save_path = f"./models/ppo_arc_{timestamp}/"
 video_save_path = os.path.join(tensorboard_log, "videos", "train")
+trajectory_save_path = f"./trajectory_data/ppo_arc_{timestamp}/"
 
 os.makedirs(log_dir, exist_ok=True)
 os.makedirs(tensorboard_log, exist_ok=True)
 os.makedirs(model_save_path, exist_ok=True)
+os.makedirs(trajectory_save_path, exist_ok=True)
 
 register(
     id="ArcIsaacEnv-v0",
@@ -433,7 +435,14 @@ if args_cli.train:
 
     per_env_reward_callback = PerEnvRewardCallback(verbose=1)
 
-    model.learn(learning_config["total_timesteps"], callback=[checkpoint_callback, log_callback, per_env_reward_callback])
+    # Create trajectory data saver callback (saves every 10 episodes by default)
+    trajectory_callback = TrajectoryDataSaver(
+        save_dir=trajectory_save_path,
+        save_interval=2,  # Save every 10 episodes
+        verbose=1
+    )
+
+    model.learn(learning_config["total_timesteps"], callback=[checkpoint_callback, log_callback, per_env_reward_callback, trajectory_callback])
     
     final_model_path = os.path.join(model_save_path, f"ppo_arc_final_{timestamp}")
     model.save(final_model_path)

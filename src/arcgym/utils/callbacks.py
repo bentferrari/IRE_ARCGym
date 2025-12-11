@@ -3,6 +3,10 @@
 from stable_baselines3.common.callbacks import BaseCallback
 import numpy as np
 import torch
+import os
+import json
+from pathlib import Path
+from PIL import Image
 
 
 class PerEnvRewardCallback(BaseCallback):
@@ -242,3 +246,270 @@ class TrainingMetricsCallback(BaseCallback):
         # But we can add custom logging here if needed
         if self.verbose > 1:
             print("Rollout ended, training metrics should be logged")
+
+
+class TrajectoryDataSaver(BaseCallback):
+    """
+    Callback for saving trajectory data (root_state) and corresponding images every N episodes.
+
+    This callback:
+    - Tracks the root_state trajectory for each environment during episodes
+    - Captures corresponding RGB images at each timestep
+    - Saves trajectory and images to disk every N episodes
+    - Organizes data in a structured folder hierarchy
+
+    Data is saved in the following structure:
+        save_dir/
+            env_0/
+                episode_0000/
+                    trajectory.npz       # Contains root_states array and metadata
+                    images/
+                        frame_0000.png
+                        frame_0001.png
+                        ...
+                episode_0010/
+                    ...
+            env_1/
+                ...
+    """
+
+    def __init__(self, save_dir="trajectory_data", save_interval=10, verbose=0):
+        """
+        Initialize the trajectory data saver callback.
+
+        Args:
+            save_dir: Root directory for saving trajectory data
+            save_interval: Save trajectory data every N episodes (default: 10)
+            verbose: Verbosity level (0: not verbose, 1: info, 2: debug)
+        """
+        super().__init__(verbose)
+        self.save_dir = Path(save_dir)
+        self.save_interval = save_interval
+
+        # Track current episode data for each environment
+        # Format: {env_idx: {'root_states': [], 'images': [], 'episode_num': int}}
+        self.current_episode_data = {}
+
+        # Track episode counts per environment
+        self.episode_counts = {}
+
+        # Create base save directory
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.verbose > 0:
+            print(f"TrajectoryDataSaver initialized: saving to '{save_dir}' every {save_interval} episodes")
+
+    def _on_step(self) -> bool:
+        """
+        Called at each step. Captures root_state and image data.
+
+        Returns:
+            bool: Always returns True to continue training
+        """
+        try:
+            # Get access to the unwrapped environment
+            # Sb3VecEnvWrapper has 'env' attribute, not 'envs'
+            if hasattr(self.training_env, 'env'):
+                env = self.training_env.env
+            else:
+                env = self.training_env
+
+            # Unwrap further if needed (but stop when we find the robot)
+            while hasattr(env, 'env') and not hasattr(env, 'robot'):
+                env = env.env
+
+            # Get root_state data for all environments
+            # root_state shape: (num_envs, 13) with [pos(3), quat(4), lin_vel(3), ang_vel(3)]
+            if hasattr(env, 'robot') and hasattr(env.robot, 'get_pose'):
+                root_states = env.robot.get_pose()  # Tensor of shape (num_envs, 13)
+
+                if self.verbose > 1:
+                    print(f"[TrajectoryDataSaver] Captured root_states, shape: {root_states.shape}")
+
+                # Get RGB images for all environments
+                rgb_images = None
+                if hasattr(env, '_camera_data') and env._camera_data is not None:
+                    rgb_images = env._camera_data  # Should be (num_envs, C, H, W)
+
+                # Process each environment
+                num_envs = root_states.shape[0]
+                for env_idx in range(num_envs):
+                    # Initialize tracking for this environment if needed
+                    if env_idx not in self.current_episode_data:
+                        self.current_episode_data[env_idx] = {
+                            'root_states': [],
+                            'images': [],
+                            'episode_num': self.episode_counts.get(env_idx, 0)
+                        }
+
+                    # Store root_state for this environment
+                    root_state = root_states[env_idx].cpu().numpy()
+                    self.current_episode_data[env_idx]['root_states'].append(root_state)
+
+                    # Debug: Print first and periodic positions to check if they're changing
+                    step_num = len(self.current_episode_data[env_idx]['root_states'])
+                    if self.verbose > 1 and env_idx == 0:
+                        if step_num <= 3 or step_num % 20 == 0:
+                            pos = root_state[:3]
+                            vel = root_state[7:10]
+                            print(f"[TrajectoryDataSaver] Env {env_idx} step {step_num}: pos=[{pos[0]:.6f}, {pos[1]:.6f}, {pos[2]:.6f}], vel=[{vel[0]:.4f}, {vel[1]:.4f}, {vel[2]:.4f}]")
+
+                    # Store image if available
+                    if rgb_images is not None and env_idx < rgb_images.shape[0]:
+                        # Convert from (C, H, W) to (H, W, C) for PIL
+                        img = rgb_images[env_idx].cpu().numpy()
+                        if img.shape[0] == 3:  # If channels first
+                            img = np.transpose(img, (1, 2, 0))
+
+                        # Ensure uint8 format
+                        if img.dtype != np.uint8:
+                            if img.max() <= 1.0:
+                                img = (img * 255).astype(np.uint8)
+                            else:
+                                img = np.clip(img, 0, 255).astype(np.uint8)
+
+                        self.current_episode_data[env_idx]['images'].append(img)
+
+            # Check if any episodes finished
+            if 'dones' in self.locals and 'infos' in self.locals:
+                dones = self.locals['dones']
+                infos = self.locals['infos']
+
+                if self.verbose > 1:
+                    print(f"[TrajectoryDataSaver] Checking dones: {dones}")
+
+                for env_idx, (done, info) in enumerate(zip(dones, infos)):
+                    if done:
+                        if self.verbose > 1:
+                            print(f"[TrajectoryDataSaver] Env {env_idx} done. 'episode' in info: {'episode' in info}")
+                            if 'episode' not in info:
+                                print(f"[TrajectoryDataSaver] Info keys: {list(info.keys())}")
+
+                    if done and 'episode' in info:
+                        # Episode finished for this environment
+                        if env_idx not in self.episode_counts:
+                            self.episode_counts[env_idx] = 0
+
+                        self.episode_counts[env_idx] += 1
+                        episode_num = self.episode_counts[env_idx]
+
+                        if self.verbose > 1:
+                            print(f"[TrajectoryDataSaver] Env {env_idx} completed episode {episode_num}")
+
+                        # Check if we should save this episode
+                        should_save = (episode_num % self.save_interval) == 0
+
+                        if self.verbose > 1:
+                            print(f"[TrajectoryDataSaver] Should save: {should_save} (episode {episode_num} % interval {self.save_interval})")
+
+                        if should_save and env_idx in self.current_episode_data:
+                            self._save_episode_data(env_idx, episode_num, info)
+
+                            if self.verbose > 0:
+                                print(f"✓ Saved trajectory data for env {env_idx}, episode {episode_num}")
+                        elif should_save:
+                            if self.verbose > 1:
+                                print(f"[TrajectoryDataSaver] WARNING: Should save but env {env_idx} not in current_episode_data")
+
+                        # Reset tracking for next episode
+                        self.current_episode_data[env_idx] = {
+                            'root_states': [],
+                            'images': [],
+                            'episode_num': episode_num
+                        }
+
+        except Exception as e:
+            print(f"ERROR in TrajectoryDataSaver._on_step: {e}")
+            import traceback
+            traceback.print_exc()
+
+        return True
+
+    def _save_episode_data(self, env_idx, episode_num, info):
+        """
+        Save trajectory and image data for a completed episode.
+
+        Args:
+            env_idx: Environment index
+            episode_num: Episode number
+            info: Info dict from the environment containing episode metadata
+        """
+        try:
+            episode_data = self.current_episode_data[env_idx]
+            root_states = episode_data['root_states']
+            images = episode_data['images']
+
+            if not root_states:
+                if self.verbose > 1:
+                    print(f"No trajectory data to save for env {env_idx}, episode {episode_num}")
+                return
+
+            # Create episode directory
+            episode_dir = self.save_dir / f"env_{env_idx}" / f"episode_{episode_num:06d}"
+            episode_dir.mkdir(parents=True, exist_ok=True)
+
+            # Save trajectory data as numpy compressed array
+            root_states_array = np.array(root_states)  # Shape: (num_steps, 13)
+
+            # Prepare metadata
+            metadata = {
+                'env_idx': env_idx,
+                'episode_num': episode_num,
+                'num_steps': len(root_states),
+                'episode_reward': float(info['episode']['r']) if 'episode' in info else None,
+                'episode_length': int(info['episode']['l']) if 'episode' in info else None,
+                'goal_reached': bool(info.get('goal_reached', False)),
+                'colon_stress': float(info['colon_stress']) if 'colon_stress' in info and info['colon_stress'] is not None else None,
+            }
+
+            # Save trajectory and metadata
+            trajectory_file = episode_dir / "trajectory.npz"
+            np.savez_compressed(
+                trajectory_file,
+                root_states=root_states_array,
+                metadata=json.dumps(metadata)
+            )
+
+            # Save metadata as JSON for easy reading
+            metadata_file = episode_dir / "metadata.json"
+            with open(metadata_file, 'w') as f:
+                json.dump(metadata, f, indent=2)
+
+            # Save images if available
+            if images:
+                images_dir = episode_dir / "images"
+                images_dir.mkdir(exist_ok=True)
+
+                for step_idx, img in enumerate(images):
+                    img_path = images_dir / f"frame_{step_idx:06d}.png"
+                    Image.fromarray(img).save(img_path)
+
+                if self.verbose > 1:
+                    print(f"  Saved {len(images)} images for env {env_idx}, episode {episode_num}")
+
+            if self.verbose > 0:
+                print(f"  Trajectory shape: {root_states_array.shape}, "
+                      f"Reward: {metadata.get('episode_reward', 'N/A'):.2f}, "
+                      f"Success: {metadata.get('goal_reached', False)}")
+
+        except Exception as e:
+            print(f"Error saving episode data for env {env_idx}, episode {episode_num}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _on_training_start(self) -> None:
+        """Called at the beginning of training."""
+        if self.verbose > 0:
+            print(f"TrajectoryDataSaver: Starting trajectory collection")
+            print(f"  Save directory: {self.save_dir.absolute()}")
+            print(f"  Save interval: every {self.save_interval} episodes")
+
+    def _on_training_end(self) -> None:
+        """Called at the end of training."""
+        if self.verbose > 0:
+            print("\nTrajectoryDataSaver: Training complete")
+            total_saved = sum(1 for env_idx in self.episode_counts
+                            for ep in range(1, self.episode_counts[env_idx] + 1)
+                            if ep % self.save_interval == 0)
+            print(f"  Total episodes saved: {total_saved}")
+            print(f"  Data location: {self.save_dir.absolute()}")
