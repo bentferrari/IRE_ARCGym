@@ -144,10 +144,12 @@ env_config = {
     "env_spacing" : env_spacing,
     "num_envs" : args_cli.num_envs,
     "replicate_physics" : False,
-    "action_scale" : 1,
+    "action_scale" : 0.1,
     "debug_vis" : False,
-    "episode_length_s" : 1.0,   # short episode for testing
+    "episode_length_s" : 20.0,   # short episode for testing
     "constraint_point_A": 1,  # Distance from robot tip to constraint point A along the robot's local z-axis
+    "init_from_csv": "./saved_states/robot_state_20251215_112526.csv" if args_cli.train else None,
+    "random_initial_configuration": False  # Use straight configuration (especially for teleoperation mode)
 }
 
 reward_config = {
@@ -336,6 +338,21 @@ video_kwargs = {
 env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
 env = Sb3VecEnvWrapper(env)
+
+# Set camera to view robot and colon properly
+# The unwrapped environment has access to the sim
+try:
+    import omni.isaac.core.utils.viewports as vp_utils
+    # Get the entry position from the environment to center the camera on it
+    # Assuming the robot and colon are around entry_positions
+    # Set camera position: above and behind the scene
+    # Adjust these values based on your scene scale
+    eye = [20.0, 10.0, 8.0]  # Camera position (x, y, z) - zoomed out to see larger area
+    target = [5.0, 1.0, 1.0]  # Look at point - center of scene
+    vp_utils.set_camera_view(eye=eye, target=target, camera_prim_path="/OmniverseKit_Persp")
+    print(f"Camera set to eye={eye}, target={target}")
+except Exception as e:
+    print(f"Could not set camera view: {e}")
 
 # env = VecVideoRecorder(
 #     env,

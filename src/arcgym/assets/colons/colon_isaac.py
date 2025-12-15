@@ -1,4 +1,5 @@
 import os
+import logging
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import DeformableObjectCfg, RigidObjectCfg, DeformableObject, RigidObject
@@ -20,6 +21,7 @@ model_full_path = os.path.join(model_folder, "noncollapsed_0000_origincollid.usd
 FLAT_ROTATION_Y = (0.7071068, 0, 0.7071068, 0)  # 90° rotation around Y-axis
 
 obj_model_full_path = os.path.join(model_folder, "noncollapsed_0000_shell.obj")
+#obj_model_full_path = os.path.join(model_folder, "surf_hole_0000_manual_blender.obj")
 shader_full_path = os.path.join(model_folder, "materials/colon_surface_material.usd")
 
 
@@ -358,14 +360,44 @@ class ColonModel:
             
             return total_stress
 
-    def get_entry_pos(self, env_ids: torch.Tensor = None) -> torch.Tensor:
-        """Get entry positions based on lowest mesh vertices."""
+    def get_entry_pos(self, env_ids: torch.Tensor = None, csv_filepath: str = None) -> torch.Tensor:
+        """Get entry positions based on lowest mesh vertices or from CSV file.
+
+        Args:
+            env_ids: Environment IDs (not used currently but kept for compatibility)
+            csv_filepath: Optional path to CSV file containing root positions
+
+        Returns:
+            Entry positions tensor of shape (num_envs, 3)
+        """
         # Get device from appropriate data attribute based on rigid/deformable
         if self.is_rigid:
             device = self.colon_body.data.body_state_w.device
         else:
             device = self.colon_body.data.nodal_state_w.device
 
+        # If CSV file is provided, load entry positions from it
+        if csv_filepath is not None and csv_filepath.endswith('.csv'):
+            import pandas as pd
+            import os
+
+            if not os.path.exists(csv_filepath):
+                raise FileNotFoundError(f"CSV file not found: {csv_filepath}")
+
+            df = pd.read_csv(csv_filepath)
+
+            # Extract root positions for all environments in the CSV
+            entry_positions = []
+            for _, row in df.iterrows():
+                pos = [row['root_pos_x'], row['root_pos_y'], row['root_pos_z']]
+                entry_positions.append(pos)
+
+            entry_pos_tensor = torch.tensor(entry_positions, dtype=torch.float32, device=device)
+            logging.info(f"Loaded entry positions from CSV: {csv_filepath}")
+            logging.info(f"Entry positions shape: {entry_pos_tensor.shape}")
+            return entry_pos_tensor
+
+        # Default behavior - use hardcoded positions
         #bottom_center = torch.tensor([0.2882, 0.2539, 0.3108]).to(device)
         bottom_center = torch.tensor([0.2882, 0.2539, 0.3108]).to(device)
         bottom_center -= torch.tensor([0.2927, 0.1686, 0.4606]).to(device)
@@ -393,7 +425,7 @@ class ColonModel:
 
         #print("entry_pos + delta_trans:", entry_pos + delta_trans)
         #print("self.colon_body.data.root_pos_w:", self.colon_body.data.root_pos_w)
-        
+
         #return bottom_center + self.colon_body.data.root_pos_w#self.env_translation
         return entry_pos + delta_trans
         #return entry_pos

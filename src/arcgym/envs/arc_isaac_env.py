@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import logging
 
 import numpy as np
 import torch
@@ -193,7 +194,28 @@ class ARCIsaacEnv(DirectRLEnv):
         if robot_type == "capsule":
             init_rot = (1, 0, 0, 0)
         else:
-            init_rot=(0, 1, 0, 1)
+            # Check if we should load rotation from CSV
+            csv_init_file = self.config.get("env_config", {}).get("init_from_csv", None)
+            if csv_init_file is not None and csv_init_file.endswith('.csv'):
+                import pandas as pd
+                import os
+
+                if os.path.exists(csv_init_file):
+                    df = pd.read_csv(csv_init_file)
+                    # Get the first row's quaternion values (w, x, y, z)
+                    first_row = df.iloc[0]
+                    init_rot = (
+                        first_row['root_quat_w'],
+                        first_row['root_quat_x'],
+                        first_row['root_quat_y'],
+                        first_row['root_quat_z']
+                    )
+                    logging.info(f"Loaded initial rotation from CSV: {init_rot}")
+                else:
+                    logging.warning(f"CSV file not found: {csv_init_file}, using default rotation")
+                    init_rot = (0, 1, 0, 1)
+            else:
+                init_rot = (0, 1, 0, 1)
         self.robot = self.robot_factory.build_robot(
             scene=self.scene,
             init_pos=(0.22, 0.16, 0.4),
@@ -295,99 +317,6 @@ class ARCIsaacEnv(DirectRLEnv):
         }
         return states
 
-    # def reset(self, seed=None, env_ids: torch.Tensor = None, options = None):
-    #     self.goal_reached = torch.tensor([False]*self.num_envs, device=self.device)
-    #     self.hit_wall = torch.tensor([False]*self.num_envs, device=self.device)
-    #     self.truncate_now = torch.tensor([False]*self.num_envs, device=self.device)
-
-    #     print("reset called")
-
-    #     obs, extras = super().reset(seed=seed)
-        
-    #     if env_ids is None: # I am not sure about this, did I write this? Chat GPT is that you?
-    #         env_ids = torch.arange(self.num_envs, device=self.device)
-        
-    #     # Reset colon first
-    #     self.colon.reset(env_ids)
-    #     self.sim.step()
-        
-    #     # Get entry positions for the environments being reset
-    #     self.entry_positions = self.colon.get_entry_pos(env_ids)
-    #     self.targets = self.colon.get_targets(env_ids)
-
-    #     self.reward_function.reset(
-    #         initial_positions=self.entry_positions,
-    #         goals=self.targets,
-    #         )
-        
-    #     #if self.robot:
-    #     # Set robot positions based on colon entry points
-    #     self.robot.set_pos(self.entry_positions)  # Remove env_ids parameter
-    #     # Then reset robot
-    #     self.robot.reset(env_ids)
-
-    #     if self.show_markers and self.markers is None:
-    #         start_position = self.entry_positions[0]
-    #         target_position = self.targets[0]
-
-    #         self.markers = []
-    #         for env_id, (start_position, target_positions) in enumerate(zip(self.entry_positions, self.targets)):
-    #             self.markers.append(create_simple_sphere_markers(start_position, target_positions[1:], env_id))
-
-    #     self.debug_resets_remaining -= 1
-    #     if self.debug_resets_remaining == 0:
-    #         # BENCHMARKING START
-    #         if self.tracer is not None:
-    #             self.tracer.save("intermediate_trace.json")
-    #         # BENCHMARKING END
-    #         exit()
-
-    #     return obs, extras
-
-    # def _reset_idx(self, env_ids: Sequence[int]):
-    #     self.colon.reset(env_ids)
-    #     self.sim.step()
-    #     self.robot.reset(env_ids)
-        
-    #     # Get entry positions for the environments being reset
-    #     self.entry_positions = self.colon.get_entry_pos(env_ids)
-    #     self.targets = self.colon.get_targets(env_ids)
-
-    #     self.reward_function.reset(
-    #         initial_positions=self.entry_positions,
-    #         goals=self.targets,
-    #         )
-
-    #     self.goal_reached[env_ids] = False
-    #     self.hit_wall[env_ids] = False
-    #     self.truncate_now[env_ids] = False
-
-    #     super()._reset_idx(env_ids)  # See contents of super()._reset_idx(env_ids) below
-    #     """
-    #     def _reset_idx(self, env_ids: Sequence[int]):
-    #         '''Reset environments based on specified indices.
-
-    #         Args:
-    #             env_ids: List of environment ids which must be reset
-    #         '''
-    #         self.scene.reset(env_ids)
-
-    #         # apply events such as randomization for environments that need a reset
-    #         if self.cfg.events:
-    #             if "reset" in self.event_manager.available_modes:
-    #                 env_step_count = self._sim_step_counter // self.cfg.decimation
-    #                 self.event_manager.apply(mode="reset", env_ids=env_ids, global_env_step_count=env_step_count)
-
-    #         # reset noise models
-    #         if self.cfg.action_noise_model:
-    #             self._action_noise_model.reset(env_ids)
-    #         if self.cfg.observation_noise_model:
-    #             self._observation_noise_model.reset(env_ids)
-
-    #         # reset the episode length buffer
-    #         self.episode_length_buf[env_ids] = 0
-    #     """
-
     def reset(self, seed=None, env_ids: torch.Tensor = None, options = None):
         self.goal_reached = torch.tensor([False]*self.num_envs, device=self.device)
         self.hit_wall = torch.tensor([False]*self.num_envs, device=self.device)
@@ -402,19 +331,22 @@ class ARCIsaacEnv(DirectRLEnv):
         
         # Reset colon first
         self.colon.reset(env_ids)
-        
+
         # CRITICAL: Step simulation to update colon state
         self.sim.step()
-        
-        # Get entry positions AFTER stepping
-        self.entry_positions = self.colon.get_entry_pos(env_ids)
+
+        # Check if CSV file is provided for initialization
+        csv_init_file = self.config.get("env_config", {}).get("init_from_csv", None)
+
+        # Get entry positions AFTER stepping - load from CSV if provided
+        self.entry_positions = self.colon.get_entry_pos(env_ids, csv_filepath=csv_init_file)
         self.targets = self.colon.get_targets(env_ids)
 
         self.reward_function.reset(
             initial_positions=self.entry_positions,
             goals=self.targets,
         )
-        
+
         # Set robot positions based on colon entry points
         self.robot.set_pos(self.entry_positions)
 
@@ -423,27 +355,32 @@ class ARCIsaacEnv(DirectRLEnv):
         self.sim.forward()
 
         # Generate initial joint configurations
-        # Check if random initialization is enabled in config
-        use_random_init = self.config.get("env_config", {}).get("random_initial_configuration", True)
 
-        if use_random_init:
-            # Generate random initial joint configurations for diversity
-            # This creates different starting poses for the robot instead of always straight
-            max_angle = self.config.get("env_config", {}).get("init_max_joint_angle", 0.3)
-            smoothness = self.config.get("env_config", {}).get("init_joint_smoothness", 0.85)
-
-            initial_joint_positions = self.robot.generate_random_joint_positions(
-                num_configs=len(env_ids),
-                max_angle=max_angle,    # Moderate bending (~17 degrees per joint default)
-                smoothness=smoothness    # Smooth, natural curves
-            )
+        if csv_init_file is not None:
+            # Load from CSV file
+            initial_joint_positions = csv_init_file
+            logging.info(f"Initializing from CSV: {csv_init_file}")
         else:
-            # Use straight configuration (all zeros)
-            initial_joint_positions = None
+            # Check if random initialization is enabled in config
+            use_random_init = self.config.get("env_config", {}).get("random_initial_configuration", True)
+
+            if use_random_init:
+                # Generate random initial joint configurations for diversity
+                # This creates different starting poses for the robot instead of always straight
+                max_angle = self.config.get("env_config", {}).get("init_max_joint_angle", 0.3)
+                smoothness = self.config.get("env_config", {}).get("init_joint_smoothness", 0.85)
+
+                initial_joint_positions = self.robot.generate_random_joint_positions(
+                    num_configs=len(env_ids),
+                    max_angle=max_angle,    # Moderate bending (~17 degrees per joint default)
+                    smoothness=smoothness    # Smooth, natural curves
+                )
+            else:
+                # Use straight configuration (all zeros)
+                initial_joint_positions = None
 
         # Reset robot with the configuration (which will now have valid data)
-        #self.robot.reset(env_ids, joint_positions=initial_joint_positions)
-        self.robot.reset(env_ids)
+        self.robot.reset(env_ids, joint_positions=initial_joint_positions)
         # Final step to ensure everything is synchronized
         self.sim.step()
 
@@ -471,28 +408,41 @@ class ARCIsaacEnv(DirectRLEnv):
 
         # Reset colon (this re-applies the nodal attachments)
         self.colon.reset(env_ids)
-        
+
         # CRITICAL: Step to update colon state after attachments
         self.sim.step()
-        
-        # Get entry positions AFTER stepping
-        self.entry_positions = self.colon.get_entry_pos(env_ids)
+
+        # Check if we should use CSV initialization
+        csv_init_file = self.config.get("env_config", {}).get("init_from_csv", None)
+
+        # Get entry positions AFTER stepping - load from CSV if provided
+        self.entry_positions = self.colon.get_entry_pos(env_ids, csv_filepath=csv_init_file)
         self.targets = self.colon.get_targets(env_ids)
 
         self.reward_function.reset(
             initial_positions=self.entry_positions,
             goals=self.targets,
         )
-        
+
         # Set robot position based on colon entry point
         self.robot.set_pos(self.entry_positions)
-        
+
         # Write and forward to update sim buffers
         self.scene.write_data_to_sim()
         self.sim.forward()
-        
+
         # Reset robot (which now starts at the correct position)
-        self.robot.reset(env_ids)
+
+        if csv_init_file is not None:
+            # Use CSV file for reset
+            self.robot.reset(env_ids, joint_positions=csv_init_file)
+        else:
+            # Use default behavior (random or straight)
+            use_random_init = self.config.get("env_config", {}).get("random_initial_configuration", True)
+            if use_random_init:
+                self.robot.reset(env_ids, joint_positions='random')
+            else:
+                self.robot.reset(env_ids)
 
         # Reset our internal environment flags
         self.goal_reached[env_ids] = False
