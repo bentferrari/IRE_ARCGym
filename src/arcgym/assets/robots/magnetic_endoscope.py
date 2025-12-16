@@ -57,6 +57,7 @@ class RobotEndoscopeChain(BaseRobot):
         )
         logging.info("Light created")
 
+
         # Register - The scene will call spawn() on the articulation during its setup
         self.scene.articulations['robot'] = self.robot
         logging.info("Continuum robot registered with scene")
@@ -498,7 +499,7 @@ class RobotEndoscopeChain(BaseRobot):
 
         # Scale actions
         actions = actions * action_scale
-        print("actions", actions)
+        #print("actions", actions)
 
         v_lr   = actions[:, 0]  # left/right
         v_ud   = actions[:, 1]  # up/down
@@ -536,6 +537,11 @@ class RobotEndoscopeChain(BaseRobot):
 
         # Write directly to simulation
         self.robot.write_root_velocity_to_sim(root_velocity)
+
+        # Print root position x, y, z for each environment
+        root_pos = self.robot.data.root_state_w[:, :3]  # (num_envs, 3)
+        for env_id in range(self.num_envs):
+            print(f"Env {env_id} - Root position: x={root_pos[env_id, 0]:.4f}, y={root_pos[env_id, 1]:.4f}, z={root_pos[env_id, 2]:.4f}")
 
         # Get accumulated stress from colon after applying action
         # if self.colon is not None:

@@ -20,10 +20,10 @@ model_full_path = os.path.join(model_folder, "noncollapsed_0000_origincollid.usd
 # Rotation to lay colon horizontally
 FLAT_ROTATION_Y = (0.7071068, 0, 0.7071068, 0)  # 90° rotation around Y-axis
 
-obj_model_full_path = os.path.join(model_folder, "noncollapsed_0000_shell.obj")
-#obj_model_full_path = os.path.join(model_folder, "surf_hole_0000_manual_blender.obj")
+#obj_model_full_path = os.path.join(model_folder, "noncollapsed_0000_shell.obj")
+#obj_model_full_path = os.path.join(model_folder, "shell_hole_0000.stl")
+obj_model_full_path = os.path.join(model_folder, "outputconv_shell_hole_0000.obj")
 shader_full_path = os.path.join(model_folder, "materials/colon_surface_material.usd")
-
 
 COLON_GEOM_MESH_CFG = MeshFileCfg(
                 file_path=obj_model_full_path,
@@ -34,7 +34,7 @@ COLON_GEOM_MESH_CFG = MeshFileCfg(
                                                                        contact_offset=0.001,     # Increased from 0.0001 for better collision detection
                                                                        self_collision=False,
                                                                        collision_simplification=False,
-                                                                       simulation_hexahedral_resolution=1, #16,    #simulation mesh resolution, default 10
+                                                                       simulation_hexahedral_resolution=8, #16,    #simulation mesh resolution, default 10
                                                                        #sleep_damping=0.5,
                                                                        vertex_velocity_damping=5.0,
                                                                        ),
@@ -53,11 +53,11 @@ COLON_GEOM_MESH_CFG_endoscope = MeshFileCfg(
                 scale=(0.01, 0.01, 0.01),
                 mass_props=sim_utils.MassPropertiesCfg(mass=10.0),
                 deformable_props=sim_utils.DeformableBodyPropertiesCfg(
-                                                                       rest_offset=0.0,        # Increased from 0.0 to prevent tunneling
-                                                                       contact_offset=0.001,     # Increased from 0.0001 for better collision detection
+                                                                       rest_offset=0.0,        # Negative value allows robot to get closer before collision
+                                                                       contact_offset=0.00001,     # Reduced to 0 to eliminate invisible collision boundary
                                                                        self_collision=False,
                                                                        collision_simplification=False,
-                                                                       simulation_hexahedral_resolution=1, #16,    #simulation mesh resolution, default 10
+                                                                       simulation_hexahedral_resolution=8, #16,    #simulation mesh resolution, default 10
                                                                        #sleep_damping=0.5,
                                                                        vertex_velocity_damping=5.0,
                                                                        ),
@@ -192,11 +192,11 @@ class ColonModelCfg:
     colon_body_cfg_endoscope = COLON_CFG_endoscope
     colon_body_rigid_cfg = COLON_RIGID_CFG
 
-    colon_attach_rectum_cfg = COLON_ENV_ATTACH_RECTUM_CFG
-    colon_attach_descend_cfg = COLON_ENV_ATTACH_DECEND_CFG
-    colon_attach_splenic_cfg = COLON_ENV_ATTACH_SPLENIC_CFG
-    colon_attach_hepatic_cfg = COLON_ENV_ATTACH_HEPATIC_CFG
-    colon_attach_cecum_cfg = COLON_ENV_ATTACH_CECUM_CFG
+    # colon_attach_rectum_cfg = COLON_ENV_ATTACH_RECTUM_CFG
+    # colon_attach_descend_cfg = COLON_ENV_ATTACH_DECEND_CFG
+    # colon_attach_splenic_cfg = COLON_ENV_ATTACH_SPLENIC_CFG
+    # colon_attach_hepatic_cfg = COLON_ENV_ATTACH_HEPATIC_CFG
+    # colon_attach_cecum_cfg = COLON_ENV_ATTACH_CECUM_CFG
 
 
 class ColonModel:
@@ -405,6 +405,7 @@ class ColonModel:
         # 5_envs_endoscope: 7.4029,  0.5015,  0.5500
         # 1_env_endoscope: 2.3976, 2.9910, 0.5599
         # 5_envs_capsule: 1.0783, 0.5391, 0.1505
+        # new_mesh: x=4.8430, y=-0.8624, z=-2.0058 lowest colon point
         robot_type = self.robot_config.get("robot_type", None)
         if robot_type == "capsule":
             entry_pos = torch.tensor([1.1899, 0.4953, 0.1229]).to(device)
@@ -415,7 +416,7 @@ class ColonModel:
                                         [-1.0, 0.0, 0.0]
                                         ]).to(device)
         else:
-            entry_pos = torch.tensor([7.4029,  0.5015,  0.5500]).to(device)
+            entry_pos = torch.tensor([5.6430,  -1.3124, -2.1]).to(device)
             delta_trans = torch.tensor([[0.0, 0.0, 0.0],
                                         [0.0, 5, 0.0],
                                         [-5, 0.0, 0.0],

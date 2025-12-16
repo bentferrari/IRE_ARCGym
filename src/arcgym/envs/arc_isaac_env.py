@@ -219,12 +219,11 @@ class ARCIsaacEnv(DirectRLEnv):
         self.robot = self.robot_factory.build_robot(
             scene=self.scene,
             init_pos=(0.22, 0.16, 0.4),
-            #init_rot=(0, 1, 0, 1),
             init_rot=init_rot,
             )
-
-        self.colon = ColonModel(self.scene, cfg=self.cfg.colon_cfg, cfg1=self.config,  init_pos=(0.5,0.5,0.1), #init_rot=(0.5, 0.5, 0.5, 0.5),
-        init_rot=(1.0, 0.0, 0.0, 0.0), is_rigid=False)
+        # endoscope init position x=7.4029, y=0.5015, z=0.5500
+        self.colon = ColonModel(self.scene, cfg=self.cfg.colon_cfg, cfg1=self.config,  init_pos=(0.5,0.5,0.1), #init_rot=(0.707, 0.0, -0.707, 0.0), init_rot=(1.0, 0.0, 0.0, 0.0)
+        init_rot=(0.707, 0.0, -0.707, 0.0), is_rigid=False)
 
         # Pass colon reference to robot for stress calculation
         if hasattr(self.robot, 'colon'):

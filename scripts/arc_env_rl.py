@@ -144,11 +144,11 @@ env_config = {
     "env_spacing" : env_spacing,
     "num_envs" : args_cli.num_envs,
     "replicate_physics" : False,
-    "action_scale" : 0.1,
+    "action_scale" : 1,
     "debug_vis" : False,
-    "episode_length_s" : 20.0,   # short episode for testing
+    "episode_length_s" : 1000.0,   # short episode for testing
     "constraint_point_A": 1,  # Distance from robot tip to constraint point A along the robot's local z-axis
-    "init_from_csv": "./saved_states/robot_state_20251215_112526.csv" if args_cli.train else None,
+    "init_from_csv": "./saved_states/robot_state_20251215_134107.csv" if args_cli.train else None,
     "random_initial_configuration": False  # Use straight configuration (especially for teleoperation mode)
 }
 
@@ -171,7 +171,7 @@ simulation_config = {
     # The physics simulation time-step (in seconds). Default is 0.0167 seconds.
     "render_interval": 4,
     # The number of physics simulation steps per rendering step. Default is 1.
-    "gravity" : (0.0, 0.0, -9.81),
+    "gravity" : (0.0, 0.0, 0),
     # The gravity vector (in m/s^2). Default is (0.0, 0.0, -9.81).
     # If set to (0.0, 0.0, 0.0), gravity is disabled.
     "enable_scene_query_support" : False,
