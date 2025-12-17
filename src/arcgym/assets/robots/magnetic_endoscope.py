@@ -109,7 +109,7 @@ class RobotEndoscopeChain(BaseRobot):
             joint_name = f"passive_{i}_joint"
             actuators[joint_name] = ImplicitActuatorCfg(
                 joint_names_expr=[f".*{joint_name}"],
-                effort_limit=1,
+                effort_limit=100,
                 velocity_limit=1.0,
                 stiffness=passive_stiffness,
                 damping=passive_damping,
@@ -134,13 +134,13 @@ class RobotEndoscopeChain(BaseRobot):
         for env_id in range(self.num_envs):
             env_path = f"/World/envs/env_{env_id}/Robot"
 
-            # Build chain: world_anchor (fixed root) → (prismatic) → passive_19 → ... → passive_1 → passive_0 (tip with camera)
-            # The articulation root is now the world_anchor, which is kinematically fixed
-            # This allows the prismatic joint to be part of the articulation
+            # Build chain: world_anchor (fixed root in X/Y) → (prismatic Z) → passive_0 (tip, X/Y fixed) → passive_1 → ... → passive_19 (free end)
+            # The articulation root is the world_anchor at the tip position
+            # The tip (passive_0) is constrained to only move in Z via prismatic joint
 
-            # Create a fixed world anchor as the articulation root
+            # Create a fixed world anchor at the tip position as the articulation root
             world_anchor_path = f"{env_path}/world_anchor"
-            world_anchor_pos = Gf.Vec3f(-(num_passive - 0.5) * link_height, 0.0, link_radius)
+            world_anchor_pos = Gf.Vec3f(-0.5 * link_height, 0.0, link_radius)  # At tip (passive_0) position
             # Create a very small fixed link as anchor
             anchor = UsdGeom.Sphere.Define(stage, world_anchor_path)
             anchor.CreateRadiusAttr().Set(0.001)  # Very small
@@ -190,16 +190,16 @@ class RobotEndoscopeChain(BaseRobot):
 
                 prev_link_path = link_path
 
-            # Create prismatic joint connecting world_anchor to passive_19 (last link)
-            # This allows passive_19 to slide along Z-axis (up/down)
-            last_link_path = f"{env_path}/passive_{num_passive - 1}"
+            # Create prismatic joint connecting world_anchor to passive_0 (tip)
+            # This allows passive_0 to slide along Z-axis (up/down) while X/Y are fixed
+            tip_link_path = f"{env_path}/passive_0"
             self._create_prismatic_joint(
                 stage=stage,
                 joint_name="world_prismatic_joint",
                 body0_path=world_anchor_path,
-                body1_path=last_link_path,
+                body1_path=tip_link_path,
                 local_pos0=Gf.Vec3f(0, 0, 0),  # Center of anchor
-                local_pos1=Gf.Vec3f(-link_height / 2, 0, 0),  # -X end of passive_19
+                local_pos1=Gf.Vec3f(link_height / 2, 0, 0),  # +X end of passive_0 (center of tip)
                 axis="Z",  # Allow sliding along Z-axis (up/down)
                 stiffness=1e3,
                 damping=1e3,
@@ -207,7 +207,7 @@ class RobotEndoscopeChain(BaseRobot):
             )
 
             # --- Structure ---
-            # world_anchor (root, fixed) → (prismatic) → passive_19 → ... → passive_1 → passive_0 (tip with camera)
+            # world_anchor (root, fixed in X/Y) → (prismatic Z) → passive_0 (tip with camera, X/Y fixed) → passive_1 → ... → passive_19 (free end)
 
             # --- Create a hollow tube around the robot for this env ---
             # tube_path = f"{env_path}/Tube"

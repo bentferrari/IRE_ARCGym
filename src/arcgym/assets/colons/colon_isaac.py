@@ -23,7 +23,8 @@ FLAT_ROTATION_Y = (0.7071068, 0, 0.7071068, 0)  # 90° rotation around Y-axis
 #obj_model_full_path = os.path.join(model_folder, "noncollapsed_0000_shell.obj")
 #obj_model_full_path = os.path.join(model_folder, "shell_hole_0000.stl")
 obj_model_full_path = os.path.join(model_folder, "outputconv_shell_hole_0000.obj")
-shader_full_path = os.path.join(model_folder, "materials/colon_surface_material.usd")
+shader_full_path = os.path.join(model_folder, "materials/colon_surface_material_realistic.usd")  # Use realistic material
+# shader_full_path = os.path.join(model_folder, "materials/colon_surface_material.usd")  # Original material
 
 COLON_GEOM_MESH_CFG = MeshFileCfg(
                 file_path=obj_model_full_path,
@@ -61,10 +62,15 @@ COLON_GEOM_MESH_CFG_endoscope = MeshFileCfg(
                                                                        #sleep_damping=0.5,
                                                                        vertex_velocity_damping=50.0,
                                                                        ),
-                #visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.7, 0.3, 0.3), opacity=1),  #seems not easy to get semi-transparent vis, have to turn on interactive rendering?
-                visual_material=UsdFileCfg(usd_path=shader_full_path),
+                #visual_material=sim_utils.PreviewSurfaceCfg(
+                #    diffuse_color=(0.95, 0.6, 0.55),  # More realistic pink/flesh color for colon
+                #    roughness=0.7,  # Add surface roughness for organic appearance
+                #    metallic=0.05,  # Slight wetness/shininess
+                #    opacity=1.0
+                #),
+                visual_material=UsdFileCfg(usd_path=shader_full_path),  # Original shader - uncomment to use
                 physics_material=DeformableBodyMaterialCfg(
-                        youngs_modulus=10000,
+                        youngs_modulus=100000,
                         poissons_ratio=0.49,
                         elasticity_damping=60,
                         ),
@@ -417,7 +423,7 @@ class ColonModel:
                                         [-1.0, 0.0, 0.0]
                                         ]).to(device)
         else:
-            entry_pos = torch.tensor([0.6076,  1.1364, -2.5]).to(device)
+            entry_pos = torch.tensor([0.6076,  1.1364, -1.9]).to(device)
             delta_trans = torch.tensor([[0.0, 0.0, 0.0],
                                         # [0.0, 5, 0.0],
                                         # [-5, 0.0, 0.0],

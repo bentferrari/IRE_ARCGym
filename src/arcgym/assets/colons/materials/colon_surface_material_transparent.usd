@@ -1,0 +1,23 @@
+#usda 1.0
+(
+    defaultPrim = "Root"
+    doc = """Transparent material for colon visualization"""
+    upAxis = "Z"
+)
+
+def Xform "Root"
+{
+    def Material "TransparentMaterial"
+    {
+        token outputs:surface.connect = </Root/TransparentMaterial/PreviewSurface.outputs:surface>
+
+        def Shader "PreviewSurface"
+        {
+            uniform token info:id = "UsdPreviewSurface"
+            color3f inputs:diffuseColor = (0.8, 0.5, 0.5)
+            float inputs:opacity = 0.2
+            float inputs:roughness = 0.4
+            token outputs:surface
+        }
+    }
+}

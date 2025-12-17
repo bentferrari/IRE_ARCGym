@@ -105,11 +105,11 @@ robot_config = {
     # Soft endoscope specific parameters (from original soft_endoscope.py)
     "num_passive_links" : 5,
     "num_active_links" : 5,
-    "num_links_total" : 40,
+    "num_links_total" : 50,
     "link_radius" : 0.01,
     "link_height" : 0.02,
-    "passive_stiffness" : 0.1,
-    "passive_damping" : 8,
+    "passive_stiffness" : 1e2,
+    "passive_damping" : 1e3,
     "active_stiffness" : 1e8,
     "active_damping" : 1e3,
     "max_linear_velocity": 1,
@@ -120,7 +120,7 @@ robot_config = {
     "front_camera_focal_length" : 5.0, 
     "front_camera_focus_distance" : 10.0, 
     "front_camera_horizontal_aperture" : 20, 
-    "front_camera_clipping_range" : (0.001, 0.2),
+    "front_camera_clipping_range" : (0.001, 5.0),
     "front_light_color" : (0.7, 0.7, 0.7), 
     "front_light_color_temperature" : 2000, 
     "front_light_intensity" : 3000,
@@ -148,7 +148,7 @@ env_config = {
     "debug_vis" : False,
     "episode_length_s" : 1000.0,   # short episode for testing
     "constraint_point_A": 1,  # Distance from robot tip to constraint point A along the robot's local z-axis
-    "init_from_csv": "./saved_states/robot_state_20251215_134107.csv" if args_cli.train else None,
+    "init_from_csv": "./saved_states/robot_state_20251217_153603.csv", #if args_cli.train else None,
     "random_initial_configuration": False  # Use straight configuration (especially for teleoperation mode)
 }
 
@@ -167,7 +167,7 @@ simulation_config = {
     # - ``"cpu"``: Use CPU.
     # - ``"cuda"``: Use GPU, where the device ID is inferred from :class:`~isaaclab.app.AppLauncher`'s config.
     # - ``"cuda:N"``: Use GPU, where N is the device ID. For example, "cuda:0".
-    "dt" : 1.0 / 120.0,
+    "dt" : 1.0 / 240.0,
     # The physics simulation time-step (in seconds). Default is 0.0167 seconds.
     "render_interval": 4,
     # The number of physics simulation steps per rendering step. Default is 1.
