@@ -51,7 +51,7 @@ COLON_GEOM_MESH_CFG = MeshFileCfg(
 COLON_GEOM_MESH_CFG_endoscope = MeshFileCfg(
                 file_path=obj_model_full_path,
                 scale=(0.01, 0.01, 0.01),
-                mass_props=sim_utils.MassPropertiesCfg(mass=10.0),
+                mass_props=sim_utils.MassPropertiesCfg(mass=100.0),
                 deformable_props=sim_utils.DeformableBodyPropertiesCfg(
                                                                        rest_offset=0.0,        # Negative value allows robot to get closer before collision
                                                                        contact_offset=0.00001,     # Reduced to 0 to eliminate invisible collision boundary
@@ -59,14 +59,14 @@ COLON_GEOM_MESH_CFG_endoscope = MeshFileCfg(
                                                                        collision_simplification=False,
                                                                        simulation_hexahedral_resolution=8, #16,    #simulation mesh resolution, default 10
                                                                        #sleep_damping=0.5,
-                                                                       vertex_velocity_damping=5.0,
+                                                                       vertex_velocity_damping=50.0,
                                                                        ),
                 #visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.7, 0.3, 0.3), opacity=1),  #seems not easy to get semi-transparent vis, have to turn on interactive rendering?
                 visual_material=UsdFileCfg(usd_path=shader_full_path),
                 physics_material=DeformableBodyMaterialCfg(
-                        youngs_modulus=100000,
+                        youngs_modulus=10000,
                         poissons_ratio=0.49,
-                        elasticity_damping=30,
+                        elasticity_damping=60,
                         ),
 
         )
@@ -405,7 +405,8 @@ class ColonModel:
         # 5_envs_endoscope: 7.4029,  0.5015,  0.5500
         # 1_env_endoscope: 2.3976, 2.9910, 0.5599
         # 5_envs_capsule: 1.0783, 0.5391, 0.1505
-        # new_mesh: x=4.8430, y=-0.8624, z=-2.0058 lowest colon point
+        # 5_envs_new_mesh: 5.6430,  -1.3124, -2.2
+        # 1_env_new_mesh: x=0.2211, y=1.6476, z=-2.0191 lowest colon point
         robot_type = self.robot_config.get("robot_type", None)
         if robot_type == "capsule":
             entry_pos = torch.tensor([1.1899, 0.4953, 0.1229]).to(device)
@@ -416,12 +417,12 @@ class ColonModel:
                                         [-1.0, 0.0, 0.0]
                                         ]).to(device)
         else:
-            entry_pos = torch.tensor([5.6430,  -1.3124, -2.1]).to(device)
+            entry_pos = torch.tensor([0.6076,  1.1364, -2.5]).to(device)
             delta_trans = torch.tensor([[0.0, 0.0, 0.0],
-                                        [0.0, 5, 0.0],
-                                        [-5, 0.0, 0.0],
-                                        [-5, 5, 0.0],
-                                        [-10, 0.0, 0.0]
+                                        # [0.0, 5, 0.0],
+                                        # [-5, 0.0, 0.0],
+                                        # [-5, 5, 0.0],
+                                        # [-10, 0.0, 0.0]
                                         ]).to(device)
 
         #print("entry_pos + delta_trans:", entry_pos + delta_trans)

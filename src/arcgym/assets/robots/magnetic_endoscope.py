@@ -85,14 +85,19 @@ class RobotEndoscopeChain(BaseRobot):
         passive_stiffness = robot_config.get("passive_stiffness", 1e2)
         passive_damping = robot_config.get("passive_damping", 1e3)
 
-        # 20 links -> 19 joints in the chain. All passive, no "active" joint indices.
-        self.num_joints = num_passive - 1
+        # 20 links -> 19 joints in the chain (passive_1_joint to passive_19_joint)
+        # Plus 1 prismatic joint to world = 20 total joints
+        num_revolute_joints = num_passive - 1  # 19 revolute joints connecting the links
+        self.num_joints = num_passive  # Total joints including prismatic = 20
         self.active_joint_indices = []  # all joints passive; no actively-driven section
-        
-        logging.info(f"Active joint indices: {self.active_joint_indices}, count: {len(self.active_joint_indices)}")
+        self.prismatic_joint_index = num_revolute_joints  # The prismatic joint is the last joint (index 19)
 
-        # Articulation root at passive_0 (the tip with camera)
-        prim_paths = f"/World/envs/env_.*/Robot/passive_0"
+        logging.info(f"Total joints: {self.num_joints} (19 revolute + 1 prismatic)")
+        logging.info(f"Active joint indices: {self.active_joint_indices}, count: {len(self.active_joint_indices)}")
+        logging.info(f"Prismatic joint index: {self.prismatic_joint_index}")
+
+        # Articulation root at world_anchor (fixed base)
+        prim_paths = f"/World/envs/env_.*/Robot/world_anchor"
 
         # === Define Actuators ===
         actuators = {}
@@ -104,11 +109,20 @@ class RobotEndoscopeChain(BaseRobot):
             joint_name = f"passive_{i}_joint"
             actuators[joint_name] = ImplicitActuatorCfg(
                 joint_names_expr=[f".*{joint_name}"],
-                effort_limit=1e1,
-                velocity_limit=10.0,
+                effort_limit=1,
+                velocity_limit=1.0,
                 stiffness=passive_stiffness,
                 damping=passive_damping,
             )
+
+        # Prismatic joint actuator (for up/down motion)
+        actuators["world_prismatic_joint"] = ImplicitActuatorCfg(
+            joint_names_expr=[".*world_prismatic_joint"],
+            effort_limit=1e4,
+            velocity_limit=10.0,
+            stiffness=1e3,
+            damping=1e3,
+        )
 
         # No base_joint, no active joints anymore
         # (All links passively follow the root via revolute joints with PD actuators)
@@ -120,8 +134,32 @@ class RobotEndoscopeChain(BaseRobot):
         for env_id in range(self.num_envs):
             env_path = f"/World/envs/env_{env_id}/Robot"
 
-            # Build chain with passive_0 as the root
-            # Structure: passive_0 (root, with camera) → passive_1 → passive_2 → ... → passive_19
+            # Build chain: world_anchor (fixed root) → (prismatic) → passive_19 → ... → passive_1 → passive_0 (tip with camera)
+            # The articulation root is now the world_anchor, which is kinematically fixed
+            # This allows the prismatic joint to be part of the articulation
+
+            # Create a fixed world anchor as the articulation root
+            world_anchor_path = f"{env_path}/world_anchor"
+            world_anchor_pos = Gf.Vec3f(-(num_passive - 0.5) * link_height, 0.0, link_radius)
+            # Create a very small fixed link as anchor
+            anchor = UsdGeom.Sphere.Define(stage, world_anchor_path)
+            anchor.CreateRadiusAttr().Set(0.001)  # Very small
+            anchor.AddTranslateOp().Set(world_anchor_pos)
+            anchor_prim = anchor.GetPrim()
+
+            # Make it the articulation root
+            UsdPhysics.ArticulationRootAPI.Apply(anchor_prim)
+            UsdPhysics.RigidBodyAPI.Apply(anchor_prim)
+
+            # Fix it in place by making it kinematically controlled (no dynamics)
+            physx_rigid_body_api = PhysxSchema.PhysxRigidBodyAPI.Apply(anchor_prim)
+            physx_rigid_body_api.CreateDisableGravityAttr().Set(False)
+            # Set very high mass to make it effectively immovable
+            mass_api = UsdPhysics.MassAPI.Apply(anchor_prim)
+            mass_api.CreateMassAttr().Set(1e10)  # Extremely heavy to stay fixed
+
+            # Disable collisions for the anchor
+            anchor_prim.CreateAttribute("physics:collisionEnabled", Sdf.ValueTypeNames.Bool).Set(False)
 
             prev_link_path = None
 
@@ -132,11 +170,8 @@ class RobotEndoscopeChain(BaseRobot):
                 pos = Gf.Vec3f(-(i + 0.5) * link_height, 0.0, link_radius)
                 self._create_link(stage, link_path, link_radius, link_height, pos, color=PASSIVE_COLOR)
 
-                if i == 0:
-                    # passive_0: articulation root (with camera and light at +X end)
-                    link_prim = stage.GetPrimAtPath(link_path)
-                    UsdPhysics.ArticulationRootAPI.Apply(link_prim)
-                else:
+                # passive_0 is now NOT the articulation root, just a regular link
+                if i >= 1:
                     # passive_1 onwards: revolute joints connecting to previous link
                     # Connect at -X end of previous link to +X end of current link
                     axis = "Z" if i % 2 == 1 else "Y"
@@ -155,8 +190,24 @@ class RobotEndoscopeChain(BaseRobot):
 
                 prev_link_path = link_path
 
-            # --- No Base Link / Active Links / Tip ---
-            # passive_0 is the root, passive_19 is the distal end
+            # Create prismatic joint connecting world_anchor to passive_19 (last link)
+            # This allows passive_19 to slide along Z-axis (up/down)
+            last_link_path = f"{env_path}/passive_{num_passive - 1}"
+            self._create_prismatic_joint(
+                stage=stage,
+                joint_name="world_prismatic_joint",
+                body0_path=world_anchor_path,
+                body1_path=last_link_path,
+                local_pos0=Gf.Vec3f(0, 0, 0),  # Center of anchor
+                local_pos1=Gf.Vec3f(-link_height / 2, 0, 0),  # -X end of passive_19
+                axis="Z",  # Allow sliding along Z-axis (up/down)
+                stiffness=1e3,
+                damping=1e3,
+                target_pos=0.0
+            )
+
+            # --- Structure ---
+            # world_anchor (root, fixed) → (prismatic) → passive_19 → ... → passive_1 → passive_0 (tip with camera)
 
             # --- Create a hollow tube around the robot for this env ---
             # tube_path = f"{env_path}/Tube"
@@ -222,11 +273,11 @@ class RobotEndoscopeChain(BaseRobot):
         UsdPhysics.CollisionAPI.Apply(prim)
         mass_api = UsdPhysics.MassAPI.Apply(prim)
         #mass_api.CreateDensityAttr().Set(1000.0)
-        mass_api.CreateMassAttr().Set(100)
+        mass_api.CreateMassAttr().Set(200)
 
         # Disable gravity for this rigid body
         physx_rigid_body_api = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
-        physx_rigid_body_api.CreateDisableGravityAttr().Set(True)
+        physx_rigid_body_api.CreateDisableGravityAttr().Set(False)
 
         # Enable contact reporting
         prim.SetCustomData({"physxContactReport:enabled": True})
@@ -245,15 +296,48 @@ class RobotEndoscopeChain(BaseRobot):
 
         # Set joint limits to prevent excessive bending
         # Limit to ±30 degrees (±0.524 radians)
-        joint.CreateLowerLimitAttr().Set(-1.0)  # degrees
-        joint.CreateUpperLimitAttr().Set(1.0)   # degrees
+        joint.CreateLowerLimitAttr().Set(-30.0)  # degrees
+        joint.CreateUpperLimitAttr().Set(30.0)   # degrees
 
         drive = UsdPhysics.DriveAPI.Apply(joint.GetPrim(), "angular")
         drive.CreateTypeAttr().Set("position")
         drive.CreateTargetPositionAttr().Set(target_pos)
         drive.CreateStiffnessAttr().Set(stiffness)
         drive.CreateDampingAttr().Set(damping)
-        drive.CreateMaxForceAttr().Set(1e2)
+        drive.CreateMaxForceAttr().Set(1e1)
+
+    def _create_prismatic_joint(self, stage, joint_name, body0_path, body1_path,
+                                local_pos0, local_pos1, axis, stiffness, damping, target_pos):
+        """Create a prismatic (sliding) joint along specified axis.
+
+        If body1_path is None or empty, the joint connects to the world (fixed frame).
+        """
+        joint_path = f"{body0_path}/{joint_name}"
+        joint = UsdPhysics.PrismaticJoint.Define(stage, joint_path)
+        joint.CreateBody0Rel().SetTargets([body0_path])
+
+        # Only set body1 if a path is provided (otherwise it connects to world)
+        if body1_path:
+            joint.CreateBody1Rel().SetTargets([body1_path])
+
+        joint.CreateAxisAttr().Set(axis)
+        joint.CreateLocalPos0Attr().Set(local_pos0)
+        joint.CreateLocalPos1Attr().Set(local_pos1)
+        joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0))
+        joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0))
+
+        # Set joint limits (allowing movement along the axis)
+        joint.CreateLowerLimitAttr().Set(-1.0)  # meters
+        joint.CreateUpperLimitAttr().Set(1.0)   # meters
+
+        drive = UsdPhysics.DriveAPI.Apply(joint.GetPrim(), "linear")
+        drive.CreateTypeAttr().Set("force")
+        drive.CreateTargetPositionAttr().Set(target_pos)
+        drive.CreateStiffnessAttr().Set(stiffness)
+        drive.CreateDampingAttr().Set(damping)
+        drive.CreateMaxForceAttr().Set(1e4)
+
+        return joint
 
     def _create_d6_joint(self, stage, joint_name, body0_path, body1_path,
                         local_pos0, local_pos1):
@@ -481,17 +565,19 @@ class RobotEndoscopeChain(BaseRobot):
 
     def apply_action(self, actions: torch.Tensor, action_scale: float = 1.0) -> None:
         """
-        Apply 6-DoF velocity commands directly to the robot root (passive_0).
+        Apply actions: prismatic joint controls Z motion, anchor position controls X/Y motion and rotation.
 
         Actions (per env):
-            [0] v_left_right   (m/s along local +Y, -Y)
-            [1] v_up_down      (m/s along local +Z, -Z)
-            [2] v_forward_back (m/s along local +X, -X)
-            [3] ω_roll         (rad/s around local X)
-            [4] ω_pitch        (rad/s around local Y)
-            [5] ω_yaw          (rad/s around local Z)
+            [0] v_left_right   (m/s along local +Y, -Y) - applied to anchor position
+            [1] v_up_down      (m/s along Z) - applied to PRISMATIC JOINT
+            [2] v_forward_back (m/s along local +X, -X) - applied to anchor position
+            [3] ω_roll         (rad/s around local X) - applied to anchor rotation
+            [4] ω_pitch        (rad/s around local Y) - applied to anchor rotation
+            [5] ω_yaw          (rad/s around local Z) - applied to anchor rotation
 
-        passive_0 (with camera) is the articulation root. The rest of the chain passively follows.
+        Structure: world_anchor (root) → (prismatic Z) → passive_19 → ... → passive_0 (tip with camera)
+        The anchor can be repositioned to move the entire chain in X/Y and rotate it.
+        The prismatic joint controls Z motion independently.
         """
         if not self._is_initialized:
             logging.warning("Cannot apply action - robot not initialized yet")
@@ -499,57 +585,46 @@ class RobotEndoscopeChain(BaseRobot):
 
         # Scale actions
         actions = actions * action_scale
-        #print("actions", actions)
 
-        v_lr   = actions[:, 0]  # left/right
-        v_ud   = actions[:, 1]  # up/down
-        v_fb   = actions[:, 2]  # forward/back
+        v_lr = actions[:, 0]  # left/right
+        v_ud = actions[:, 1]  # up/down (applied to prismatic joint)
+        v_fb = actions[:, 2]  # forward/back
         w_roll = actions[:, 5]  # roll
-        w_pitch= -actions[:, 3]  # pitch
-        w_yaw  = actions[:, 4]  # yaw
+        w_pitch = -actions[:, 3]  # pitch
+        w_yaw = actions[:, 4]  # yaw
 
-        # Get current orientation to transform velocities from local to world frame
+        # Get current anchor (root) orientation
         current_quat = self.robot.data.root_state_w[:, 3:7]  # (num_envs, 4)
 
         # ------------------------------------------------------------
-        # 1. LINEAR VELOCITY (transform from local to world frame)
+        # 1. APPLY X/Y LINEAR VELOCITY TO ANCHOR (no Z component)
         # ------------------------------------------------------------
-        # Local velocity vector [forward, left/right, up/down]
-        local_linear_vel = torch.stack([v_fb, v_lr, v_ud], dim=1)  # (num_envs, 3)
-
-        # Transform to world frame
+        local_linear_vel = torch.stack([v_fb, v_lr, torch.zeros_like(v_ud)], dim=1)  # (num_envs, 3)
         world_linear_vel = quat_apply(current_quat, local_linear_vel)
 
         # ------------------------------------------------------------
-        # 2. ANGULAR VELOCITY (transform from local to world frame)
+        # 2. APPLY ANGULAR VELOCITY TO ANCHOR
         # ------------------------------------------------------------
-        # Local angular velocity vector [roll, pitch, yaw]
         local_angular_vel = torch.stack([w_roll, w_pitch, w_yaw], dim=1)  # (num_envs, 3)
-
-        # Transform to world frame
         world_angular_vel = quat_apply(current_quat, local_angular_vel)
 
-        # ------------------------------------------------------------
-        # 3. WRITE VELOCITIES TO SIMULATION
-        # ------------------------------------------------------------
-        # Combine into root velocity: [linear_vel (3), angular_vel (3)]
-        root_velocity = torch.cat([world_linear_vel, world_angular_vel], dim=1)  # (num_envs, 6)
-
-        # Write directly to simulation
+        # Combine and write anchor velocity
+        root_velocity = torch.cat([world_linear_vel, 5 * world_angular_vel], dim=1)  # (num_envs, 6)
         self.robot.write_root_velocity_to_sim(root_velocity)
 
-        # Print root position x, y, z for each environment
+        # ------------------------------------------------------------
+        # 3. APPLY v_ud TO PRISMATIC JOINT
+        # ------------------------------------------------------------
+        joint_velocities = torch.zeros((self.num_envs, self.robot.num_joints), device=self.device)
+        prismatic_idx = 0  # First joint connecting anchor to passive_19
+        joint_velocities[:, prismatic_idx] = v_ud
+
+        self.robot.set_joint_velocity_target(joint_velocities)
+
+        # Print anchor position for debugging
         root_pos = self.robot.data.root_state_w[:, :3]  # (num_envs, 3)
         for env_id in range(self.num_envs):
-            print(f"Env {env_id} - Root position: x={root_pos[env_id, 0]:.4f}, y={root_pos[env_id, 1]:.4f}, z={root_pos[env_id, 2]:.4f}")
-
-        # Get accumulated stress from colon after applying action
-        # if self.colon is not None:
-        #     try:
-        #         stress = self.colon.get_accumulated_stress()
-        #         print(f"Colon accumulated stress: {stress}")
-        #     except Exception as e:
-        #         logging.debug(f"Could not get colon stress: {e}")
+            print(f"Env {env_id} - Anchor position: x={root_pos[env_id, 0]:.4f}, y={root_pos[env_id, 1]:.4f}, z={root_pos[env_id, 2]:.4f}")
 
 
     def get_observation(self, use_pose_in_obs=False, use_camera=None) -> dict:

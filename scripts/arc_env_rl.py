@@ -107,9 +107,9 @@ robot_config = {
     "num_active_links" : 5,
     "num_links_total" : 40,
     "link_radius" : 0.01,
-    "link_height" : 0.1,
-    "passive_stiffness" : 1e1,
-    "passive_damping" : 1e4,
+    "link_height" : 0.02,
+    "passive_stiffness" : 0.1,
+    "passive_damping" : 8,
     "active_stiffness" : 1e8,
     "active_damping" : 1e3,
     "max_linear_velocity": 1,
@@ -144,7 +144,7 @@ env_config = {
     "env_spacing" : env_spacing,
     "num_envs" : args_cli.num_envs,
     "replicate_physics" : False,
-    "action_scale" : 1,
+    "action_scale" : 0.1,
     "debug_vis" : False,
     "episode_length_s" : 1000.0,   # short episode for testing
     "constraint_point_A": 1,  # Distance from robot tip to constraint point A along the robot's local z-axis
@@ -167,11 +167,11 @@ simulation_config = {
     # - ``"cpu"``: Use CPU.
     # - ``"cuda"``: Use GPU, where the device ID is inferred from :class:`~isaaclab.app.AppLauncher`'s config.
     # - ``"cuda:N"``: Use GPU, where N is the device ID. For example, "cuda:0".
-    "dt" : 1.0 / 240.0,
+    "dt" : 1.0 / 120.0,
     # The physics simulation time-step (in seconds). Default is 0.0167 seconds.
     "render_interval": 4,
     # The number of physics simulation steps per rendering step. Default is 1.
-    "gravity" : (0.0, 0.0, 0),
+    "gravity" : (0, 0.0, 0),
     # The gravity vector (in m/s^2). Default is (0.0, 0.0, -9.81).
     # If set to (0.0, 0.0, 0.0), gravity is disabled.
     "enable_scene_query_support" : False,
@@ -257,10 +257,10 @@ physx_config = {
     #     Each physics actor in Omniverse specifies its own solver iteration count. The solver takes
     #     the number of iterations specified by the actor with the highest iteration and clamps it to
     #     the range ``[min_velocity_iteration_count, max_velocity_iteration_count]``.
-    "enable_ccd" : False,
+    "enable_ccd" : True,
     # Enable a second broad-phase pass that makes it possible to prevent objects from tunneling through each other.
     # Default is False.
-    "enable_stabilization" : False,
+    "enable_stabilization" : True,
     # Enable/disable additional stabilization pass in solver. Default is False.
     # .. note::
     #     We recommend setting this flag to true only when the simulation step size is large (i.e., less than 30 Hz or more than 0.0333 seconds).
