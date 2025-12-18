@@ -1,7 +1,8 @@
 #usda 1.0
 (
     defaultPrim = "Root"
-    doc = """Generated from Composed Stage of root layer /home/hans/projects/arcgym/src/arcgym/assets/colons/materials/colon_surface_material.usd
+    doc = """Colon surface material (final, UV-based, no tiling).
+Generated from /home/hans/projects/arcgym/src/arcgym/assets/colons/materials/colon_surface_material.usd
 """
     upAxis = "Z"
 )
@@ -11,40 +12,41 @@ def Xform "Root"
     def Material "OmniSurface"
     {
         token outputs:mdl:displacement.connect = </Root/OmniSurface/Shader.outputs:out>
-        token outputs:mdl:surface.connect = </Root/OmniSurface/Shader.outputs:out>
-        token outputs:mdl:volume.connect = </Root/OmniSurface/Shader.outputs:out>
-        custom uniform bool paused = 0 (
-            customData = {
-                bool nonpersistant = 1
-            }
-            hidden = true
-        )
+        token outputs:mdl:surface.connect      = </Root/OmniSurface/Shader.outputs:out>
+        token outputs:mdl:volume.connect       = </Root/OmniSurface/Shader.outputs:out>
+
         token ui:displayGroup = "Material Graphs"
-        token ui:displayName = "OmniSurface"
-        int ui:order = 1024
-        uniform token[] xformOpOrder = []
+        token ui:displayName  = "OmniSurface"
+        int   ui:order        = 1024
 
         def Shader "Shader"
         {
             uniform token info:implementationSource = "sourceAsset"
-            uniform asset info:mdl:sourceAsset = @OmniSurface.mdl@
+            uniform asset info:mdl:sourceAsset      = @OmniSurface.mdl@
             uniform token info:mdl:sourceAsset:subIdentifier = "OmniSurface"
+
+            # Base color texture (use mesh UVs)
             asset inputs:diffuse_reflection_color_image = @../textures/colon_texture_test.png@ (
-                colorSpace = "auto"
+                colorSpace = "sRGB"
             )
-            float inputs:diffuse_reflection_weight = 0.39999998
-            bool inputs:enable_diffuse_transmission = 1
-            float inputs:specular_reflection_roughness = 0.099999994
-            float inputs:specular_reflection_weight = 0.099999994
-            float inputs:subsurface_weight = 0.19999999
-            int inputs:uvw_projection_mode = 6
-            float inputs:uvw_s_scale = 10
-            float inputs:uvw_t_scale = 10
-            int inputs:uvw_texture_coordinate_system = 1
+
+            # ---- Optical properties (unchanged) ----
+            float inputs:diffuse_reflection_weight        = 0.4
+            bool  inputs:enable_diffuse_transmission      = 1
+            float inputs:specular_reflection_weight       = 0.1
+            float inputs:specular_reflection_roughness    = 0.1
+            float inputs:subsurface_weight                = 0.2
+
+            # ---- UV configuration (CRITICAL FIX) ----
+            # Use mesh UV coordinates
+            int   inputs:uvw_projection_mode              = 0   # UV coordinates
+            int   inputs:uvw_texture_coordinate_system    = 1   # UV set 0
+            float inputs:uvw_s_scale                      = 1.0
+            float inputs:uvw_t_scale                      = 1.0
+
             token outputs:out (
                 renderType = "material"
             )
         }
     }
 }
-

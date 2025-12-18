@@ -108,8 +108,8 @@ robot_config = {
     "num_links_total" : 50,
     "link_radius" : 0.01,
     "link_height" : 0.02,
-    "passive_stiffness" : 1e2,
-    "passive_damping" : 1e3,
+    "passive_stiffness" : 1e1,
+    "passive_damping" : 1e2,
     "active_stiffness" : 1e8,
     "active_damping" : 1e3,
     "max_linear_velocity": 1,
@@ -121,11 +121,11 @@ robot_config = {
     "front_camera_focus_distance" : 10.0, 
     "front_camera_horizontal_aperture" : 20, 
     "front_camera_clipping_range" : (0.001, 5.0),
-    "front_light_color" : (0.7, 0.7, 0.7), 
-    "front_light_color_temperature" : 2000, 
-    "front_light_intensity" : 3000,
-    "front_light_radius" : 0.005,
-    "front_light_exposure" : 5,
+    "front_light_color" : (1.0, 1.0, 1.0),  # Pure white for maximum contrast
+    "front_light_color_temperature" : 6500,  # Daylight color temp for natural appearance
+    "front_light_intensity" : 30000,  # Very high intensity for bright tissue highlights (was 4000)
+    "front_light_radius" : 0.005,  # Smaller point source for stronger falloff/contrast (was 0.01)
+    "front_light_exposure" : 6,  # Lower exposure to darken lumen center (was 7)
     "num_segments": 20,
     "joint_stiffness": 1e4,  # Adjust for desired compliance
     "joint_damping": 1e3,
@@ -144,7 +144,7 @@ env_config = {
     "env_spacing" : env_spacing,
     "num_envs" : args_cli.num_envs,
     "replicate_physics" : False,
-    "action_scale" : 0.1,
+    "action_scale" : 0.3,
     "debug_vis" : False,
     "episode_length_s" : 1000.0,   # short episode for testing
     "constraint_point_A": 1,  # Distance from robot tip to constraint point A along the robot's local z-axis
@@ -169,7 +169,7 @@ simulation_config = {
     # - ``"cuda:N"``: Use GPU, where N is the device ID. For example, "cuda:0".
     "dt" : 1.0 / 240.0,
     # The physics simulation time-step (in seconds). Default is 0.0167 seconds.
-    "render_interval": 4,
+    "render_interval": 2,
     # The number of physics simulation steps per rendering step. Default is 1.
     "gravity" : (0, 0.0, 0),
     # The gravity vector (in m/s^2). Default is (0.0, 0.0, -9.81).
@@ -222,7 +222,7 @@ render_config = {
 	# Int. Defines the Direct Lighting samples per pixel. Higher values increase the direct lighting quality at the cost of performance.
     "enable_shadows" : True,
 	# Bool. Enables shadows at the cost of performance. When disabled, lights will not cast shadows.
-    "enable_ambient_occlusion" : False,
+    "enable_ambient_occlusion" : True,  # Enable to darken recessed areas (lumen center)
 	# Bool. Enables ambient occlusion at the cost of some performance.
 }
 

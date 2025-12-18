@@ -23,8 +23,8 @@ FLAT_ROTATION_Y = (0.7071068, 0, 0.7071068, 0)  # 90° rotation around Y-axis
 #obj_model_full_path = os.path.join(model_folder, "noncollapsed_0000_shell.obj")
 #obj_model_full_path = os.path.join(model_folder, "shell_hole_0000.stl")
 obj_model_full_path = os.path.join(model_folder, "outputconv_shell_hole_0000.obj")
-shader_full_path = os.path.join(model_folder, "materials/colon_surface_material_realistic.usd")  # Use realistic material
-# shader_full_path = os.path.join(model_folder, "materials/colon_surface_material.usd")  # Original material
+#shader_full_path = os.path.join(model_folder, "materials/colon_surface_material_realistic.usd")  # Use realistic material
+shader_full_path = os.path.join(model_folder, "materials/colon_surface_material.usd")  # Original material
 
 COLON_GEOM_MESH_CFG = MeshFileCfg(
                 file_path=obj_model_full_path,
@@ -42,7 +42,7 @@ COLON_GEOM_MESH_CFG = MeshFileCfg(
                 #visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.7, 0.3, 0.3), opacity=1),  #seems not easy to get semi-transparent vis, have to turn on interactive rendering?
                 visual_material=UsdFileCfg(usd_path=shader_full_path),
                 physics_material=DeformableBodyMaterialCfg(
-                        youngs_modulus=100000,
+                        youngs_modulus=2e6,
                         poissons_ratio=0.49,
                         elasticity_damping=30,
                         ),
@@ -70,7 +70,7 @@ COLON_GEOM_MESH_CFG_endoscope = MeshFileCfg(
                 #),
                 visual_material=UsdFileCfg(usd_path=shader_full_path),  # Original shader - uncomment to use
                 physics_material=DeformableBodyMaterialCfg(
-                        youngs_modulus=100000,
+                        youngs_modulus=2e6,
                         poissons_ratio=0.49,
                         elasticity_damping=60,
                         ),

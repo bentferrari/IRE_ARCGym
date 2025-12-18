@@ -153,7 +153,7 @@ class RobotEndoscopeChain(BaseRobot):
 
             # Fix it in place by making it kinematically controlled (no dynamics)
             physx_rigid_body_api = PhysxSchema.PhysxRigidBodyAPI.Apply(anchor_prim)
-            physx_rigid_body_api.CreateDisableGravityAttr().Set(False)
+            physx_rigid_body_api.CreateDisableGravityAttr().Set(True)
             # Set very high mass to make it effectively immovable
             mass_api = UsdPhysics.MassAPI.Apply(anchor_prim)
             mass_api.CreateMassAttr().Set(1e10)  # Extremely heavy to stay fixed
