@@ -599,7 +599,7 @@ class RobotEndoscopeChain(BaseRobot):
         # ------------------------------------------------------------
         # 1. APPLY X/Y LINEAR VELOCITY TO ANCHOR (no Z component)
         # ------------------------------------------------------------
-        local_linear_vel = torch.stack([v_fb, v_lr, torch.zeros_like(v_ud)], dim=1)  # (num_envs, 3)
+        local_linear_vel = torch.stack([v_fb, v_lr, v_ud], dim=1)  # (num_envs, 3)
         world_linear_vel = quat_apply(current_quat, local_linear_vel)
 
         # ------------------------------------------------------------
@@ -615,16 +615,16 @@ class RobotEndoscopeChain(BaseRobot):
         # ------------------------------------------------------------
         # 3. APPLY v_ud TO PRISMATIC JOINT
         # ------------------------------------------------------------
-        joint_velocities = torch.zeros((self.num_envs, self.robot.num_joints), device=self.device)
-        prismatic_idx = 0  # First joint connecting anchor to passive_19
-        joint_velocities[:, prismatic_idx] = v_ud
+        # joint_velocities = torch.zeros((self.num_envs, self.robot.num_joints), device=self.device)
+        # prismatic_idx = 0  # First joint connecting anchor to passive_19
+        # joint_velocities[:, prismatic_idx] = v_ud
 
-        self.robot.set_joint_velocity_target(joint_velocities)
+        # self.robot.set_joint_velocity_target(joint_velocities)
 
         # Print anchor position for debugging
         root_pos = self.robot.data.root_state_w[:, :3]  # (num_envs, 3)
-        for env_id in range(self.num_envs):
-            print(f"Env {env_id} - Anchor position: x={root_pos[env_id, 0]:.4f}, y={root_pos[env_id, 1]:.4f}, z={root_pos[env_id, 2]:.4f}")
+        # for env_id in range(self.num_envs):
+        #     print(f"Env {env_id} - Anchor position: x={root_pos[env_id, 0]:.4f}, y={root_pos[env_id, 1]:.4f}, z={root_pos[env_id, 2]:.4f}")
 
 
     def get_observation(self, use_pose_in_obs=False, use_camera=None) -> dict:

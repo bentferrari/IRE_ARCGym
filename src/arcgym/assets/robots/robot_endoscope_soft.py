@@ -17,7 +17,7 @@ from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.utils.math import quat_apply
 from isaaclab.utils.math import quat_from_euler_xyz, quat_mul
 
-class RobotEndoscopeChain(BaseRobot):
+class SoftEndoscopeChain(BaseRobot):
     def __init__(self, scene, config, isaac_cfg, init_pos, init_rot, device):
         self.config = config
         self.isaac_cfg = isaac_cfg
@@ -203,9 +203,24 @@ class RobotEndoscopeChain(BaseRobot):
                 prev_link_path = link_path
 
             # --- Tip Mount ---
+            # Attach tip to the last active link with a fixed joint
             tip_path = f"{env_path}/tip"
             tip_prim = UsdGeom.Xform.Define(stage, tip_path)
-            tip_prim.AddTranslateOp().Set(Gf.Vec3f(link_height / 2, 0, 0))
+            tip_prim.AddTranslateOp().Set(Gf.Vec3f((num_active + 0.5) * link_height, 0.0, link_radius))
+
+            # Make tip a rigid body so it can be part of articulation
+            tip_prim_obj = tip_prim.GetPrim()
+            UsdPhysics.RigidBodyAPI.Apply(tip_prim_obj)
+
+            # Create fixed joint to attach tip to last active link
+            fixed_joint_path = f"{prev_link_path}/tip_fixed_joint"
+            fixed_joint = UsdPhysics.FixedJoint.Define(stage, fixed_joint_path)
+            fixed_joint.CreateBody0Rel().SetTargets([prev_link_path])
+            fixed_joint.CreateBody1Rel().SetTargets([tip_path])
+            fixed_joint.CreateLocalPos0Attr().Set(Gf.Vec3f(link_height / 2, 0, 0))  # +X end of last link
+            fixed_joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0, 0, 0))  # Center of tip
+            fixed_joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0))
+            fixed_joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0))
 
             # # --- Create a hollow tube around the robot for this env ---
             # tube_path = f"{env_path}/Tube"
@@ -550,41 +565,53 @@ class RobotEndoscopeChain(BaseRobot):
         # ============================================================
         # Get current joint positions
         current_joint_pos = self.robot.data.joint_pos[:, self.active_joint_indices]
-        
+
         # Identify Y-axis (pitch) and Z-axis (yaw) joints
-        y_joints = []  # Pitch joints
-        z_joints = []  # Yaw joints
-        
+        # Note: Y-axis joints control pitch (up/down), Z-axis joints control yaw (left/right)
+        y_joints = []  # Y-axis rotation joints (pitch control)
+        z_joints = []  # Z-axis rotation joints (yaw control)
+
         for local_idx in range(len(self.active_joint_indices)):
             link_num = local_idx + 1
             if link_num % 2 == 1:
-                z_joints.append(local_idx)
+                z_joints.append(local_idx)  # Odd links have Z-axis joints
             else:
-                y_joints.append(local_idx)
-        
+                y_joints.append(local_idx)  # Even links have Y-axis joints
+
         # Calculate target position increments
         new_joint_pos = current_joint_pos.clone()
-        
+
         if len(y_joints) > 0:
             pitch_per_joint = (pitch_rate * dt) / len(y_joints)
             for idx in y_joints:
                 new_joint_pos[:, idx] += pitch_per_joint
-        
+
         if len(z_joints) > 0:
             yaw_per_joint = (yaw_rate * dt) / len(z_joints)
             for idx in z_joints:
                 new_joint_pos[:, idx] += yaw_per_joint
+
+        # Debug: Log actions if non-zero
+        if torch.any(torch.abs(pitch_rate) > 0.01) or torch.any(torch.abs(yaw_rate) > 0.01):
+            logging.debug(f"Actions - pitch: {pitch_rate[0]:.3f}, yaw: {yaw_rate[0]:.3f}, " +
+                         f"pitch_per_joint: {pitch_per_joint[0] if len(y_joints) > 0 else 0:.4f}, " +
+                         f"yaw_per_joint: {yaw_per_joint[0] if len(z_joints) > 0 else 0:.4f}")
         
         # Clamp to joint limits
         max_angle = math.pi / 4
         new_joint_pos = torch.clamp(new_joint_pos, -max_angle, max_angle)
-        
+
         # Apply smoothing
-        smoothing = 3
+        smoothing = 0.3
         smoothed_pos = current_joint_pos + smoothing * (new_joint_pos - current_joint_pos)
-        
-        # Set joint targets
-        self.robot.set_joint_position_target(smoothed_pos, joint_ids=self.active_joint_indices)
+
+        # Create full joint position target array (all joints)
+        full_joint_targets = self.robot.data.joint_pos.clone()
+        # Update only the active joints
+        full_joint_targets[:, self.active_joint_indices] = smoothed_pos
+
+        # Set joint targets for all joints
+        self.robot.set_joint_position_target(full_joint_targets)
 
     def get_observation(self, use_pose_in_obs=False, use_camera=None) -> dict:
         use_camera = use_camera if use_camera is not None else self.use_camera
@@ -633,8 +660,115 @@ class RobotEndoscopeChain(BaseRobot):
         if init_rot is not None:
             self.init_rot = torch.tensor(init_rot, device=self.device)
 
-    def reset(self, env_ids: torch.Tensor = None) -> None:
-        """Reset robot to initial pose."""
+    def _load_joint_positions_from_csv(self, csv_filepath: str, num_envs: int, source_env_id: int = 0) -> torch.Tensor:
+        """Load joint positions from a CSV file saved during teleoperation.
+
+        Args:
+            csv_filepath: Path to the CSV file (e.g., "saved_states/robot_state_20251215_143022.csv")
+            num_envs: Number of environments to generate positions for
+            source_env_id: Which environment's configuration to use from the CSV (default: 0)
+
+        Returns:
+            Joint positions tensor. Shape: (num_envs, num_joints)
+        """
+        import pandas as pd
+        import os
+
+        if not os.path.exists(csv_filepath):
+            raise FileNotFoundError(f"CSV file not found: {csv_filepath}")
+
+        # Load the CSV
+        df = pd.read_csv(csv_filepath)
+
+        # Verify source environment exists
+        if source_env_id not in df['env_id'].values:
+            raise ValueError(f"Environment {source_env_id} not found in CSV file. Available: {df['env_id'].values.tolist()}")
+
+        # Get the row for source environment
+        row = df[df['env_id'] == source_env_id].iloc[0]
+
+        # Extract joint positions
+        joint_cols = [col for col in df.columns if col.startswith('joint_') and col.endswith('_pos')]
+        joint_cols = sorted(joint_cols, key=lambda x: int(x.split('_')[1]))  # Sort by joint number
+        joint_positions = [row[col] for col in joint_cols]
+
+        # Verify number of joints matches
+        if len(joint_positions) != self.robot.num_joints:
+            raise ValueError(
+                f"Number of joints in CSV ({len(joint_positions)}) doesn't match robot ({self.robot.num_joints})"
+            )
+
+        # Convert to tensor and replicate for all environments
+        joint_pos_single = torch.tensor(joint_positions, dtype=torch.float32, device=self.device)
+        joint_pos = joint_pos_single.unsqueeze(0).repeat(num_envs, 1)
+
+        logging.info(f"Loaded joint positions from {csv_filepath} (env {source_env_id})")
+        return joint_pos
+
+    def generate_random_joint_positions(
+        self,
+        num_configs: int = None,
+        max_angle: float = 0.5,
+        smoothness: float = 0.8,
+        ) -> torch.Tensor:
+        """Generate reasonable random joint configurations for the robot.
+
+        Creates smooth, physically plausible joint configurations by using adjacent
+        joint correlation to avoid sharp bends.
+
+        Args:
+            num_configs: Number of configurations to generate. If None, generates for all envs.
+            max_angle: Maximum joint angle in radians. Default: 0.5 (~28.6 degrees)
+            smoothness: Smoothness factor (0-1). Higher values create smoother curves.
+                       0 = completely random, 1 = very smooth gradual bending.
+
+        Returns:
+            Random joint positions. Shape: (num_configs, num_joints)
+        """
+        if num_configs is None:
+            num_configs = self.num_envs
+
+        num_joints = self.robot.num_joints
+
+        # Generate base random values
+        joint_positions = torch.randn(num_configs, num_joints, device=self.device)
+
+        # Apply smoothing by correlating adjacent joints
+        if smoothness > 0:
+            # Apply exponential moving average across joints for smooth bending
+            smoothed = torch.zeros_like(joint_positions)
+            alpha = 1.0 - smoothness  # Convert to decay factor
+
+            for env_idx in range(num_configs):
+                smoothed[env_idx, 0] = joint_positions[env_idx, 0]
+                for joint_idx in range(1, num_joints):
+                    # Exponential moving average: smooth blend with previous joint
+                    smoothed[env_idx, joint_idx] = (
+                        alpha * joint_positions[env_idx, joint_idx] +
+                        (1 - alpha) * smoothed[env_idx, joint_idx - 1]
+                    )
+
+            joint_positions = smoothed
+
+        # Normalize and scale to desired range
+        # Clamp to reasonable values first
+        joint_positions = torch.clamp(joint_positions, -3.0, 3.0)
+
+        # Scale to max_angle range
+        joint_positions = joint_positions * (max_angle / 3.0)
+
+        return joint_positions
+
+    def reset(self, env_ids: torch.Tensor = None, joint_positions: torch.Tensor = None) -> None:
+        """Reset robot to initial pose with specified joint positions.
+
+        Args:
+            env_ids: Environment indices to reset. If None, resets all environments.
+            joint_positions: Desired joint positions for reset. Shape: (len(env_ids), num_joints).
+                           If None, resets to zero joint positions (straight configuration).
+                           Can pass 'random' as a string to generate random configurations.
+                           Can pass a CSV filepath (str ending with '.csv') to load from saved state.
+        """
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
 
@@ -654,15 +788,34 @@ class RobotEndoscopeChain(BaseRobot):
 
         # Write state to simulation
         self.robot.write_root_state_to_sim(root_state, env_ids)
-        
-        # Reset joint positions to zero
-        joint_pos = torch.zeros((len(env_ids), self.robot.num_joints), device=self.device)
+
+        # Set joint positions (zero, random, from CSV, or specified values) with zero velocities
+        if joint_positions is None:
+            joint_pos = torch.zeros((len(env_ids), self.robot.num_joints), device=self.device)
+        elif isinstance(joint_positions, str):
+            if joint_positions.lower() == 'random':
+                # Generate random smooth configurations
+                joint_pos = self.generate_random_joint_positions(num_configs=len(env_ids))
+            elif joint_positions.endswith('.csv'):
+                # Load from CSV file
+                joint_pos = self._load_joint_positions_from_csv(joint_positions, len(env_ids))
+            else:
+                raise ValueError(f"Invalid string value for joint_positions: {joint_positions}")
+        else:
+            # Validate shape
+            if joint_positions.shape != (len(env_ids), self.robot.num_joints):
+                raise ValueError(
+                    f"joint_positions shape {joint_positions.shape} doesn't match expected shape "
+                    f"({len(env_ids)}, {self.robot.num_joints})"
+                )
+            joint_pos = joint_positions.to(self.device)
+
         joint_vel = torch.zeros((len(env_ids), self.robot.num_joints), device=self.device)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
-        
+
         # Reset the articulation internal state
         self.robot.reset(env_ids)
-        
+
         # Mark as initialized after first reset
         if not self._is_initialized:
             self._is_initialized = True

@@ -184,7 +184,7 @@ class DepthDistanceReward(RewardFunction):
 
         for i, (robot_position, depth_img, goal, entry_pos) in enumerate(zip(robot_positions, depth_images, goals, entry_poss)):
             # print("robot_position:", robot_position)
-            # print("goals:", self.goals)
+            #print("goals:", self.goals)
             d2target = torch.norm(goal - robot_position)
             # print("entry_pos:", entry_pos)
             d_max = torch.norm(goal - entry_pos)
@@ -231,8 +231,8 @@ class DepthDistanceReward(RewardFunction):
             # slightly punish hitting wall
             if torch.abs(torch.tensor(np.max(depth_img) - 1.0)) < 0.001:
                 reward = -1
-            # if dark_ratio < 0.1:
-            #     reward = -1
+            if dark_ratio < 0.1:
+                reward = -1
             if d2target < 0.02:
                 reward = 1
                 self.goal_reached_per_env[i] = True

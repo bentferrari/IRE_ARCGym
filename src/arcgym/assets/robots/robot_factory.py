@@ -1,6 +1,6 @@
 from arcgym.assets.robots.base_robot import BaseRobot
 from arcgym.assets.robots.capsule import RobotEndoscopeCapsule
-from arcgym.assets.robots.robot_endoscope_soft import RobotEndoscopeChain
+from arcgym.assets.robots.robot_endoscope_soft import SoftEndoscopeChain
 from arcgym.assets.robots.magnetic_endoscope import RobotEndoscopeChain
 
 class RobotFactory:
@@ -13,7 +13,7 @@ class RobotFactory:
         if self.robot_type == "capsule":
             self.isaac_robot_cfg = RobotEndoscopeCapsule.make_isaac_config(self.config)
         elif self.robot_type == "soft_endoscope":
-            self.isaac_robot_cfg = RobotEndoscopeChain.make_isaac_config(self.config)
+            self.isaac_robot_cfg = SoftEndoscopeChain.make_isaac_config(self.config)
         elif self.robot_type == "magnetic_endoscope":
             self.isaac_robot_cfg = RobotEndoscopeChain.make_isaac_config(self.config)
         else:
@@ -32,7 +32,7 @@ class RobotFactory:
         if self.robot_type == "capsule":
             return RobotEndoscopeCapsule(scene, self.config, self.isaac_robot_cfg, init_pos, init_rot, self.device)
         elif self.robot_type == "soft_endoscope":
-            return RobotEndoscopeChain(scene, self.config, self.isaac_robot_cfg, init_pos, init_rot, self.device)
+            return SoftEndoscopeChain(scene, self.config, self.isaac_robot_cfg, init_pos, init_rot, self.device)
         elif self.robot_type == "magnetic_endoscope":
             return RobotEndoscopeChain(scene, self.config, self.isaac_robot_cfg, init_pos, init_rot, self.device)
         else:

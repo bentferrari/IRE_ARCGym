@@ -395,7 +395,8 @@ class Sb3VecEnvWrapper(VecEnv):
                 colon_stress_tensor = extras["colon_stress"]
                 if isinstance(colon_stress_tensor, torch.Tensor):
                     colon_stress_np = colon_stress_tensor.detach().cpu().numpy()
-                    for idx in range(self.num_envs):
+                    # Handle case where tensor size doesn't match num_envs
+                    for idx in range(min(len(colon_stress_np), self.num_envs)):
                         infos[idx]["colon_stress"] = float(colon_stress_np[idx])
                 else:
                     for idx in range(self.num_envs):
@@ -406,7 +407,8 @@ class Sb3VecEnvWrapper(VecEnv):
                 goal_reached_tensor = extras["goal_reached"]
                 if isinstance(goal_reached_tensor, torch.Tensor):
                     goal_reached_np = goal_reached_tensor.detach().cpu().numpy()
-                    for idx in range(self.num_envs):
+                    # Handle case where tensor size doesn't match num_envs
+                    for idx in range(min(len(goal_reached_np), self.num_envs)):
                         infos[idx]["goal_reached"] = bool(goal_reached_np[idx])
                 else:
                     for idx in range(self.num_envs):

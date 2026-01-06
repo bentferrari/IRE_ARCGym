@@ -58,7 +58,7 @@ COLON_GEOM_MESH_CFG_endoscope = MeshFileCfg(
                                                                        contact_offset=0.00001,     # Reduced to 0 to eliminate invisible collision boundary
                                                                        self_collision=False,
                                                                        collision_simplification=False,
-                                                                       simulation_hexahedral_resolution=8, #16,    #simulation mesh resolution, default 10
+                                                                       simulation_hexahedral_resolution=6, #16,    #simulation mesh resolution, default 10
                                                                        #sleep_damping=0.5,
                                                                        vertex_velocity_damping=50.0,
                                                                        ),
@@ -407,6 +407,13 @@ class ColonModel:
         #bottom_center = torch.tensor([0.2882, 0.2539, 0.3108]).to(device)
         bottom_center = torch.tensor([0.2882, 0.2539, 0.3108]).to(device)
         bottom_center -= torch.tensor([0.2927, 0.1686, 0.4606]).to(device)
+        
+        # Colon lowest point
+        # Env 0: x=4.8371, y=-0.8524, z=-2.0192
+        # Env 1: x=4.8371, y=4.1476, z=-2.0192
+        # Env 2: x=-0.1629, y=-0.8524, z=-2.0192
+        # Env 3: x=-0.1629, y=4.1476, z=-2.0192
+        # Env 4: x=-5.1629, y=-0.8524, z=-2.0192
 
         # 5_envs_endoscope: 7.4029,  0.5015,  0.5500
         # 1_env_endoscope: 2.3976, 2.9910, 0.5599
@@ -423,12 +430,12 @@ class ColonModel:
                                         [-1.0, 0.0, 0.0]
                                         ]).to(device)
         else:
-            entry_pos = torch.tensor([0.6076,  1.1364, -1.9]).to(device)
+            entry_pos = torch.tensor([5.6430,  -1.3124, -2.2]).to(device)
             delta_trans = torch.tensor([[0.0, 0.0, 0.0],
-                                        # [0.0, 5, 0.0],
-                                        # [-5, 0.0, 0.0],
-                                        # [-5, 5, 0.0],
-                                        # [-10, 0.0, 0.0]
+                                        [0.0, 5, 0.0],
+                                        [-5, 0.0, 0.0],
+                                        [-5, 5, 0.0],
+                                        [-10, 0.0, 0.0]
                                         ]).to(device)
 
         #print("entry_pos + delta_trans:", entry_pos + delta_trans)
@@ -438,29 +445,47 @@ class ColonModel:
         return entry_pos + delta_trans
         #return entry_pos
     
-    def get_targets(self, env_ids: torch.Tensor = None) -> torch.Tensor:
+    def get_targets(self, env_ids: torch.Tensor = None, csv_filepath: str = None) -> torch.Tensor:
         entry_positions = self.get_entry_pos(env_ids)
-        #print("entry_positions:", entry_positions)
-        #env_translation = self.colon_body.data.nodal_state_w[:, 0, :3] - xyz[0, :]
-        # base_target = torch.tensor(
-        #         [[entry_positions[0,0], entry_positions[0,1], entry_positions[0,2]],
-        #          [0.2849, 0.2097, 0.3526], # unfinished additional coordinates, please ignore
-        #          [0.2977, 0.1968, 0.3533]]).to(entry_positions.device)
-        base_target = torch.tensor([
-            # [0.2882, 0.2539, 0.3108],
-            # [0.2946, 0.2506, 0.3341],
-            # [0.2972, 0.2269, 0.3446],
-            # [0.2917, 0.2176, 0.3476],
-            # [0.2899, 0.2150, 0.3484],
-            # [0.2842, 0.2044, 0.3543],
-            # [0.2877, 0.1887, 0.3600],
-            # [0.3075, 0.1809, 0.3694],
-            # [0.3356, 0.1627, 0.3941],
-            # [0.3378, 0.1568, 0.3575],
-            # [0.3340, 0.1559, 0.3386],
-            [0.7795, -0.0453,  0.3561],
-            ]).to(entry_positions.device)
 
+        # Get device from appropriate data attribute based on rigid/deformable
+        if self.is_rigid:
+            device = self.colon_body.data.body_state_w.device
+        else:
+            device = self.colon_body.data.nodal_state_w.device
+
+        # If CSV file is provided, load base_target from it
+        if csv_filepath is not None and csv_filepath.endswith('.csv'):
+            import pandas as pd
+            import os
+
+            if not os.path.exists(csv_filepath):
+                raise FileNotFoundError(f"CSV file not found: {csv_filepath}")
+
+            df = pd.read_csv(csv_filepath)
+
+            # Extract root_xyz (root_pos_x, root_pos_y, root_pos_z) from CSV
+            # Each row represents a different environment's target configuration
+            base_targets = []
+            for _, row in df.iterrows():
+                # Skip rows with NaN values
+                if pd.isna(row['root_pos_x']) or pd.isna(row['root_pos_y']) or pd.isna(row['root_pos_z']):
+                    continue
+                pos = [row['root_pos_x'], row['root_pos_y'], row['root_pos_z']]
+                base_targets.append(pos)
+
+            if not base_targets:
+                raise ValueError(f"No valid target positions found in CSV: {csv_filepath}")
+
+            # Use the first valid row as the base target
+            base_target = torch.tensor([base_targets[0]], dtype=torch.float32, device=device)
+            logging.info(f"Loaded base_target from CSV: {csv_filepath}")
+            logging.info(f"Base target: {base_target}")
+        else:
+            # Default hardcoded base_target
+            base_target = torch.tensor([
+                [0.7795, -0.0453,  0.3561],
+            ]).to(device)
 
         targets = []
         for translation in self.env_translation:

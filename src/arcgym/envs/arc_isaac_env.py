@@ -336,10 +336,10 @@ class ARCIsaacEnv(DirectRLEnv):
 
         # Check if CSV file is provided for initialization
         csv_init_file = self.config.get("env_config", {}).get("init_from_csv", None)
-
+        csv_init_endpose = self.config.get("env_config", {}).get("init_endpose_from_csv", None)
         # Get entry positions AFTER stepping - load from CSV if provided
         self.entry_positions = self.colon.get_entry_pos(env_ids, csv_filepath=csv_init_file)
-        self.targets = self.colon.get_targets(env_ids)
+        self.targets = self.colon.get_targets(env_ids, csv_filepath=csv_init_endpose)
 
         self.reward_function.reset(
             initial_positions=self.entry_positions,
@@ -416,7 +416,7 @@ class ARCIsaacEnv(DirectRLEnv):
 
         # Get entry positions AFTER stepping - load from CSV if provided
         self.entry_positions = self.colon.get_entry_pos(env_ids, csv_filepath=csv_init_file)
-        self.targets = self.colon.get_targets(env_ids)
+        self.targets = self.colon.get_targets(env_ids, csv_filepath=csv_init_file)
 
         self.reward_function.reset(
             initial_positions=self.entry_positions,

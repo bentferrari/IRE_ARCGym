@@ -91,7 +91,7 @@ device = args_cli.device
 
 learning_config = {
     "total_timesteps": 1000000,
-    "learning_rate" : 1e-4,
+    "learning_rate" : 3e-4,
     "batch_size" : 1024,
     "verbose" : True,
 }
@@ -103,15 +103,15 @@ robot_config = {
     "collision_contact_offset" : 0.0001,
     "collision_rest_offset" : 0.0,
     # Soft endoscope specific parameters (from original soft_endoscope.py)
-    "num_passive_links" : 5,
+    "num_passive_links" : 25,
     "num_active_links" : 5,
-    "num_links_total" : 50,
+    "num_links_total" : 30,
     "link_radius" : 0.01,
     "link_height" : 0.02,
     "passive_stiffness" : 1e1,
     "passive_damping" : 1e2,
-    "active_stiffness" : 1e8,
-    "active_damping" : 1e3,
+    "active_stiffness" : 1e1,
+    "active_damping" : 1e2,
     "max_linear_velocity": 1,
     "max_angular_velocity": 1,
     #"link_density" : 0.1,
@@ -144,11 +144,12 @@ env_config = {
     "env_spacing" : env_spacing,
     "num_envs" : args_cli.num_envs,
     "replicate_physics" : False,
-    "action_scale" : 0.3,
+    "action_scale" : 0.2,
     "debug_vis" : False,
-    "episode_length_s" : 1000.0,   # short episode for testing
+    "episode_length_s" : 20.0 if args_cli.train else 20000.0,
     "constraint_point_A": 1,  # Distance from robot tip to constraint point A along the robot's local z-axis
-    "init_from_csv": "./saved_states/robot_state_20251217_153603.csv", #if args_cli.train else None,
+    "init_from_csv": "./saved_states/c1t1_start.csv" if args_cli.train else None,
+    "init_endpose_from_csv": "./saved_states/c1t1_end.csv" if args_cli.train else None,
     "random_initial_configuration": False  # Use straight configuration (especially for teleoperation mode)
 }
 
@@ -328,7 +329,7 @@ env = gym.make("ArcIsaacEnv-v0", cfg=env_cfg, robot_factory=robot_factory,
                config=config, tracer=tracer, disable_env_checker=True) # We need disable_env_checker=True because it fails due to the wrapper removing the 'policy' key
                #, render_mode = "rgb_array"
 
-env = FrameStack(env, n_stack=1)
+env = FrameStack(env, n_stack=4)
 
 video_kwargs = {
     "video_folder": video_save_path,
@@ -455,7 +456,7 @@ if args_cli.train:
     # Create trajectory data saver callback (saves every 10 episodes by default)
     trajectory_callback = TrajectoryDataSaver(
         save_dir=trajectory_save_path,
-        save_interval=2,  # Save every 10 episodes
+        save_interval=10,  # Save every 10 episodes
         verbose=1
     )
 

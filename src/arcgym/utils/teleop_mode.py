@@ -120,7 +120,11 @@ def run_teleoperation_mode(env, simulation_app, device="cuda"):
                 # Convert teleop data to actions
                 teleop_actions = pre_process_actions(teleop_data, device)
                 actions = teleop_actions.repeat(env.num_envs, 1)
-                
+
+                # Debug: Log non-zero actions
+                if torch.any(torch.abs(teleop_actions) > 0.01):
+                    logging.info(f"Teleop actions: {teleop_actions}")
+
                 # Apply actions to environment
                 obs, reward, done, info = env.step(actions)
                 #from PIL import Image
