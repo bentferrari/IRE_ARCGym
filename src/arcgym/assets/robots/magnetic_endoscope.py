@@ -676,16 +676,19 @@ class RobotEndoscopeChain(BaseRobot):
         if init_rot is not None:
             self.init_rot = torch.tensor(init_rot, device=self.device)
 
-    def _load_joint_positions_from_csv(self, csv_filepath: str, num_envs: int, source_env_id: int = 0) -> torch.Tensor:
-        """Load joint positions from a CSV file saved during teleoperation.
+    def _load_state_from_csv(self, csv_filepath: str, env_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Load robot state (root pose and joint positions) from a CSV file saved during teleoperation.
 
         Args:
-            csv_filepath: Path to the CSV file (e.g., "saved_states/robot_state_20251215_143022.csv")
-            num_envs: Number of environments to generate positions for
-            source_env_id: Which environment's configuration to use from the CSV (default: 0)
+            csv_filepath: Path to the CSV file (e.g., "saved_states/c1t1_start.csv")
+            env_ids: Environment indices to load data for. Each env_id will load its corresponding
+                    row from the CSV file (matching the env_id column).
 
         Returns:
-            Joint positions tensor. Shape: (num_envs, num_joints)
+            Tuple of (root_pos, root_quat, joint_positions):
+                - root_pos: Root position tensor. Shape: (len(env_ids), 3)
+                - root_quat: Root quaternion (w,x,y,z). Shape: (len(env_ids), 4)
+                - joint_positions: Joint positions tensor. Shape: (len(env_ids), num_joints)
         """
         import pandas as pd
         import os
@@ -696,30 +699,55 @@ class RobotEndoscopeChain(BaseRobot):
         # Load the CSV
         df = pd.read_csv(csv_filepath)
 
-        # Verify source environment exists
-        if source_env_id not in df['env_id'].values:
-            raise ValueError(f"Environment {source_env_id} not found in CSV file. Available: {df['env_id'].values.tolist()}")
+        # Convert env_ids to list for indexing
+        env_ids_list = env_ids.cpu().tolist() if isinstance(env_ids, torch.Tensor) else list(env_ids)
 
-        # Get the row for source environment
-        row = df[df['env_id'] == source_env_id].iloc[0]
-
-        # Extract joint positions
+        # Extract joint columns once
         joint_cols = [col for col in df.columns if col.startswith('joint_') and col.endswith('_pos')]
         joint_cols = sorted(joint_cols, key=lambda x: int(x.split('_')[1]))  # Sort by joint number
-        joint_positions = [row[col] for col in joint_cols]
 
-        # Verify number of joints matches
-        if len(joint_positions) != self.robot.num_joints:
-            raise ValueError(
-                f"Number of joints in CSV ({len(joint_positions)}) doesn't match robot ({self.robot.num_joints})"
-            )
+        # Prepare batch tensors
+        root_pos_list = []
+        root_quat_list = []
+        joint_pos_list = []
 
-        # Convert to tensor and replicate for all environments
-        joint_pos_single = torch.tensor(joint_positions, dtype=torch.float32, device=self.device)
-        joint_pos = joint_pos_single.unsqueeze(0).repeat(num_envs, 1)
+        for env_id in env_ids_list:
+            # Get the row for this environment
+            if env_id not in df['env_id'].values:
+                logging.warning(f"Environment {env_id} not found in CSV file. Using env_id=0 as fallback.")
+                env_id = 0
 
-        logging.info(f"Loaded joint positions from {csv_filepath} (env {source_env_id})")
-        return joint_pos
+            row = df[df['env_id'] == env_id].iloc[0]
+
+            # Extract root position (x, y, z)
+            root_pos = [row['root_pos_x'], row['root_pos_y'], row['root_pos_z']]
+            root_pos_list.append(root_pos)
+
+            # Extract root quaternion (w, x, y, z)
+            root_quat = [row['root_quat_w'], row['root_quat_x'], row['root_quat_y'], row['root_quat_z']]
+            root_quat_list.append(root_quat)
+
+            # Extract joint positions
+            joint_positions = [row[col] for col in joint_cols]
+
+            # Handle mismatch between CSV joints and robot joints
+            if len(joint_positions) != self.robot.num_joints:
+                # If CSV has more joints than robot, truncate to robot's joint count
+                if len(joint_positions) > self.robot.num_joints:
+                    joint_positions = joint_positions[:self.robot.num_joints]
+                # If CSV has fewer joints than robot, pad with zeros
+                else:
+                    joint_positions.extend([0.0] * (self.robot.num_joints - len(joint_positions)))
+
+            joint_pos_list.append(joint_positions)
+
+        # Convert to tensors
+        root_pos_batch = torch.tensor(root_pos_list, dtype=torch.float32, device=self.device)
+        root_quat_batch = torch.tensor(root_quat_list, dtype=torch.float32, device=self.device)
+        joint_pos_batch = torch.tensor(joint_pos_list, dtype=torch.float32, device=self.device)
+
+        logging.info(f"Loaded robot state from {csv_filepath} for {len(env_ids_list)} environments")
+        return root_pos_batch, root_quat_batch, joint_pos_batch
 
     def generate_random_joint_positions(
         self,
@@ -789,43 +817,53 @@ class RobotEndoscopeChain(BaseRobot):
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
 
+        # Check if we're loading from CSV (need to load root state too)
+        load_from_csv = isinstance(joint_positions, str) and joint_positions.endswith('.csv')
+
         # Get default root state
         root_state = self.robot.data.default_root_state[env_ids].clone()
 
-        # Set position
-        if self.env_init_pos is not None and self.env_init_pos.shape[0] == len(env_ids):
-            root_state[:, :3] = self.env_init_pos
+        # Set root position and orientation
+        if load_from_csv:
+            # Load complete state from CSV (root pose + joint positions)
+            # Pass env_ids so each environment gets its own data from CSV
+            root_pos_csv, root_quat_csv, joint_pos = self._load_state_from_csv(joint_positions, env_ids)
+            root_state[:, :3] = root_pos_csv
+            root_state[:, 3:7] = root_quat_csv
         else:
-            origins = self.scene.env_origins[env_ids]
-            root_state[:, :3] = origins + self.init_pos
+            # Use default position logic
+            if self.env_init_pos is not None and self.env_init_pos.shape[0] == len(env_ids):
+                root_state[:, :3] = self.env_init_pos
+            else:
+                origins = self.scene.env_origins[env_ids]
+                root_state[:, :3] = origins + self.init_pos
 
-        # Set orientation and zero velocities
-        root_state[:, 3:7] = self.init_rot.repeat(len(env_ids), 1)
+            # Set orientation
+            root_state[:, 3:7] = self.init_rot.repeat(len(env_ids), 1)
+
+            # Handle joint positions for non-CSV cases
+            if joint_positions is None:
+                joint_pos = torch.zeros((len(env_ids), self.robot.num_joints), device=self.device)
+            elif isinstance(joint_positions, str):
+                if joint_positions.lower() == 'random':
+                    # Generate random smooth configurations
+                    joint_pos = self.generate_random_joint_positions(num_configs=len(env_ids))
+                else:
+                    raise ValueError(f"Invalid string value for joint_positions: {joint_positions}")
+            else:
+                # Validate shape
+                if joint_positions.shape != (len(env_ids), self.robot.num_joints):
+                    raise ValueError(
+                        f"joint_positions shape {joint_positions.shape} doesn't match expected shape "
+                        f"({len(env_ids)}, {self.robot.num_joints})"
+                    )
+                joint_pos = joint_positions.to(self.device)
+
+        # Zero velocities
         root_state[:, 7:] = 0.0
 
         # Write state to simulation
         self.robot.write_root_state_to_sim(root_state, env_ids)
-
-        # Set joint positions (zero, random, from CSV, or specified values) with zero velocities
-        if joint_positions is None:
-            joint_pos = torch.zeros((len(env_ids), self.robot.num_joints), device=self.device)
-        elif isinstance(joint_positions, str):
-            if joint_positions.lower() == 'random':
-                # Generate random smooth configurations
-                joint_pos = self.generate_random_joint_positions(num_configs=len(env_ids))
-            elif joint_positions.endswith('.csv'):
-                # Load from CSV file
-                joint_pos = self._load_joint_positions_from_csv(joint_positions, len(env_ids))
-            else:
-                raise ValueError(f"Invalid string value for joint_positions: {joint_positions}")
-        else:
-            # Validate shape
-            if joint_positions.shape != (len(env_ids), self.robot.num_joints):
-                raise ValueError(
-                    f"joint_positions shape {joint_positions.shape} doesn't match expected shape "
-                    f"({len(env_ids)}, {self.robot.num_joints})"
-                )
-            joint_pos = joint_positions.to(self.device)
 
         joint_vel = torch.zeros((len(env_ids), self.robot.num_joints), device=self.device)
 

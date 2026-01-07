@@ -116,7 +116,7 @@ robot_config = {
     "max_angular_velocity": 1,
     #"link_density" : 0.1,
     # Camera and light configuration
-    "camera_resolution" : (128, 128),
+    "camera_resolution" : (256, 256),
     "front_camera_focal_length" : 5.0, 
     "front_camera_focus_distance" : 10.0, 
     "front_camera_horizontal_aperture" : 20, 
@@ -144,9 +144,9 @@ env_config = {
     "env_spacing" : env_spacing,
     "num_envs" : args_cli.num_envs,
     "replicate_physics" : False,
-    "action_scale" : 0.2,
+    "action_scale" : 0.1,
     "debug_vis" : False,
-    "episode_length_s" : 20.0 if args_cli.train else 20000.0,
+    "episode_length_s" : 30.0 if args_cli.train else 20000.0,
     "constraint_point_A": 1,  # Distance from robot tip to constraint point A along the robot's local z-axis
     "init_from_csv": "./saved_states/c1t1_start.csv" if args_cli.train else None,
     "init_endpose_from_csv": "./saved_states/c1t1_end.csv" if args_cli.train else None,
@@ -154,7 +154,7 @@ env_config = {
 }
 
 reward_config = {
-    "reward_type" : "depth_goal", #"test_reward_action",#"depth_goal",#"default",#,
+    "reward_type" : "final_reward", #"test_reward_action",#"depth_goal",#"default",#,"final_reward"
     "reward_scale" : 1.0,
     "eps" : 0.025,
     "running_penalty" : -0.1,

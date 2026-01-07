@@ -169,7 +169,7 @@ class DepthDistanceReward(RewardFunction):
         # obs = current_states["obs"] why cannot access obs?
         # print("obs shape:", obs)
         robot_positions = current_states["robot_positions"]
-        print("robot_pos:", robot_positions)
+        # print("robot_pos:", robot_positions)
         depth_images = current_states["depth"]
         goals = self.goals
         entry_poss = self.initial_positions
@@ -183,8 +183,8 @@ class DepthDistanceReward(RewardFunction):
             self.goal_reached_per_env.fill_(False)
 
         for i, (robot_position, depth_img, goal, entry_pos) in enumerate(zip(robot_positions, depth_images, goals, entry_poss)):
-            # print("robot_position:", robot_position)
-            #print("goals:", self.goals)
+            # print("robot_positions:", robot_positions)
+            print("goals:", self.goals)
             d2target = torch.norm(goal - robot_position)
             # print("entry_pos:", entry_pos)
             d_max = torch.norm(goal - entry_pos)
@@ -215,8 +215,10 @@ class DepthDistanceReward(RewardFunction):
                 cx_dark, cy_dark = centroids[largest_label]
                 #print("center of dark region (x, y):", cx_dark, cy_dark)
                 r_a = 1 - (((max_depth_row - 64)**2 + ((max_depth_col - 64)**2))**0.5) / 64
+                print("reward_a",r_a)
                 r_b = 1 - (((cx_dark - 64)**2 + ((cy_dark - 64)**2))**0.5) / 64
                 r_c = 1 - d2target/d_max
+                print("reward_c",r_c)
                 black_pixels =  np.sum(binary_image == 0)
                 total_pixels = binary_image.size
                 dark_ratio = black_pixels / total_pixels
@@ -233,7 +235,7 @@ class DepthDistanceReward(RewardFunction):
                 reward = -1
             if dark_ratio < 0.1:
                 reward = -1
-            if d2target < 0.02:
+            if d2target < 0.002:
                 reward = 1
                 self.goal_reached_per_env[i] = True
                 print(f"Goal reached in environment {i}!")
@@ -244,3 +246,165 @@ class DepthDistanceReward(RewardFunction):
             #rewards.append(reward)
 
         return torch.stack(rewards)
+
+class FinalReward(RewardFunction):
+    def __init__(self, eps, reward_scale, center_weight=0.3, goal_weight=0.4, obstruction_weight=0.3, **kwargs):
+        """
+        Final reward function combining multiple penalty components.
+
+        Args:
+            eps: Epsilon threshold for goal reaching
+            reward_scale: Overall reward scaling factor
+            center_weight: Weight for lumen center deviation penalty
+            goal_weight: Weight for goal distance penalty
+            obstruction_weight: Weight for obstruction penalty
+        """
+        self.reward_scale = reward_scale
+        self.eps = eps
+        self.center_weight = center_weight
+        self.goal_weight = goal_weight
+        self.obstruction_weight = obstruction_weight
+        self.goal_reached_per_env = None
+
+    def reset(self, initial_positions, goals):
+        self.initial_positions = initial_positions
+        self.goals = goals
+        # Reset goal_reached status for all environments
+        num_envs = len(initial_positions)
+        self.goal_reached_per_env = torch.zeros(num_envs, dtype=torch.bool, device=initial_positions.device)
+
+    def __call__(self, action, current_states, _previous_states):
+        robot_positions = current_states["robot_positions"]
+        depth_images = current_states["depth"]
+        goals = self.goals
+        entry_poss = self.initial_positions
+        rewards = []
+
+        # Reset goal_reached status for this step
+        if self.goal_reached_per_env is None:
+            num_envs = len(robot_positions)
+            self.goal_reached_per_env = torch.zeros(num_envs, dtype=torch.bool, device=robot_positions.device)
+        else:
+            self.goal_reached_per_env.fill_(False)
+
+        for i, (robot_position, depth_img, goal, entry_pos) in enumerate(zip(robot_positions, depth_images, goals, entry_poss)):
+            # Calculate distance to goal
+            d2target = torch.norm(goal - robot_position)
+            d_max = torch.norm(goal - entry_pos)
+
+            # Process depth image
+            depth_img_np = depth_img[:, :, 0].cpu().numpy()
+            img_height, img_width = depth_img_np.shape
+            img_center_row, img_center_col = img_height / 2, img_width / 2
+
+            # Depth statistics - KEY CRITERIA for lumen quality:
+            # 1. max_depth: indicates if facing lumen or wall
+            # 2. depth_variance & high_depth_ratio: indicates quality of lumen view
+            max_depth = np.max(depth_img_np)
+            min_depth = np.min(depth_img_np)
+            mean_depth = np.mean(depth_img_np)
+            depth_variance = np.var(depth_img_np)
+
+            # Find the deepest point location (highest depth value = farthest point)
+            max_depth_idx = np.unravel_index(np.argmax(depth_img_np), depth_img_np.shape)
+            max_depth_row, max_depth_col = max_depth_idx  # (row, col)
+
+            # Calculate ratio of pixels with "good depth" (indicates wide open lumen vs narrow view)
+            GOOD_DEPTH_THRESHOLD = 0.12  # Pixels above this are considered "good depth"
+            high_depth_pixels = np.sum(depth_img_np > GOOD_DEPTH_THRESHOLD)
+            total_pixels = depth_img_np.size
+            high_depth_ratio = high_depth_pixels / total_pixels
+
+            # Calculate max possible distance from center (for normalization)
+            max_center_distance = np.sqrt(img_center_row**2 + img_center_col**2)
+
+            # Distance from deepest point to image center
+            deepest_point_deviation = np.sqrt((max_depth_row - img_center_row)**2 +
+                                             (max_depth_col - img_center_col)**2)
+            deepest_point_normalized = deepest_point_deviation / max_center_distance
+
+            # print(f"Depth stats - min: {min_depth:.3f}, max: {max_depth:.3f}, mean: {mean_depth:.3f}, "
+            #       f"variance: {depth_variance:.6f}, high_depth_ratio: {high_depth_ratio:.3f}, "
+            #       f"deepest_deviation: {deepest_point_normalized:.3f}")
+
+            # Calculate individual reward components
+            reward_components = {}
+
+            # 1. Lumen alignment: reward when deepest point (farthest) is centered
+            # When facing lumen center, the deepest point should be in the center of the image
+            reward_components['center_alignment'] = 1.0 - deepest_point_normalized
+
+            # 2. Lumen visibility quality: combines max_depth AND high_depth_ratio
+            # Good lumen view requires BOTH deep point AND wide open view
+            LUMEN_MIN_DEPTH = 0.20  # Minimum max depth for good lumen
+            WALL_MAX_DEPTH = 0.10   # Maximum depth indicating wall
+            MIN_HIGH_DEPTH_RATIO = 0.40  # Minimum ratio of "good depth" pixels for quality view
+
+            # First check max_depth (is lumen visible at all?)
+            if max_depth < WALL_MAX_DEPTH:
+                # Very low max depth - definitely facing wall (BAD)
+                lumen_visibility_penalty = -1.0
+                reward_components['center_alignment'] = -1.0  # Override center alignment
+            elif max_depth < LUMEN_MIN_DEPTH:
+                # Low max depth - partially obstructed
+                base_penalty = -0.5 * (LUMEN_MIN_DEPTH - max_depth) / (LUMEN_MIN_DEPTH - WALL_MAX_DEPTH)
+
+                # Further penalize if high_depth_ratio is low (narrow view)
+                if high_depth_ratio < MIN_HIGH_DEPTH_RATIO:
+                    ratio_penalty = -0.3 * (MIN_HIGH_DEPTH_RATIO - high_depth_ratio) / MIN_HIGH_DEPTH_RATIO
+                    lumen_visibility_penalty = base_penalty + ratio_penalty
+                else:
+                    lumen_visibility_penalty = base_penalty
+            else:
+                # Good max depth - but check if view is wide open or narrow
+                if high_depth_ratio < MIN_HIGH_DEPTH_RATIO:
+                    # Narrow view - can see lumen but not well positioned (YOUR CASE)
+                    # Penalize proportionally to how narrow the view is
+                    lumen_visibility_penalty = -0.4 * (MIN_HIGH_DEPTH_RATIO - high_depth_ratio) / MIN_HIGH_DEPTH_RATIO
+                elif high_depth_ratio < 0.25:
+                    # Decent view but not optimal
+                    lumen_visibility_penalty = 0.1
+                else:
+                    # Wide open lumen view - excellent! (GOOD)
+                    lumen_visibility_penalty = 0.2
+
+            reward_components['lumen_visibility'] = lumen_visibility_penalty
+
+            # print(f"max_depth: {max_depth:.3f}, high_depth_ratio: {high_depth_ratio:.3f}, "
+            #       f"lumen_visibility: {lumen_visibility_penalty:.3f}")
+
+            # 3. Penalty for deviation from robot position to goal position
+            reward_components['goal_progress'] = 1.0 - (d2target / d_max).item()
+
+            # Combine reward components with weights
+            total_reward = (self.center_weight * reward_components['center_alignment'] +
+                          self.goal_weight * reward_components['goal_progress'] +
+                          self.obstruction_weight * reward_components['lumen_visibility'])
+
+            # Special conditions override the weighted sum
+            # Hitting wall - severe penalty (depth = 1.0 means collision)
+            if torch.abs(torch.tensor(max_depth - 1.0)) < 0.001:
+                total_reward = -1.0
+
+            # Goal reached - maximum reward
+            if d2target < self.eps:
+                total_reward = 1.0
+                self.goal_reached_per_env[i] = True
+                print(f"Goal reached in environment {i}!")
+
+            # Normalize the reward to be in range [-1, 1]
+            # The weighted combination naturally stays in this range for normal operation
+            # Special conditions are already normalized
+            total_reward = np.clip(total_reward, -1.0, 1.0)
+
+            # Debug output
+            print(f"Env {i} - Center: {reward_components['center_alignment']:.3f}, "
+                  f"Goal: {reward_components['goal_progress']:.3f}, "
+                  f"Lumen_Visibility: {reward_components['lumen_visibility']:.3f}, "
+                  f"Total: {total_reward:.3f}")
+
+            rewards.append(torch.tensor(total_reward,
+                                       dtype=torch.float32,
+                                       device='cuda' if torch.cuda.is_available() else 'cpu'))
+
+        return torch.stack(rewards) * self.reward_scale

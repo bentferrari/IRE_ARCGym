@@ -430,7 +430,7 @@ class ColonModel:
                                         [-1.0, 0.0, 0.0]
                                         ]).to(device)
         else:
-            entry_pos = torch.tensor([5.6430,  -1.3124, -2.2]).to(device)
+            entry_pos = torch.tensor([5.6430,  -1.3124, -2.0]).to(device)
             delta_trans = torch.tensor([[0.0, 0.0, 0.0],
                                         [0.0, 5, 0.0],
                                         [-5, 0.0, 0.0],
@@ -566,6 +566,18 @@ class ColonModel:
 
         # Reset the existing deformable object
         self.colon_body.reset(env_ids)
+
+        # For deformable bodies, explicitly restore nodal state to default
+        # This ensures blown-away colons return to their original position
+        if not self.is_rigid:
+            # Get the default nodal state (position and velocity)
+            default_nodal_state = self.colon_body._data.default_nodal_state_w.clone()
+
+            # Write the default state back to the specified environments
+            self.colon_body._data.nodal_state_w[env_ids] = default_nodal_state[env_ids]
+
+            # Write the nodal state to simulation
+            self.colon_body.write_nodal_state_to_sim(self.colon_body._data.nodal_state_w, env_ids)
 
         # Reapply nodal attachments
         self._attach_colon_nodals()

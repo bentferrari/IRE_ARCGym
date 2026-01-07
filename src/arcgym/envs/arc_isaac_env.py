@@ -27,6 +27,7 @@ from arcgym.rewards.rewards import (
     TestRewardPosition,
     PointToPointLineDistanceReward,
     DepthDistanceReward,
+    FinalReward,
     )
 from arcgym.utils.debug import create_simple_sphere_markers
 
@@ -165,6 +166,8 @@ class ARCIsaacEnv(DirectRLEnv):
             self.reward_function = PointToPointLineDistanceReward(**self.reward_config)
         elif reward_type == "depth_goal":
             self.reward_function = DepthDistanceReward(**self.reward_config)
+        elif reward_type == "final_reward":
+            self.reward_function = FinalReward(**self.reward_config)
         else:
             raise ValueError(f"Unknown reward type: '{reward_type}'")
 
@@ -304,7 +307,7 @@ class ARCIsaacEnv(DirectRLEnv):
             obs = None
         #pdb.set_trace()
         pose=self.robot.get_pose()
-        print("robot_pose",pose)
+        #print("robot_pose",pose)
 
         robot_positions = self.robot.get_pose()[:, :3]
         depth_data = self.robot.get_depth()
@@ -413,10 +416,11 @@ class ARCIsaacEnv(DirectRLEnv):
 
         # Check if we should use CSV initialization
         csv_init_file = self.config.get("env_config", {}).get("init_from_csv", None)
+        csv_init_endpose = self.config.get("env_config", {}).get("init_endpose_from_csv", None)
 
         # Get entry positions AFTER stepping - load from CSV if provided
         self.entry_positions = self.colon.get_entry_pos(env_ids, csv_filepath=csv_init_file)
-        self.targets = self.colon.get_targets(env_ids, csv_filepath=csv_init_file)
+        self.targets = self.colon.get_targets(env_ids, csv_filepath=csv_init_endpose)
 
         self.reward_function.reset(
             initial_positions=self.entry_positions,
@@ -569,7 +573,7 @@ class ARCIsaacEnv(DirectRLEnv):
         if self.render_mode == "rgb_array":
             if self._camera_data is None:
                 logging.info("Camera data is None this step")
-                return np.zeros((128, 128, 3), dtype=np.uint8)
+                return np.zeros((256, 256, 3), dtype=np.uint8)
 
             # Handle torch tensor
             rgb_data = self._camera_data.cpu().numpy()
