@@ -563,7 +563,7 @@ class RobotEndoscopeChain(BaseRobot):
 
         return RobotContinuumSnakeCfg()
 
-    def apply_action(self, actions: torch.Tensor, action_scale: float = 1.0) -> None:
+    def apply_action(self, actions: torch.Tensor, action_scale: float = 1.0, **kwargs) -> None:
         """
         Apply actions: prismatic joint controls Z motion, anchor position controls X/Y motion and rotation.
 
@@ -574,6 +574,12 @@ class RobotEndoscopeChain(BaseRobot):
             [3] ω_roll         (rad/s around local X) - applied to anchor rotation
             [4] ω_pitch        (rad/s around local Y) - applied to anchor rotation
             [5] ω_yaw          (rad/s around local Z) - applied to anchor rotation
+
+        Args:
+            actions: Action tensor of shape (num_envs, 6). Movement constraints should be
+                    applied BEFORE calling this method (in environment's _apply_movement_constraints).
+            action_scale: Scaling factor for actions
+            **kwargs: Additional parameters for compatibility (e.g., center_alignment passed from env)
 
         Structure: world_anchor (root) → (prismatic Z) → passive_19 → ... → passive_0 (tip with camera)
         The anchor can be repositioned to move the entire chain in X/Y and rotate it.
@@ -592,6 +598,11 @@ class RobotEndoscopeChain(BaseRobot):
         w_roll = actions[:, 5]  # roll
         w_pitch = -actions[:, 3]  # pitch
         w_yaw = actions[:, 4]  # yaw
+
+        # Note: Movement constraints (based on center_alignment) are now applied
+        # in the environment's _apply_movement_constraints() method BEFORE calling
+        # this function. This ensures the constrained actions are used for both
+        # simulation and reward computation (critical for RL training consistency).
 
         # Get current anchor (root) orientation
         current_quat = self.robot.data.root_state_w[:, 3:7]  # (num_envs, 4)

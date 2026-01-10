@@ -5,6 +5,7 @@ import logging
 
 import numpy as np
 import torch
+import cv2
 from PIL import Image, ImageDraw, ImageFont
 
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
@@ -188,6 +189,21 @@ class ARCIsaacEnv(DirectRLEnv):
         self.goal_reached = torch.tensor([False]*self.num_envs, device=self.device)
         self.hit_wall = torch.tensor([False]*self.num_envs, device=self.device)
         self.truncate_now = torch.tensor([False]*self.num_envs, device=self.device)
+        self.colon_invalid = torch.tensor([False]*self.num_envs, device=self.device)
+        self.colon_invalid_prev = torch.tensor([False]*self.num_envs, device=self.device)
+        self.poor_alignment = torch.tensor([False]*self.num_envs, device=self.device)
+
+        # Stuck detection and backward motion tracking
+        self.previous_positions = None
+        self.poor_alignment_counter = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        self.backward_steps_remaining = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        self.stuck_threshold = 15  # Number of steps with poor alignment to consider stuck
+        self.backward_duration = 10  # Number of steps to move backward when stuck
+        self.alignment_threshold = 0.7  # Center alignment below this is considered poor
+
+        # Bright region avoidance tracking
+        self.bright_region_directions = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
+        self.has_bright_regions = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         self.sim.set_camera_view(eye=[0.5, 1.5, 0.5], target=[0.0, 0.0, 0.5])
 
@@ -250,16 +266,292 @@ class ARCIsaacEnv(DirectRLEnv):
         if self.scene.cfg.filter_collisions:
             self.scene.filter_collisions(self.scene._global_prim_paths)
 
+    def _compute_movement_metrics(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compute center alignment, lumen visibility, and escape directions from current depth images.
+        Returns:
+            center_alignments: Tensor of shape (num_envs,) with values in [0, 1]
+            lumen_visibilities: Tensor of shape (num_envs,) with visibility scores
+            escape_directions: Tensor of shape (num_envs, 2) with [y_offset, z_offset] to escape bright regions
+        """
+        current_states = self.get_states()
+        depth_images = current_states["depth"]
+        center_alignments = []
+        lumen_visibilities = []
+        escape_directions = []
+
+        for depth_img in depth_images:
+            depth_img_np = depth_img[:, :, 0].cpu().numpy()
+            img_height, img_width = depth_img_np.shape
+            img_center_row, img_center_col = img_height / 2, img_width / 2
+
+            # Depth statistics
+            max_depth = np.max(depth_img_np)
+
+            # Calculate ratio of pixels with "good depth"
+            GOOD_DEPTH_THRESHOLD = 0.12
+            high_depth_pixels = np.sum(depth_img_np > GOOD_DEPTH_THRESHOLD)
+            total_pixels = depth_img_np.size
+            high_depth_ratio = high_depth_pixels / total_pixels
+
+            # Find the deepest point location (highest depth value = farthest point)
+            max_depth_idx = np.unravel_index(np.argmax(depth_img_np), depth_img_np.shape)
+            max_depth_row, max_depth_col = max_depth_idx
+
+            # Calculate max possible distance from center
+            max_center_distance = np.sqrt(img_center_row**2 + img_center_col**2)
+
+            # Distance from deepest point to image center
+            deepest_point_deviation = np.sqrt((max_depth_row - img_center_row)**2 +
+                                             (max_depth_col - img_center_col)**2)
+            deepest_point_normalized = deepest_point_deviation / max_center_distance
+
+            # Center alignment: 1.0 = perfectly centered, 0.0 = at edge
+            center_alignment = 1.0 - deepest_point_normalized
+            center_alignments.append(center_alignment)
+
+            # Compute lumen visibility (same logic as in FinalReward)
+            LUMEN_MIN_DEPTH = 0.20
+            WALL_MAX_DEPTH = 0.10
+            MIN_HIGH_DEPTH_RATIO = 0.40
+
+            if max_depth < WALL_MAX_DEPTH:
+                lumen_visibility = -1.0
+            elif max_depth < LUMEN_MIN_DEPTH:
+                base_penalty = -0.5 * (LUMEN_MIN_DEPTH - max_depth) / (LUMEN_MIN_DEPTH - WALL_MAX_DEPTH)
+                if high_depth_ratio < MIN_HIGH_DEPTH_RATIO:
+                    ratio_penalty = -0.3 * (MIN_HIGH_DEPTH_RATIO - high_depth_ratio) / MIN_HIGH_DEPTH_RATIO
+                    lumen_visibility = base_penalty + ratio_penalty
+                else:
+                    lumen_visibility = base_penalty
+            else:
+                if high_depth_ratio < MIN_HIGH_DEPTH_RATIO:
+                    lumen_visibility = -0.4 * (MIN_HIGH_DEPTH_RATIO - high_depth_ratio) / MIN_HIGH_DEPTH_RATIO
+                elif high_depth_ratio < 0.25:
+                    lumen_visibility = 0.1
+                else:
+                    lumen_visibility = 0.2
+
+            lumen_visibilities.append(lumen_visibility)
+
+            # Compute escape direction: find centroid of bright (open) pixels
+            # Bright pixels = high depth values = far away = open lumen space
+            # We want to move TOWARD these (to find open path)
+            depth_threshold = np.percentile(depth_img_np, 75)  # Top 25% brightest pixels
+            bright_mask = depth_img_np > depth_threshold
+
+            if np.sum(bright_mask) > 0:
+                # Find centroid of bright pixels (open space)
+                rows, cols = np.where(bright_mask)
+                bright_center_row = np.mean(rows)
+                bright_center_col = np.mean(cols)
+
+                # Calculate offset from image center to bright center
+                offset_row = bright_center_row - img_center_row  # Positive = bright region is below
+                offset_col = bright_center_col - img_center_col  # Positive = bright region is right
+
+                # Escape direction is TOWARD the bright center (open lumen)
+                # Normalize to [-1, 1] range
+                escape_y = offset_col / (img_width / 2)   # Left/Right: toward col offset
+                escape_z = offset_row / (img_height / 2)  # Up/Down: toward row offset
+            else:
+                # No clear bright region, no escape direction needed
+                escape_y = 0.0
+                escape_z = 0.0
+
+            escape_directions.append([escape_y, escape_z])
+
+        return (torch.tensor(center_alignments, dtype=torch.float32, device=depth_images.device),
+                torch.tensor(lumen_visibilities, dtype=torch.float32, device=depth_images.device),
+                torch.tensor(escape_directions, dtype=torch.float32, device=depth_images.device))
+
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        self.actions = self.action_scale * actions.clone()
-    
+        # Apply different scaling for translation vs orientation
+        # Actions: [0-2] translation (left/right, up/down, forward/back)
+        #          [3-5] orientation (pitch, yaw, roll)
+        scaled_actions = actions.clone()
+
+        # Scale translation actions (indices 0, 1, 2)
+        scaled_actions[:, :3] = scaled_actions[:, :3] * self.action_scale
+
+        # Scale orientation actions (indices 3, 4, 5) with higher scale
+        orientation_scale = self.action_scale * 1 # 3x higher for orientation
+        scaled_actions[:, 3:] = scaled_actions[:, 3:] * orientation_scale
+
+        self.actions = scaled_actions
+
+    def _apply_movement_constraints(self, actions: torch.Tensor) -> torch.Tensor:
+        """
+        Apply movement constraints based on quadrant of lumen centroid (threshold_high).
+
+        ALWAYS forces forward motion (v_forward_back = 0.1) and clips other actions based on quadrant:
+        - upper-left: clip to go up and left (v_left_right ≤ 0, v_up_down ≤ 0, ω_pitch ≤ 0, ω_yaw ≤ 0)
+        - upper-right: clip to go up and right (v_left_right ≥ 0, v_up_down ≤ 0, ω_pitch ≤ 0, ω_yaw ≥ 0)
+        - lower-left: clip to go down and left (v_left_right ≤ 0, v_up_down ≥ 0, ω_pitch ≥ 0, ω_yaw ≤ 0)
+        - lower-right: clip to go down and right (v_left_right ≥ 0, v_up_down ≥ 0, ω_pitch ≥ 0, ω_yaw ≥ 0)
+
+        Args:
+            actions: Action tensor of shape (num_envs, 6)
+                    [0] v_left_right, [1] v_up_down, [2] v_forward_back (OVERRIDDEN to 0.1),
+                    [3] ω_pitch, [4] ω_yaw, [5] ω_roll
+
+        Returns:
+            Modified actions with constraints applied
+        """
+        # Check if movement constraints are disabled (e.g., for teleoperation mode)
+        if self.env_config.get("disable_movement_constraints", False):
+            return actions
+
+        # Clone to avoid modifying input
+        constrained_actions = actions.clone()
+
+        # Get quadrant information from reward function (using threshold_high centroid)
+        if hasattr(self.reward_function, 'high_quadrants_per_env') and self.reward_function.high_quadrants_per_env:
+            quadrants = self.reward_function.high_quadrants_per_env
+
+            for env_id, quadrant in enumerate(quadrants):
+                # Store original actions for printing
+                original_action = actions[env_id].clone()
+
+                # ALWAYS set forward/back to fixed 0.1 (constant forward motion)
+                constrained_actions[env_id, 2] = 0.1  # v_forward_back = 0.1 (always move forward)
+
+                if quadrant == "upper-left":
+                    # Clip to go up and left: translation left/up, yaw left, pitch up
+                    constrained_actions[env_id, 0] = torch.clamp(constrained_actions[env_id, 0], max=0.0)  # v_left_right <= 0 (left)
+                    constrained_actions[env_id, 1] = torch.clamp(constrained_actions[env_id, 1], max=0.0)  # v_up_down <= 0 (up)
+                    constrained_actions[env_id, 3] = torch.clamp(constrained_actions[env_id, 3], max=0.0)  # ω_pitch <= 0 (up)
+                    constrained_actions[env_id, 4] = torch.clamp(constrained_actions[env_id, 4], max=0.0)  # ω_yaw <= 0 (left)
+
+                elif quadrant == "upper-right":
+                    # Clip to go up and right: translation right/up, yaw right, pitch up
+                    constrained_actions[env_id, 0] = torch.clamp(constrained_actions[env_id, 0], min=0.0)  # v_left_right >= 0 (right)
+                    constrained_actions[env_id, 1] = torch.clamp(constrained_actions[env_id, 1], max=0.0)  # v_up_down <= 0 (up)
+                    constrained_actions[env_id, 3] = torch.clamp(constrained_actions[env_id, 3], max=0.0)  # ω_pitch <= 0 (up)
+                    constrained_actions[env_id, 4] = torch.clamp(constrained_actions[env_id, 4], min=0.0)  # ω_yaw >= 0 (right)
+
+                elif quadrant == "lower-left":
+                    # Clip to go down and left: translation left/down, yaw left, pitch down
+                    constrained_actions[env_id, 0] = torch.clamp(constrained_actions[env_id, 0], max=0.0)  # v_left_right <= 0 (left)
+                    constrained_actions[env_id, 1] = torch.clamp(constrained_actions[env_id, 1], min=0.0)  # v_up_down >= 0 (down)
+                    constrained_actions[env_id, 3] = torch.clamp(constrained_actions[env_id, 3], min=0.0)  # ω_pitch >= 0 (down)
+                    constrained_actions[env_id, 4] = torch.clamp(constrained_actions[env_id, 4], max=0.0)  # ω_yaw <= 0 (left)
+
+                elif quadrant == "lower-right":
+                    # Clip to go down and right: translation right/down, yaw right, pitch down
+                    constrained_actions[env_id, 0] = torch.clamp(constrained_actions[env_id, 0], min=0.0)  # v_left_right >= 0 (right)
+                    constrained_actions[env_id, 1] = torch.clamp(constrained_actions[env_id, 1], min=0.0)  # v_up_down >= 0 (down)
+                    constrained_actions[env_id, 3] = torch.clamp(constrained_actions[env_id, 3], min=0.0)  # ω_pitch >= 0 (down)
+                    constrained_actions[env_id, 4] = torch.clamp(constrained_actions[env_id, 4], min=0.0)  # ω_yaw >= 0 (right)
+
+                # Print quadrant and actions for each environment
+                clipped_action = constrained_actions[env_id]
+                print(f"Env {env_id} - Quadrant: {quadrant:12s} | "
+                      f"Original: [L/R:{original_action[0]:6.3f}, U/D:{original_action[1]:6.3f}, F/B:{original_action[2]:6.3f}, "
+                      f"Pitch:{original_action[3]:6.3f}, Yaw:{original_action[4]:6.3f}, Roll:{original_action[5]:6.3f}] | "
+                      f"Clipped: [L/R:{clipped_action[0]:6.3f}, U/D:{clipped_action[1]:6.3f}, F/B:{clipped_action[2]:6.3f}, "
+                      f"Pitch:{clipped_action[3]:6.3f}, Yaw:{clipped_action[4]:6.3f}, Roll:{clipped_action[5]:6.3f}]")
+
+        return constrained_actions
+
     def _apply_action(self) -> None:
         #pdb.set_trace()
-        self.robot.apply_action(self.actions)
+        # Compute center alignment for conditional movement control
+        if not hasattr(self, 'center_alignment'):
+            self.center_alignment = torch.ones(self.num_envs, dtype=torch.float32, device=self.device)
+
+        # Update center alignment from depth images if available
+        if hasattr(self.robot, 'get_depth'):
+            try:
+                center_alignments, _, _ = self._compute_movement_metrics()
+                self.center_alignment = center_alignments
+            except Exception as e:
+                logging.warning(f"Failed to compute center alignment: {e}")
+
+        # Apply conditional logic to actions BEFORE passing to robot
+        # This ensures self.actions reflects what actually gets applied
+        actions_to_apply = self._apply_movement_constraints(self.actions.clone())
+
+        # Store the actually applied actions for reward computation
+        self.actions = actions_to_apply
+        #print("Applied actions:", actions_to_apply)
+
+        # Pass to robot (actions are already constrained)
+        self.robot.apply_action(actions_to_apply)
+
+    def _check_colon_validity(self) -> None:
+        """
+        Check if the colon is still valid (not all nodes blown away).
+        Mark environments with invalid colons for truncation.
+        """
+        if self.colon.is_rigid:
+            # For rigid colons, check if the body has moved too far from initial position
+            current_pos = self.colon.colon_body.data.body_state_w[:, :3]
+            # Use the initial colon position stored in init_pos
+            initial_pos = torch.tensor(self.colon.init_pos, device=self.device).unsqueeze(0).expand(self.num_envs, -1)
+            displacement = torch.norm(current_pos - initial_pos, dim=1)
+            # Threshold for invalid colon (10 meters - very large displacement)
+            INVALID_THRESHOLD = 10.0
+            self.colon_invalid = displacement > INVALID_THRESHOLD
+        else:
+            # For deformable colons, check nodal positions
+            default_nodal_state = self.colon.colon_body._data.default_nodal_state_w
+            current_nodal_state = self.colon.colon_body._data.nodal_state_w
+
+            # Get positions (first 3 components)
+            default_nodal_pos = default_nodal_state[:, :, :3]  # (num_envs, num_nodes, 3)
+            current_nodal_pos = current_nodal_state[:, :, :3]  # (num_envs, num_nodes, 3)
+
+            # Calculate displacement for each node in each environment
+            displacement = torch.norm(current_nodal_pos - default_nodal_pos, dim=2)  # (num_envs, num_nodes)
+
+            # Threshold for a node being "blown away" (in meters)
+            BLOWN_AWAY_THRESHOLD = 0.5  # Same as in colon reset
+
+            # Count how many nodes are blown away per environment
+            blown_away_nodes = (displacement > BLOWN_AWAY_THRESHOLD).sum(dim=1)  # (num_envs,)
+            total_nodes = displacement.shape[1]
+
+            # If more than 50% of nodes are blown away, mark colon as invalid
+            blown_away_ratio = blown_away_nodes.float() / total_nodes
+            self.colon_invalid = blown_away_ratio > 0.5
+
+            # Log when colons become invalid
+            newly_invalid = self.colon_invalid & ~self.colon_invalid_prev
+            if newly_invalid.any():
+                invalid_env_ids = torch.where(newly_invalid)[0]
+                logging.info(f"Colon became invalid in environments: {invalid_env_ids.cpu().tolist()}")
+                logging.info(f"Blown away ratios: {blown_away_ratio[newly_invalid].cpu().tolist()}")
+
+            # Update previous state
+            self.colon_invalid_prev = self.colon_invalid.clone()
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        # Check colon validity before computing dones
+        self._check_colon_validity()
+
+        # Update camera data to get fresh depth for alignment checking
+        # This is necessary because _get_dones() is called before _get_observations()
+        if self.use_camera and hasattr(self.robot, 'egocamera'):
+            try:
+                self.robot.egocamera.update(dt=self.cfg.sim.dt * self.cfg.decimation)
+            except Exception as e:
+                logging.warning(f"Camera update failed in _get_dones: {e}")
+
+        # Compute center alignment FRESH for done checking
+        # This ensures we have the most recent alignment values
+        if hasattr(self.robot, 'get_depth'):
+            try:
+                center_alignments, _, _ = self._compute_movement_metrics()
+                self.center_alignment = center_alignments
+            except Exception as e:
+                logging.warning(f"Failed to compute center alignment in _get_dones: {e}")
+                # Initialize if failed
+                if not hasattr(self, 'center_alignment'):
+                    self.center_alignment = torch.ones(self.num_envs, dtype=torch.float32, device=self.device)
+
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        truncated = time_out | self.truncate_now
+        truncated = time_out | self.truncate_now | self.colon_invalid
         terminated = self.goal_reached | self.hit_wall
         return terminated, truncated
 
@@ -279,20 +571,20 @@ class ARCIsaacEnv(DirectRLEnv):
         # This ensures we capture the success state for environments that just finished
         self.extras["goal_reached"] = self.goal_reached.clone()
 
+        # Also save center alignment for logging
+        if hasattr(self, 'center_alignment'):
+            self.extras["center_alignment"] = self.center_alignment.clone()
+
         self.previous_states = current_states
         self.latest_rewards = rewards
         return rewards
         
     def _get_observations(self) -> dict:
         """Get observations from robot."""
-        # Update camera data before getting observations
-        if self.use_camera and hasattr(self.robot, 'egocamera'):
-            try:
-                self.robot.egocamera.update(dt=self.cfg.sim.dt * self.cfg.decimation)
-            except Exception as e:
-                logging.exception(f"Camera update failed: {e}")
-                raise
-        
+        # Note: Camera is already updated in _get_dones() for alignment checking
+        # So we skip the update here to avoid doing it twice
+        # The camera data is still fresh from _get_dones()
+
         robot_obs = self.robot.get_observation(use_pose_in_obs=self.use_pose_in_obs, use_camera=self.use_camera)
 
         obs = {"policy": robot_obs}
@@ -319,10 +611,22 @@ class ARCIsaacEnv(DirectRLEnv):
         }
         return states
 
-    def reset(self, seed=None, env_ids: torch.Tensor = None, options = None):
+    def reset(self, seed=3407, env_ids: torch.Tensor = None, options = None):
         self.goal_reached = torch.tensor([False]*self.num_envs, device=self.device)
         self.hit_wall = torch.tensor([False]*self.num_envs, device=self.device)
         self.truncate_now = torch.tensor([False]*self.num_envs, device=self.device)
+        self.colon_invalid = torch.tensor([False]*self.num_envs, device=self.device)
+        self.colon_invalid_prev = torch.tensor([False]*self.num_envs, device=self.device)
+        self.poor_alignment = torch.tensor([False]*self.num_envs, device=self.device)
+
+        # Reset stuck detection tracking
+        self.previous_positions = None
+        self.poor_alignment_counter = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        self.backward_steps_remaining = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+
+        # Reset bright region tracking
+        self.bright_region_directions = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
+        self.has_bright_regions = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         print("reset called")
 
@@ -451,6 +755,17 @@ class ARCIsaacEnv(DirectRLEnv):
         self.goal_reached[env_ids] = False
         self.hit_wall[env_ids] = False
         self.truncate_now[env_ids] = False
+        self.colon_invalid[env_ids] = False
+        self.colon_invalid_prev[env_ids] = False
+        self.poor_alignment[env_ids] = False
+
+        # Reset stuck detection for these environments
+        self.poor_alignment_counter[env_ids] = 0
+        self.backward_steps_remaining[env_ids] = 0
+
+        # Reset bright region tracking for these environments
+        self.bright_region_directions[env_ids] = 0.0
+        self.has_bright_regions[env_ids] = False
 
     def step(self, action):
         obs, reward, terminated, truncated, info = super().step(action)  # See contents of super().step(action) below
@@ -573,7 +888,7 @@ class ARCIsaacEnv(DirectRLEnv):
         if self.render_mode == "rgb_array":
             if self._camera_data is None:
                 logging.info("Camera data is None this step")
-                return np.zeros((256, 256, 3), dtype=np.uint8)
+                return np.zeros((84, 84, 3), dtype=np.uint8)
 
             # Handle torch tensor
             rgb_data = self._camera_data.cpu().numpy()

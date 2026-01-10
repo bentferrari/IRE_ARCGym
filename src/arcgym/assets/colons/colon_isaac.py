@@ -29,7 +29,7 @@ shader_full_path = os.path.join(model_folder, "materials/colon_surface_material.
 COLON_GEOM_MESH_CFG = MeshFileCfg(
                 file_path=obj_model_full_path,
                 scale=(0.001, 0.001, 0.001),
-                mass_props=sim_utils.MassPropertiesCfg(mass=10.0),
+                mass_props=sim_utils.MassPropertiesCfg(mass=100.0),
                 deformable_props=sim_utils.DeformableBodyPropertiesCfg(
                                                                        rest_offset=0.0,        # Increased from 0.0 to prevent tunneling
                                                                        contact_offset=0.001,     # Increased from 0.0001 for better collision detection
@@ -281,34 +281,44 @@ class ColonModel:
             api = PhysxSchema.PhysxAutoAttachmentAPI.Apply(attachment.GetPrim())
             api.CreateDeformableVertexOverlapOffsetAttr(0.001)
 
-    def _attach_colon_nodals(self):
+    def _attach_colon_nodals(self, env_ids: torch.Tensor = None):
         if self.is_rigid:
             return  # Skip for rigid bodies
+
+        # If no env_ids specified, apply to all environments
+        if env_ids is None:
+            env_ids = torch.arange(self.colon_body.num_instances, device=self.colon_body.device)
+
         #try to attach nodal of colon
         nodal_state = self.colon_body._data.default_nodal_state_w.clone()
         nodal_kinematic_target = self.colon_body._data.nodal_kinematic_target.clone()
 
-        nodal_kinematic_target[..., :3] = nodal_state[..., :3]  #initialize target with initial nodal pos
-        nodal_kinematic_target[..., 3] = 1                      #free for all of them
+        # Initialize target with initial nodal pos for specified environments
+        nodal_kinematic_target[env_ids, :, :3] = nodal_state[env_ids, :, :3]
+        nodal_kinematic_target[env_ids, :, 3] = 1  # free for all of them
 
         #now attach rectum, descend, splenic, hectic, cecum nodals
+        # Use first environment's nodal positions to determine attachment indices
         attaching_nodal_idx = colon_utils.extract_attach_nodals(nodal_pos=nodal_state[0, :, :3])
-        
+
         # Get bottom vertices indices (same logic as entry position)
         xyz = nodal_state[0, :, :3]
         z = xyz[:, 2]
         bottom_mask = z < torch.quantile(z, 0.033)  # Same threshold as get_entry_pos
         bottom_nodal_idx = torch.where(bottom_mask)[0]
-        
+
         # Ensure both tensors are on the same device
         attaching_nodal_idx = torch.tensor(attaching_nodal_idx, device=nodal_state.device)
-        
+
         # Combine anatomical attachments with bottom vertex attachments
         all_attach_idx = torch.cat([attaching_nodal_idx, bottom_nodal_idx])
-        
+
+        # Apply attachments only to specified environments
         # print("nodal to attach", all_attach_idx)
-        nodal_kinematic_target[..., all_attach_idx, 3] = 0                 
-        self.colon_body.write_nodal_kinematic_target_to_sim(nodal_kinematic_target)
+        # Use advanced indexing to set attachments for specific environments
+        for env_id in env_ids:
+            nodal_kinematic_target[env_id, all_attach_idx, 3] = 0
+        self.colon_body.write_nodal_kinematic_target_to_sim(nodal_kinematic_target[env_ids], env_ids)
         self.colon_body.write_data_to_sim()
 
     @property
@@ -573,14 +583,34 @@ class ColonModel:
             # Get the default nodal state (position and velocity)
             default_nodal_state = self.colon_body._data.default_nodal_state_w.clone()
 
+            # Check if any colons have been "blown away" (nodes moved too far from default)
+            current_nodal_pos = self.colon_body._data.nodal_state_w[env_ids, :, :3]  # Positions only
+            default_nodal_pos = default_nodal_state[env_ids, :, :3]
+
+            # Calculate max displacement per environment
+            displacement = torch.norm(current_nodal_pos - default_nodal_pos, dim=2)  # (num_envs, num_nodes)
+            max_displacement_per_env = torch.max(displacement, dim=1)[0]  # (num_envs,)
+
+            # Threshold for detecting blown-away colon (in meters)
+            BLOWN_AWAY_THRESHOLD = 0.5  # Adjust based on your scene scale
+
+            # Detect which environments have blown-away colons
+            blown_away_mask = max_displacement_per_env > BLOWN_AWAY_THRESHOLD
+            blown_away_env_ids = env_ids[blown_away_mask]
+
+            if len(blown_away_env_ids) > 0:
+                print(f"Detected blown-away colons in environments: {blown_away_env_ids.cpu().tolist()}")
+                print(f"Max displacements: {max_displacement_per_env[blown_away_mask].cpu().tolist()}")
+
             # Write the default state back to the specified environments
+            # This includes both position ([:3]) and velocity ([:3:6])
             self.colon_body._data.nodal_state_w[env_ids] = default_nodal_state[env_ids]
 
             # Write the nodal state to simulation
-            self.colon_body.write_nodal_state_to_sim(self.colon_body._data.nodal_state_w, env_ids)
+            self.colon_body.write_nodal_state_to_sim(self.colon_body._data.nodal_state_w[env_ids], env_ids)
 
-        # Reapply nodal attachments
-        self._attach_colon_nodals()
+        # Reapply nodal attachments (pass env_ids to only reset specified environments)
+        self._attach_colon_nodals(env_ids)
 
         # Print the lowest position after reset (for environment 0)
         if 0 in env_ids or env_ids.numel() == self.colon_body.num_instances:

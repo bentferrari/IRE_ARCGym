@@ -31,6 +31,10 @@ class PerEnvRewardCallback(BaseCallback):
         self.episode_stresses = {}  # Track colon stress per episode
         self.episode_successes = {}  # Track success/failure for each episode
 
+        # Track overall statistics across all environments
+        self.total_episodes = 0
+        self.total_successes = 0
+
     def _on_step(self) -> bool:
         """
         Called at each step of the training loop.
@@ -98,6 +102,19 @@ class PerEnvRewardCallback(BaseCallback):
 
                     self.episode_successes[env_idx].append(1 if is_success else 0)
 
+                    # Update overall statistics
+                    self.total_episodes += 1
+                    if is_success:
+                        self.total_successes += 1
+
+                    # Get center alignment if available
+                    center_alignment = None
+                    if 'center_alignment' in info:
+                        try:
+                            center_alignment = float(info['center_alignment'])
+                        except Exception:
+                            pass
+
                     # Get and log colon stress if available
                     # First try to get it from info dict (most reliable)
                     stress_value = None
@@ -137,7 +154,7 @@ class PerEnvRewardCallback(BaseCallback):
                     self.logger.record(f'rollout_per_env/env_{env_idx}_length', episode_length)
                     self.logger.record(f'rollout_per_env/env_{env_idx}_episode_count', self.episode_counts[env_idx])
 
-                    # Calculate success rate over last 10 episodes
+                    # Calculate success rate over last 10 episodes (rolling window)
                     if len(self.episode_successes[env_idx]) >= 10:
                         recent_successes_10 = self.episode_successes[env_idx][-10:]
                     else:
@@ -145,9 +162,19 @@ class PerEnvRewardCallback(BaseCallback):
 
                     success_rate_10 = np.mean(recent_successes_10) if recent_successes_10 else 0.0
 
-                    # Log success rate
+                    # Calculate cumulative success rate for this environment
+                    cumulative_success_rate = np.mean(self.episode_successes[env_idx])
+
+                    # Log success rates
                     self.logger.record(f'rollout_per_env/env_{env_idx}_success_rate_10ep', success_rate_10)
+                    self.logger.record(f'rollout_per_env/env_{env_idx}_success_rate_cumulative', cumulative_success_rate)
                     self.logger.record(f'rollout_per_env/env_{env_idx}_is_success', 1 if is_success else 0)
+                    self.logger.record(f'rollout_per_env/env_{env_idx}_total_successes', sum(self.episode_successes[env_idx]))
+                    self.logger.record(f'rollout_per_env/env_{env_idx}_total_episodes', len(self.episode_successes[env_idx]))
+
+                    # Log center alignment if available
+                    if center_alignment is not None:
+                        self.logger.record(f'rollout_per_env/env_{env_idx}_final_center_alignment', center_alignment)
 
                     # Log running statistics (mean over last 100 episodes per env)
                     if len(self.episode_rewards[env_idx]) >= 100:
@@ -169,9 +196,31 @@ class PerEnvRewardCallback(BaseCallback):
 
                     if self.verbose > 0:
                         stress_str = f", Stress={stress_value:.2f}" if stress_value is not None else ""
-                        success_str = f", Success={is_success}, SR10={success_rate_10:.1%}"
+                        success_str = f", Success={is_success}, SR10={success_rate_10:.1%}, Cumulative={cumulative_success_rate:.1%}"
+                        alignment_str = f", Alignment={center_alignment:.2f}" if center_alignment is not None else ""
                         print(f"Env {env_idx} - Episode {self.episode_counts[env_idx]}: "
-                              f"Reward={episode_reward:.2f}, Length={episode_length}{stress_str}{success_str}")
+                              f"Reward={episode_reward:.2f}, Length={episode_length}{stress_str}{success_str}{alignment_str}")
+
+        # Log overall success rate across all environments (after processing all dones)
+        if self.total_episodes > 0:
+            overall_success_rate = self.total_successes / self.total_episodes
+            self.logger.record('success/overall_success_rate', overall_success_rate)
+            self.logger.record('success/total_successes', self.total_successes)
+            self.logger.record('success/total_episodes', self.total_episodes)
+
+            # Calculate success rate over last 100 episodes across all environments
+            all_recent_successes = []
+            for env_idx in self.episode_successes:
+                if len(self.episode_successes[env_idx]) >= 100:
+                    all_recent_successes.extend(self.episode_successes[env_idx][-100:])
+                else:
+                    all_recent_successes.extend(self.episode_successes[env_idx])
+
+            if all_recent_successes:
+                # Take only the most recent 100 across all environments
+                recent_100 = all_recent_successes[-100:] if len(all_recent_successes) >= 100 else all_recent_successes
+                success_rate_recent_100 = np.mean(recent_100)
+                self.logger.record('success/success_rate_recent_100ep', success_rate_recent_100)
 
         return True
 
@@ -183,15 +232,28 @@ class PerEnvRewardCallback(BaseCallback):
     def _on_training_end(self) -> None:
         """Called at the end of training."""
         if self.verbose > 0:
-            print("\nTraining complete. Per-environment statistics:")
+            print("\n" + "="*80)
+            print("TRAINING COMPLETE - FINAL STATISTICS")
+            print("="*80)
+
+            # Overall statistics across all environments
+            if self.total_episodes > 0:
+                overall_success_rate = self.total_successes / self.total_episodes
+                print(f"\nOVERALL SUCCESS RATE: {overall_success_rate:.2%} ({self.total_successes}/{self.total_episodes})")
+            else:
+                print("\nNo episodes completed.")
+
+            print("\nPer-environment statistics:")
             for env_idx in sorted(self.episode_counts.keys()):
                 mean_reward = np.mean(self.episode_rewards[env_idx])
                 mean_length = np.mean(self.episode_lengths[env_idx])
 
-                # Calculate overall success rate
+                # Calculate success rate for this environment
                 if env_idx in self.episode_successes and self.episode_successes[env_idx]:
-                    overall_success_rate = np.mean(self.episode_successes[env_idx])
-                    success_str = f", Success Rate={overall_success_rate:.1%}"
+                    env_success_rate = np.mean(self.episode_successes[env_idx])
+                    env_successes = sum(self.episode_successes[env_idx])
+                    env_episodes = len(self.episode_successes[env_idx])
+                    success_str = f", Success Rate={env_success_rate:.1%} ({env_successes}/{env_episodes})"
                 else:
                     success_str = ""
 
@@ -202,6 +264,8 @@ class PerEnvRewardCallback(BaseCallback):
 
                 print(f"  Env {env_idx}: {self.episode_counts[env_idx]} episodes, "
                       f"Mean Reward={mean_reward:.2f}, Mean Length={mean_length:.2f}{success_str}{stress_str}")
+
+            print("="*80)
 
 
 class TrainingMetricsCallback(BaseCallback):

@@ -248,7 +248,7 @@ class DepthDistanceReward(RewardFunction):
         return torch.stack(rewards)
 
 class FinalReward(RewardFunction):
-    def __init__(self, eps, reward_scale, center_weight=0.3, goal_weight=0.4, obstruction_weight=0.3, **kwargs):
+    def __init__(self, eps, reward_scale, center_weight=0.4, goal_weight=0.4, obstruction_weight=0.2, **kwargs):
         """
         Final reward function combining multiple penalty components.
 
@@ -265,6 +265,7 @@ class FinalReward(RewardFunction):
         self.goal_weight = goal_weight
         self.obstruction_weight = obstruction_weight
         self.goal_reached_per_env = None
+        self.center_alignment_per_env = None  # Track center alignment for each environment
 
     def reset(self, initial_positions, goals):
         self.initial_positions = initial_positions
@@ -272,6 +273,7 @@ class FinalReward(RewardFunction):
         # Reset goal_reached status for all environments
         num_envs = len(initial_positions)
         self.goal_reached_per_env = torch.zeros(num_envs, dtype=torch.bool, device=initial_positions.device)
+        self.center_alignment_per_env = torch.zeros(num_envs, dtype=torch.float32, device=initial_positions.device)
 
     def __call__(self, action, current_states, _previous_states):
         robot_positions = current_states["robot_positions"]
@@ -284,8 +286,11 @@ class FinalReward(RewardFunction):
         if self.goal_reached_per_env is None:
             num_envs = len(robot_positions)
             self.goal_reached_per_env = torch.zeros(num_envs, dtype=torch.bool, device=robot_positions.device)
+            self.center_alignment_per_env = torch.zeros(num_envs, dtype=torch.float32, device=robot_positions.device)
+            self.high_quadrants_per_env = []  # Store quadrant for each environment (using threshold_high)
         else:
             self.goal_reached_per_env.fill_(False)
+            self.high_quadrants_per_env = []
 
         for i, (robot_position, depth_img, goal, entry_pos) in enumerate(zip(robot_positions, depth_images, goals, entry_poss)):
             # Calculate distance to goal
@@ -305,15 +310,74 @@ class FinalReward(RewardFunction):
             mean_depth = np.mean(depth_img_np)
             depth_variance = np.var(depth_img_np)
 
-            # Find the deepest point location (highest depth value = farthest point)
-            max_depth_idx = np.unravel_index(np.argmax(depth_img_np), depth_img_np.shape)
-            max_depth_row, max_depth_col = max_depth_idx  # (row, col)
+            # Find the centroid of the region with depth >= 40% and <= 60% of max_depth
+            # This targets the mid-depth region which represents the lumen opening better
+            depth_threshold_low = 0.1 * max_depth
+            depth_threshold_high = 0.2 * max_depth
+            deep_pixels_mask = (depth_img_np >= depth_threshold_low) & (depth_img_np <= depth_threshold_high)
+            deep_pixel_coords = np.argwhere(deep_pixels_mask)  # Returns (row, col) pairs
+
+            # Calculate the centroid of the deep region
+            if len(deep_pixel_coords) > 0:
+                max_depth_row = np.mean(deep_pixel_coords[:, 0])
+                max_depth_col = np.mean(deep_pixel_coords[:, 1])
+            else:
+                # Fallback to absolute deepest point if no pixels found (shouldn't happen)
+                max_depth_idx = np.unravel_index(np.argmax(depth_img_np), depth_img_np.shape)
+                max_depth_row, max_depth_col = max_depth_idx
+
+            # Compute centroids for threshold_low and threshold_high regions separately
+            # Region 1: pixels >= threshold_low
+            low_region_mask = depth_img_np >= depth_threshold_low
+            low_region_coords = np.argwhere(low_region_mask)
+
+            # Region 2: pixels >= threshold_high
+            high_region_mask = depth_img_np >= depth_threshold_high
+            high_region_coords = np.argwhere(high_region_mask)
+
+            # Helper function to determine quadrant
+            def get_quadrant(row, col, center_row, center_col):
+                if row < center_row and col < center_col:
+                    return "upper-left"
+                elif row < center_row and col >= center_col:
+                    return "upper-right"
+                elif row >= center_row and col < center_col:
+                    return "lower-left"
+                else:
+                    return "lower-right"
+
+            # Compute centroid for threshold_low region
+            if len(low_region_coords) > 0:
+                low_centroid_row = np.mean(low_region_coords[:, 0])
+                low_centroid_col = np.mean(low_region_coords[:, 1])
+                low_quadrant = get_quadrant(low_centroid_row, low_centroid_col, img_center_row, img_center_col)
+                print(f"Env {i} - threshold_low centroid: ({low_centroid_row:.1f}, {low_centroid_col:.1f}), quadrant: {low_quadrant}")
+            else:
+                print(f"Env {i} - threshold_low region: No pixels found")
+
+            # Compute centroid for threshold_high region (THIS IS USED FOR ACTION CLIPPING)
+            if len(high_region_coords) > 0:
+                high_centroid_row = np.mean(high_region_coords[:, 0])
+                high_centroid_col = np.mean(high_region_coords[:, 1])
+                high_quadrant = get_quadrant(high_centroid_row, high_centroid_col, img_center_row, img_center_col)
+                print(f"Env {i} - threshold_high centroid: ({high_centroid_row:.1f}, {high_centroid_col:.1f}), quadrant: {high_quadrant}")
+                self.high_quadrants_per_env.append(high_quadrant)
+            else:
+                print(f"Env {i} - threshold_high region: No pixels found")
+                self.high_quadrants_per_env.append("center")  # Default when no pixels found
 
             # Calculate ratio of pixels with "good depth" (indicates wide open lumen vs narrow view)
             GOOD_DEPTH_THRESHOLD = 0.12  # Pixels above this are considered "good depth"
             high_depth_pixels = np.sum(depth_img_np > GOOD_DEPTH_THRESHOLD)
             total_pixels = depth_img_np.size
             high_depth_ratio = high_depth_pixels / total_pixels
+
+            # Check if too many pixels are in the shallow depth range (very close to camera)
+            # This indicates facing a wall or obstruction
+            # Use an absolute threshold instead of relative to avoid false positives
+            SHALLOW_DEPTH_ABSOLUTE = 0.05  # Pixels closer than this are "very shallow"
+            shallow_pixels = np.sum(depth_img_np < SHALLOW_DEPTH_ABSOLUTE)
+            shallow_ratio = shallow_pixels / total_pixels
 
             # Calculate max possible distance from center (for normalization)
             max_center_distance = np.sqrt(img_center_row**2 + img_center_col**2)
@@ -332,12 +396,14 @@ class FinalReward(RewardFunction):
 
             # 1. Lumen alignment: reward when deepest point (farthest) is centered
             # When facing lumen center, the deepest point should be in the center of the image
-            reward_components['center_alignment'] = 1.0 - deepest_point_normalized
+            center_alignment = 1.0 - deepest_point_normalized
+            reward_components['center_alignment'] = center_alignment
+            self.center_alignment_per_env[i] = center_alignment
 
             # 2. Lumen visibility quality: combines max_depth AND high_depth_ratio
             # Good lumen view requires BOTH deep point AND wide open view
             LUMEN_MIN_DEPTH = 0.20  # Minimum max depth for good lumen
-            WALL_MAX_DEPTH = 0.10   # Maximum depth indicating wall
+            WALL_MAX_DEPTH = 0.05   # Maximum depth indicating wall
             MIN_HIGH_DEPTH_RATIO = 0.40  # Minimum ratio of "good depth" pixels for quality view
 
             # First check max_depth (is lumen visible at all?)
@@ -381,9 +447,21 @@ class FinalReward(RewardFunction):
                           self.goal_weight * reward_components['goal_progress'] +
                           self.obstruction_weight * reward_components['lumen_visibility'])
 
+            # Poor center alignment penalty - penalize when not well-aligned with lumen center
+            # if center_alignment < 0.8:
+            #     total_reward = -1.0
+
             # Special conditions override the weighted sum
+            # Poor lumen visibility - severe penalty
+            if lumen_visibility_penalty < -0.1:
+                total_reward = -1.0
+
+            # Too many shallow pixels - indicates facing wall/obstruction
+            if shallow_ratio > 0.6:
+                total_reward = -1.0
+
             # Hitting wall - severe penalty (depth = 1.0 means collision)
-            if torch.abs(torch.tensor(max_depth - 1.0)) < 0.001:
+            if torch.abs(torch.tensor(max_depth - 0.5)) < 0.001:
                 total_reward = -1.0
 
             # Goal reached - maximum reward
@@ -398,13 +476,18 @@ class FinalReward(RewardFunction):
             total_reward = np.clip(total_reward, -1.0, 1.0)
 
             # Debug output
-            print(f"Env {i} - Center: {reward_components['center_alignment']:.3f}, "
-                  f"Goal: {reward_components['goal_progress']:.3f}, "
-                  f"Lumen_Visibility: {reward_components['lumen_visibility']:.3f}, "
-                  f"Total: {total_reward:.3f}")
+            # print(f"Env {i} - Center: {reward_components['center_alignment']:.3f}, "
+            #       f"Goal: {reward_components['goal_progress']:.3f}, "
+            #       f"Lumen_Visibility: {reward_components['lumen_visibility']:.3f}, "
+            #       f"Total: {total_reward:.3f}")
 
             rewards.append(torch.tensor(total_reward,
                                        dtype=torch.float32,
                                        device='cuda' if torch.cuda.is_available() else 'cpu'))
+
+        # Store quadrant information for action clipping (accessible via current_states)
+        # We'll store the quadrant for each environment to be used by the environment
+        if not hasattr(self, 'low_quadrants'):
+            self.low_quadrants = []
 
         return torch.stack(rewards) * self.reward_scale

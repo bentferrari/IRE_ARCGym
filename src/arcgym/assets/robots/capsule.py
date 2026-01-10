@@ -140,8 +140,14 @@ class RobotEndoscopeCapsule(BaseRobot):
         
         return RobotEndoscopeCapsuleCfg()
 
-    def apply_action(self, actions: torch.Tensor, action_scale: float = 1.0) -> None:
-        """Apply 6DOF velocity actions with collision-safe scaling."""
+    def apply_action(self, actions: torch.Tensor, action_scale: float = 1.0, **kwargs) -> None:
+        """Apply 6DOF velocity actions with collision-safe scaling.
+
+        Args:
+            actions: Action tensor
+            action_scale: Scaling factor for actions
+            **kwargs: Additional parameters for compatibility
+        """
         pose = self.get_pose()  # Shape: (num_envs, 13)
         if pose is None or pose.numel() == 0:
             logging.warning("Warning: Invalid pose data, skipping action application")

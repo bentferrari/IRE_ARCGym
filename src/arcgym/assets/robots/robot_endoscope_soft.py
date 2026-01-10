@@ -490,10 +490,10 @@ class SoftEndoscopeChain(BaseRobot):
 
         return RobotContinuumSnakeCfg()
 
-    def apply_action(self, actions: torch.Tensor, action_scale: float = 1.0) -> None:
+    def apply_action(self, actions: torch.Tensor, action_scale: float = 1.0, **kwargs) -> None:
         """
         Apply 6-DoF action to continuum robot.
-        
+
         Actions:
             [0] left/right (NOT USED)
             [1] up/down (NOT USED)
@@ -501,6 +501,11 @@ class SoftEndoscopeChain(BaseRobot):
             [3] Δpitch_total → total pitch bend (rad/s)
             [4] Δyaw_total → total yaw bend (rad/s)
             [5] roll/twist (NOT IMPLEMENTED - needs root rotation control)
+
+        Args:
+            actions: Action tensor
+            action_scale: Scaling factor for actions
+            **kwargs: Additional parameters for compatibility
         """
         if not self._is_initialized:
             logging.warning("Cannot apply action - robot not initialized yet")
