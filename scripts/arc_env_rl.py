@@ -90,7 +90,7 @@ use_camera = True
 device = args_cli.device
 
 learning_config = {
-    "total_timesteps": 1000000,
+    "total_timesteps": 1e7,
     "learning_rate" : 1e-4,
     "batch_size" : 1024,
     "verbose" : True,
@@ -148,22 +148,23 @@ env_config = {
     "debug_vis" : False,
     "episode_length_s" : 20.0 if args_cli.train else 20000.0,
     "constraint_point_A": 1,  # Distance from robot tip to constraint point A along the robot's local z-axis
-    "init_from_csv": "./saved_states/c1t2_start.csv" if args_cli.train else None,
-    "init_endpose_from_csv": "./saved_states/c1t2_end.csv" if args_cli.train else None,
+    "init_from_csv": "./saved_states/env1_c1t1_start.csv" if args_cli.train else None,
+    "init_endpose_from_csv": "./saved_states/env1_c1t1_end.csv" if args_cli.train else None,
     "random_initial_configuration": False,  # Use straight configuration (especially for teleoperation mode)
-    "disable_movement_constraints": not args_cli.train  # Disable constraints in teleoperation mode for free movement
+    "disable_movement_constraints": not args_cli.train,  # Disable constraints in teleoperation mode for free movement
+    "use_txt_files_for_attachments": True  # Use txt files to load precise vertex indices for colon attachments
 }
 
 reward_config = {
     "reward_type" : "final_reward", #"test_reward_action",#"depth_goal",#"default",#,"final_reward"
     "reward_scale" : 1.0,
-    "eps" : 0.13,
+    "eps" : 0.15,
     "running_penalty" : -0.1,
     "goal_reward" : 50.0,
     # Make center alignment dominant in the reward function
-    "center_weight": 0.2,      # Increased from 0.4 to 0.7 (dominant)
-    "goal_weight": 0.6,        # Decreased from 0.4 to 0.2
-    "obstruction_weight": 0.2, # Decreased from 0.2 to 0.1
+    "center_weight": 0.5,      # Increased from 0.4 to 0.7 (dominant)
+    "goal_weight": 0.1,        # Decreased from 0.4 to 0.2
+    "obstruction_weight": 0.4, # Decreased from 0.2 to 0.1
 }
 
 simulation_config = {
@@ -339,7 +340,7 @@ env = FrameStack(env, n_stack=4)
 video_kwargs = {
     "video_folder": video_save_path,
     "step_trigger": lambda step: step % 25000 == 0,
-    "video_length": 2500,
+    "video_length": 5000,
 }
 env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
@@ -398,52 +399,61 @@ if config["env_config"]["discrete_action_space"]:
         exploration_final_eps=0.05,
     )
 else:
-    model = SAC(
-        "MultiInputPolicy",
-        env,
-        verbose=1,
-        policy_kwargs={"normalize_images": False},
-        tensorboard_log=tensorboard_log,
-        device="cuda",
-        ent_coef=0.5,
-        learning_starts=5000,
-        learning_rate=learning_config["learning_rate"],
-        buffer_size=5000,
-        batch_size=learning_config["batch_size"],
-        tau=0.005,
-        gamma=0.99,
-        train_freq=10,
-        gradient_steps=2,
-    )
-
-    # model = PPO(
+    # model = SAC(
     #     "MultiInputPolicy",
     #     env,
     #     verbose=1,
-    #     policy_kwargs={"normalize_images": True},
+    #     policy_kwargs={"normalize_images": False},
     #     tensorboard_log=tensorboard_log,
     #     device="cuda",
+    #     ent_coef=0.5,
+    #     learning_starts=5000,
     #     learning_rate=learning_config["learning_rate"],
+    #     buffer_size=5000,
     #     batch_size=learning_config["batch_size"],
-    #     n_steps=2048,
-    #     clip_range=0.2,
-    #     ent_coef=0.1,
-    #     n_epochs=64,
+    #     tau=0.005,
     #     gamma=0.99,
-    #     gae_lambda=0.95,
+    #     train_freq=10,
+    #     gradient_steps=2,
     # )
+
+    model = PPO(
+        "MultiInputPolicy",
+        env,
+        verbose=1,
+        policy_kwargs={"normalize_images": True},
+        tensorboard_log=tensorboard_log,
+        device="cuda",
+        learning_rate=learning_config["learning_rate"],
+        batch_size=learning_config["batch_size"],
+        n_steps=2048,
+        clip_range=0.2,
+        ent_coef=0.1,
+        n_epochs=64,
+        gamma=0.99,
+        gae_lambda=0.95,
+    )
 
 # Print the policy network structure
 logging.debug("Policy architecture:")
 logging.debug(model.policy)
 
 # More detailed view of the policy networks
-# SAC has 'actor' and 'critic' instead of 'action_net' and 'value_net'
-logging.debug("\nActor network:")
-logging.debug(model.policy.actor)
-
-logging.debug("\nCritic network:")
-logging.debug(model.policy.critic)
+# PPO has 'action_net' and 'value_net', SAC has 'actor' and 'critic'
+if hasattr(model.policy, 'actor'):
+    # SAC-specific
+    logging.debug("\nActor network:")
+    logging.debug(model.policy.actor)
+    logging.debug("\nCritic network:")
+    logging.debug(model.policy.critic)
+elif hasattr(model.policy, 'action_net'):
+    # PPO-specific (ActorCriticPolicy)
+    logging.debug("\nAction network (actor):")
+    logging.debug(model.policy.action_net)
+    logging.debug("\nValue network (critic):")
+    logging.debug(model.policy.value_net)
+    logging.debug("\nMLP extractor:")
+    logging.debug(model.policy.mlp_extractor)
 
 logging.debug("\nFeature extractor:")
 logging.debug(model.policy.features_extractor)

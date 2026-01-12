@@ -217,6 +217,9 @@ class ColonModel:
         self.init_rot = init_rot
         self._env_translation = None
 
+        # Get attachment configuration from env_config
+        self.use_txt_files_for_attachments = cfg1.get("env_config", {}).get("use_txt_files_for_attachments", True)
+
         self._setup()
 
     def _setup(self):
@@ -281,7 +284,7 @@ class ColonModel:
             api = PhysxSchema.PhysxAutoAttachmentAPI.Apply(attachment.GetPrim())
             api.CreateDeformableVertexOverlapOffsetAttr(0.001)
 
-    def _attach_colon_nodals(self, env_ids: torch.Tensor = None):
+    def _attach_colon_nodals(self, env_ids: torch.Tensor = None, use_txt_files: bool = True):
         if self.is_rigid:
             return  # Skip for rigid bodies
 
@@ -297,21 +300,38 @@ class ColonModel:
         nodal_kinematic_target[env_ids, :, :3] = nodal_state[env_ids, :, :3]
         nodal_kinematic_target[env_ids, :, 3] = 1  # free for all of them
 
-        #now attach rectum, descend, splenic, hectic, cecum nodals
-        # Use first environment's nodal positions to determine attachment indices
-        attaching_nodal_idx = colon_utils.extract_attach_nodals(nodal_pos=nodal_state[0, :, :3])
+        if use_txt_files:
+            # Load attachment indices from txt files (these are visual mesh indices)
+            visual_vertex_indices = colon_utils.get_attachment_nodal_indices(
+                model_id="0000",
+                device=nodal_state.device
+            )
 
-        # Get bottom vertices indices (same logic as entry position)
-        xyz = nodal_state[0, :, :3]
-        z = xyz[:, 2]
-        bottom_mask = z < torch.quantile(z, 0.033)  # Same threshold as get_entry_pos
-        bottom_nodal_idx = torch.where(bottom_mask)[0]
+            # Map visual mesh vertex indices to simulation mesh node indices
+            # The txt files reference the high-res visual mesh, but we need simulation node indices
+            all_attach_idx = colon_utils.map_visual_to_simulation_nodes(
+                visual_mesh_path=obj_model_full_path,
+                visual_vertex_indices=visual_vertex_indices,
+                simulation_nodal_positions=nodal_state[0, :, :3]  # Use first env's nodal positions
+            )
+            print(f"Loaded {len(visual_vertex_indices)} visual vertices from txt files")
+            print(f"Mapped to {len(all_attach_idx)} simulation nodes (out of {nodal_state.shape[1]} total nodes)")
+        else:
+            #now attach rectum, descend, splenic, hectic, cecum nodals (old method)
+            # Use first environment's nodal positions to determine attachment indices
+            attaching_nodal_idx = colon_utils.extract_attach_nodals(nodal_pos=nodal_state[0, :, :3])
 
-        # Ensure both tensors are on the same device
-        attaching_nodal_idx = torch.tensor(attaching_nodal_idx, device=nodal_state.device)
+            # Get bottom vertices indices (same logic as entry position)
+            xyz = nodal_state[0, :, :3]
+            z = xyz[:, 2]
+            bottom_mask = z < torch.quantile(z, 0.033)  # Same threshold as get_entry_pos
+            bottom_nodal_idx = torch.where(bottom_mask)[0]
 
-        # Combine anatomical attachments with bottom vertex attachments
-        all_attach_idx = torch.cat([attaching_nodal_idx, bottom_nodal_idx])
+            # Ensure both tensors are on the same device
+            attaching_nodal_idx = torch.tensor(attaching_nodal_idx, device=nodal_state.device)
+
+            # Combine anatomical attachments with bottom vertex attachments
+            all_attach_idx = torch.cat([attaching_nodal_idx, bottom_nodal_idx])
 
         # Apply attachments only to specified environments
         # print("nodal to attach", all_attach_idx)
@@ -429,7 +449,7 @@ class ColonModel:
         # 1_env_endoscope: 2.3976, 2.9910, 0.5599
         # 5_envs_capsule: 1.0783, 0.5391, 0.1505
         # 5_envs_new_mesh: 5.6430,  -1.3124, -2.2
-        # 1_env_new_mesh: x=0.2211, y=1.6476, z=-2.0191 lowest colon point
+        # 1_env_new_mesh: x=0.643, 1.119, -2.017
         robot_type = self.robot_config.get("robot_type", None)
         if robot_type == "capsule":
             entry_pos = torch.tensor([1.1899, 0.4953, 0.1229]).to(device)
@@ -440,12 +460,12 @@ class ColonModel:
                                         [-1.0, 0.0, 0.0]
                                         ]).to(device)
         else:
-            entry_pos = torch.tensor([5.6430,  -1.3124, -2.0]).to(device)
+            entry_pos = torch.tensor([0.643, 1.119, -2.017]).to(device)
             delta_trans = torch.tensor([[0.0, 0.0, 0.0],
-                                        [0.0, 5, 0.0],
-                                        [-5, 0.0, 0.0],
-                                        [-5, 5, 0.0],
-                                        [-10, 0.0, 0.0]
+                                        # [0.0, 5, 0.0],
+                                        # [-5, 0.0, 0.0],
+                                        # [-5, 5, 0.0],
+                                        # [-10, 0.0, 0.0]
                                         ]).to(device)
 
         #print("entry_pos + delta_trans:", entry_pos + delta_trans)
@@ -610,7 +630,7 @@ class ColonModel:
             self.colon_body.write_nodal_state_to_sim(self.colon_body._data.nodal_state_w[env_ids], env_ids)
 
         # Reapply nodal attachments (pass env_ids to only reset specified environments)
-        self._attach_colon_nodals(env_ids)
+        self._attach_colon_nodals(env_ids, use_txt_files=self.use_txt_files_for_attachments)
 
         # Print the lowest position after reset (for environment 0)
         if 0 in env_ids or env_ids.numel() == self.colon_body.num_instances:

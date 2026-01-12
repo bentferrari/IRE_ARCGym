@@ -310,10 +310,23 @@ class FinalReward(RewardFunction):
             mean_depth = np.mean(depth_img_np)
             depth_variance = np.var(depth_img_np)
 
-            # Find the centroid of the region with depth >= 40% and <= 60% of max_depth
-            # This targets the mid-depth region which represents the lumen opening better
-            depth_threshold_low = 0.1 * max_depth
-            depth_threshold_high = 0.2 * max_depth
+            # Print depth statistics for each environment at each timestep
+            #print(f"Env {i} - min_depth: {min_depth:.4f}, max_depth: {max_depth:.4f}")
+
+            # Find the centroid of the region with different thresholds based on proximity to wall
+            # When close to wall (min_depth < 0.05), use lower thresholds to find the opening
+            # Otherwise, use higher thresholds to focus on deeper lumen regions
+            depth_threshold_low = 0.6 * max_depth
+            depth_threshold_high = 0.7 * max_depth
+            if min_depth < 0.03:
+                depth_threshold_low = 0.1 * max_depth
+                depth_threshold_high = 0.2 * max_depth
+            # else:
+            #     depth_threshold_low = 0.9 * max_depth
+            #     depth_threshold_high = 1.0 * max_depth
+            # if max_depth < 0.3:
+            #     depth_threshold_low = 0.9 * max_depth
+            #     depth_threshold_high = 1.0 * max_depth
             deep_pixels_mask = (depth_img_np >= depth_threshold_low) & (depth_img_np <= depth_threshold_high)
             deep_pixel_coords = np.argwhere(deep_pixels_mask)  # Returns (row, col) pairs
 
@@ -351,16 +364,16 @@ class FinalReward(RewardFunction):
                 low_centroid_row = np.mean(low_region_coords[:, 0])
                 low_centroid_col = np.mean(low_region_coords[:, 1])
                 low_quadrant = get_quadrant(low_centroid_row, low_centroid_col, img_center_row, img_center_col)
-                print(f"Env {i} - threshold_low centroid: ({low_centroid_row:.1f}, {low_centroid_col:.1f}), quadrant: {low_quadrant}")
-            else:
-                print(f"Env {i} - threshold_low region: No pixels found")
+                #print(f"Env {i} - threshold_low centroid: ({low_centroid_row:.1f}, {low_centroid_col:.1f}), quadrant: {low_quadrant}")
+            # else:
+            #     print(f"Env {i} - threshold_low region: No pixels found")
 
             # Compute centroid for threshold_high region (THIS IS USED FOR ACTION CLIPPING)
             if len(high_region_coords) > 0:
                 high_centroid_row = np.mean(high_region_coords[:, 0])
                 high_centroid_col = np.mean(high_region_coords[:, 1])
                 high_quadrant = get_quadrant(high_centroid_row, high_centroid_col, img_center_row, img_center_col)
-                print(f"Env {i} - threshold_high centroid: ({high_centroid_row:.1f}, {high_centroid_col:.1f}), quadrant: {high_quadrant}")
+                #print(f"Env {i} - threshold_high centroid: ({high_centroid_row:.1f}, {high_centroid_col:.1f}), quadrant: {high_quadrant}")
                 self.high_quadrants_per_env.append(high_quadrant)
             else:
                 print(f"Env {i} - threshold_high region: No pixels found")
@@ -453,20 +466,20 @@ class FinalReward(RewardFunction):
 
             # Special conditions override the weighted sum
             # Poor lumen visibility - severe penalty
-            if lumen_visibility_penalty < -0.1:
-                total_reward = -1.0
+            if lumen_visibility_penalty < 0:
+                total_reward = total_reward - 0.5
 
             # Too many shallow pixels - indicates facing wall/obstruction
             if shallow_ratio > 0.6:
                 total_reward = -1.0
 
-            # Hitting wall - severe penalty (depth = 1.0 means collision)
-            if torch.abs(torch.tensor(max_depth - 0.5)) < 0.001:
+            # Hitting wall - severe penalty (very close collision)
+            if min_depth < 0.01:
                 total_reward = -1.0
 
             # Goal reached - maximum reward
             if d2target < self.eps:
-                total_reward = 1.0
+                total_reward = 100.0
                 self.goal_reached_per_env[i] = True
                 print(f"Goal reached in environment {i}!")
 
@@ -475,7 +488,7 @@ class FinalReward(RewardFunction):
             # Special conditions are already normalized
             total_reward = np.clip(total_reward, -1.0, 1.0)
 
-            # Debug output
+            # # Debug output
             # print(f"Env {i} - Center: {reward_components['center_alignment']:.3f}, "
             #       f"Goal: {reward_components['goal_progress']:.3f}, "
             #       f"Lumen_Visibility: {reward_components['lumen_visibility']:.3f}, "

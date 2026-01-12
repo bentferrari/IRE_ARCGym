@@ -378,17 +378,24 @@ class ARCIsaacEnv(DirectRLEnv):
         orientation_scale = self.action_scale * 1 # 3x higher for orientation
         scaled_actions[:, 3:] = scaled_actions[:, 3:] * orientation_scale
 
+        # Store the scaled actions BEFORE clipping for reward computation
+        # This ensures PPO trains on the actions it actually outputs
         self.actions = scaled_actions
 
     def _apply_movement_constraints(self, actions: torch.Tensor) -> torch.Tensor:
         """
-        Apply movement constraints based on quadrant of lumen centroid (threshold_high).
+        Apply movement constraints based on quadrant of lumen centroid.
+
+        When lumen visibility is poor (< -0.15), uses the deepest point position.
+        Otherwise, uses the threshold_high centroid from the reward function.
 
         ALWAYS forces forward motion (v_forward_back = 0.1) and clips other actions based on quadrant:
         - upper-left: clip to go up and left (v_left_right ≤ 0, v_up_down ≤ 0, ω_pitch ≤ 0, ω_yaw ≤ 0)
         - upper-right: clip to go up and right (v_left_right ≥ 0, v_up_down ≤ 0, ω_pitch ≤ 0, ω_yaw ≥ 0)
         - lower-left: clip to go down and left (v_left_right ≤ 0, v_up_down ≥ 0, ω_pitch ≥ 0, ω_yaw ≤ 0)
         - lower-right: clip to go down and right (v_left_right ≥ 0, v_up_down ≥ 0, ω_pitch ≥ 0, ω_yaw ≥ 0)
+
+        Constraints are only applied after 10,000 steps to allow initial exploration.
 
         Args:
             actions: Action tensor of shape (num_envs, 6)
@@ -402,8 +409,22 @@ class ARCIsaacEnv(DirectRLEnv):
         if self.env_config.get("disable_movement_constraints", False):
             return actions
 
+        # Only apply constraints after 10,000 steps
+        if self.common_step_counter < 100:
+            return actions
+
         # Clone to avoid modifying input
         constrained_actions = actions.clone()
+
+        # Compute lumen visibility to determine quadrant source
+        if hasattr(self.robot, 'get_depth'):
+            try:
+                _, lumen_visibilities, _ = self._compute_movement_metrics()
+            except Exception as e:
+                logging.warning(f"Failed to compute lumen visibility: {e}")
+                lumen_visibilities = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        else:
+            lumen_visibilities = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
 
         # Get quadrant information from reward function (using threshold_high centroid)
         if hasattr(self.reward_function, 'high_quadrants_per_env') and self.reward_function.high_quadrants_per_env:
@@ -413,44 +434,78 @@ class ARCIsaacEnv(DirectRLEnv):
                 # Store original actions for printing
                 original_action = actions[env_id].clone()
 
-                # ALWAYS set forward/back to fixed 0.1 (constant forward motion)
-                constrained_actions[env_id, 2] = 0.1  # v_forward_back = 0.1 (always move forward)
+                # Override quadrant with deepest point position if lumen visibility is poor
+                quadrant_source = "threshold_high"
+                if lumen_visibilities[env_id] < -0.10:
+                    # Poor visibility: compute quadrant from deepest point
+                    try:
+                        depth_images = self.robot.get_depth()
+                        depth_img = depth_images[env_id]
+                        depth_img_np = depth_img[:, :, 0].cpu().numpy()
+
+                        img_height, img_width = depth_img_np.shape
+                        img_center_row, img_center_col = img_height / 2, img_width / 2
+
+                        # Find deepest point (maximum depth value)
+                        max_depth_idx = np.unravel_index(np.argmax(depth_img_np), depth_img_np.shape)
+                        max_depth_row, max_depth_col = max_depth_idx
+
+                        # Determine quadrant based on deepest point
+                        if max_depth_row < img_center_row and max_depth_col < img_center_col:
+                            quadrant = "upper-left"
+                        elif max_depth_row < img_center_row and max_depth_col >= img_center_col:
+                            quadrant = "upper-right"
+                        elif max_depth_row >= img_center_row and max_depth_col < img_center_col:
+                            quadrant = "lower-left"
+                        else:
+                            quadrant = "lower-right"
+
+                        quadrant_source = "deepest_point"
+                    except Exception as e:
+                        logging.warning(f"Failed to compute deepest point quadrant: {e}")
+
+                # Clip forward/back motion to range [0.01, 0.05]
+                constrained_actions[env_id, 2] = torch.clamp(constrained_actions[env_id, 2], min=0.05, max=0.10)
+
+                # Always disable roll (set to 0)
+                constrained_actions[env_id, 5] = 0.0
 
                 if quadrant == "upper-left":
                     # Clip to go up and left: translation left/up, yaw left, pitch up
-                    constrained_actions[env_id, 0] = torch.clamp(constrained_actions[env_id, 0], max=0.0)  # v_left_right <= 0 (left)
-                    constrained_actions[env_id, 1] = torch.clamp(constrained_actions[env_id, 1], max=0.0)  # v_up_down <= 0 (up)
-                    constrained_actions[env_id, 3] = torch.clamp(constrained_actions[env_id, 3], max=0.0)  # ω_pitch <= 0 (up)
-                    constrained_actions[env_id, 4] = torch.clamp(constrained_actions[env_id, 4], max=0.0)  # ω_yaw <= 0 (left)
+                    constrained_actions[env_id, 0] = torch.clamp(constrained_actions[env_id, 0], max=0)  # v_left_right <= 0 (left)
+                    constrained_actions[env_id, 1] = torch.clamp(constrained_actions[env_id, 1], max=0)  # v_up_down <= 0 (up)
+                    constrained_actions[env_id, 3] = torch.clamp(constrained_actions[env_id, 3], max=0)  # ω_pitch <= 0 (up)
+                    constrained_actions[env_id, 4] = torch.clamp(constrained_actions[env_id, 4], max=0)  # ω_yaw <= 0 (left)
 
                 elif quadrant == "upper-right":
                     # Clip to go up and right: translation right/up, yaw right, pitch up
-                    constrained_actions[env_id, 0] = torch.clamp(constrained_actions[env_id, 0], min=0.0)  # v_left_right >= 0 (right)
-                    constrained_actions[env_id, 1] = torch.clamp(constrained_actions[env_id, 1], max=0.0)  # v_up_down <= 0 (up)
-                    constrained_actions[env_id, 3] = torch.clamp(constrained_actions[env_id, 3], max=0.0)  # ω_pitch <= 0 (up)
-                    constrained_actions[env_id, 4] = torch.clamp(constrained_actions[env_id, 4], min=0.0)  # ω_yaw >= 0 (right)
+                    constrained_actions[env_id, 0] = torch.clamp(constrained_actions[env_id, 0], min=0)  # v_left_right >= 0 (right)
+                    constrained_actions[env_id, 1] = torch.clamp(constrained_actions[env_id, 1], max=0)  # v_up_down <= 0 (up)
+                    constrained_actions[env_id, 3] = torch.clamp(constrained_actions[env_id, 3], max=0)  # ω_pitch <= 0 (up)
+                    constrained_actions[env_id, 4] = torch.clamp(constrained_actions[env_id, 4], min=0)  # ω_yaw >= 0 (right)
 
                 elif quadrant == "lower-left":
                     # Clip to go down and left: translation left/down, yaw left, pitch down
-                    constrained_actions[env_id, 0] = torch.clamp(constrained_actions[env_id, 0], max=0.0)  # v_left_right <= 0 (left)
-                    constrained_actions[env_id, 1] = torch.clamp(constrained_actions[env_id, 1], min=0.0)  # v_up_down >= 0 (down)
-                    constrained_actions[env_id, 3] = torch.clamp(constrained_actions[env_id, 3], min=0.0)  # ω_pitch >= 0 (down)
-                    constrained_actions[env_id, 4] = torch.clamp(constrained_actions[env_id, 4], max=0.0)  # ω_yaw <= 0 (left)
+                    constrained_actions[env_id, 0] = torch.clamp(constrained_actions[env_id, 0], max=0)  # v_left_right <= 0 (left)
+                    constrained_actions[env_id, 1] = torch.clamp(constrained_actions[env_id, 1], min=0)  # v_up_down >= 0 (down)
+                    constrained_actions[env_id, 3] = torch.clamp(constrained_actions[env_id, 3], min=0)  # ω_pitch >= 0 (down)
+                    constrained_actions[env_id, 4] = torch.clamp(constrained_actions[env_id, 4], max=0)  # ω_yaw <= 0 (left)
 
                 elif quadrant == "lower-right":
                     # Clip to go down and right: translation right/down, yaw right, pitch down
-                    constrained_actions[env_id, 0] = torch.clamp(constrained_actions[env_id, 0], min=0.0)  # v_left_right >= 0 (right)
-                    constrained_actions[env_id, 1] = torch.clamp(constrained_actions[env_id, 1], min=0.0)  # v_up_down >= 0 (down)
-                    constrained_actions[env_id, 3] = torch.clamp(constrained_actions[env_id, 3], min=0.0)  # ω_pitch >= 0 (down)
-                    constrained_actions[env_id, 4] = torch.clamp(constrained_actions[env_id, 4], min=0.0)  # ω_yaw >= 0 (right)
+                    constrained_actions[env_id, 0] = torch.clamp(constrained_actions[env_id, 0], min=0)  # v_left_right >= 0 (right)
+                    constrained_actions[env_id, 1] = torch.clamp(constrained_actions[env_id, 1], min=0)  # v_up_down >= 0 (down)
+                    constrained_actions[env_id, 3] = torch.clamp(constrained_actions[env_id, 3], min=0)  # ω_pitch >= 0 (down)
+                    constrained_actions[env_id, 4] = torch.clamp(constrained_actions[env_id, 4], min=0)  # ω_yaw >= 0 (right)
 
                 # Print quadrant and actions for each environment
                 clipped_action = constrained_actions[env_id]
-                print(f"Env {env_id} - Quadrant: {quadrant:12s} | "
-                      f"Original: [L/R:{original_action[0]:6.3f}, U/D:{original_action[1]:6.3f}, F/B:{original_action[2]:6.3f}, "
-                      f"Pitch:{original_action[3]:6.3f}, Yaw:{original_action[4]:6.3f}, Roll:{original_action[5]:6.3f}] | "
-                      f"Clipped: [L/R:{clipped_action[0]:6.3f}, U/D:{clipped_action[1]:6.3f}, F/B:{clipped_action[2]:6.3f}, "
-                      f"Pitch:{clipped_action[3]:6.3f}, Yaw:{clipped_action[4]:6.3f}, Roll:{clipped_action[5]:6.3f}]")
+                lumen_vis = lumen_visibilities[env_id].item()
+                # print(f"Env {env_id} - Quadrant: {quadrant:12s} ({quadrant_source}) | LumenVis: {lumen_vis:6.3f} | "
+                #     #   f"Original: [L/R:{original_action[0]:6.3f}, U/D:{original_action[1]:6.3f}, F/B:{original_action[2]:6.3f}, "
+                #     #   f"Pitch:{original_action[3]:6.3f}, Yaw:{original_action[4]:6.3f}, Roll:{original_action[5]:6.3f}] | "
+                #       f"Clipped: [L/R:{clipped_action[0]:6.3f}, U/D:{clipped_action[1]:6.3f}, F/B:{clipped_action[2]:6.3f}, "
+                #       f"Pitch:{clipped_action[3]:6.3f}, Yaw:{clipped_action[4]:6.3f}, Roll:{clipped_action[5]:6.3f}]")
 
         return constrained_actions
 
@@ -469,12 +524,15 @@ class ARCIsaacEnv(DirectRLEnv):
                 logging.warning(f"Failed to compute center alignment: {e}")
 
         # Apply conditional logic to actions BEFORE passing to robot
-        # This ensures self.actions reflects what actually gets applied
+        # Store original PPO actions for debugging
+        original_ppo_actions = self.actions.clone()
+
+        # Apply movement constraints
         actions_to_apply = self._apply_movement_constraints(self.actions.clone())
 
-        # Store the actually applied actions for reward computation
+        # CRITICAL: Update self.actions to the clipped version for reward computation
+        # This ensures PPO learns about the actions that were actually executed
         self.actions = actions_to_apply
-        #print("Applied actions:", actions_to_apply)
 
         # Pass to robot (actions are already constrained)
         self.robot.apply_action(actions_to_apply)
@@ -561,6 +619,10 @@ class ARCIsaacEnv(DirectRLEnv):
         if self.previous_states is None:
             self.previous_state = current_states
 
+        # Print which actions are being used for reward computation
+        if self.common_step_counter % 50 == 0:  # Print every 50 steps
+            print(f"[REWARD] Step {self.common_step_counter} - Computing rewards with actions (Env 0): {self.actions[0].cpu().numpy()}")
+
         rewards = self.reward_function(self.actions, current_states, self.previous_states)
 
         # Update goal_reached status from reward function if available
@@ -611,7 +673,7 @@ class ARCIsaacEnv(DirectRLEnv):
         }
         return states
 
-    def reset(self, seed=3407, env_ids: torch.Tensor = None, options = None):
+    def reset(self, seed=42, env_ids: torch.Tensor = None, options = None):
         self.goal_reached = torch.tensor([False]*self.num_envs, device=self.device)
         self.hit_wall = torch.tensor([False]*self.num_envs, device=self.device)
         self.truncate_now = torch.tensor([False]*self.num_envs, device=self.device)
