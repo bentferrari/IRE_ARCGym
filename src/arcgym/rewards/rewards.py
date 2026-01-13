@@ -248,7 +248,9 @@ class DepthDistanceReward(RewardFunction):
         return torch.stack(rewards)
 
 class FinalReward(RewardFunction):
-    def __init__(self, eps, reward_scale, center_weight=0.4, goal_weight=0.4, obstruction_weight=0.2, **kwargs):
+    def __init__(self, eps, reward_scale, center_weight=0.4, goal_weight=0.4, obstruction_weight=0.2,
+                 alignment_threshold=0.85, alignment_steps=2800,
+                 consecutive_negative_threshold=2400, reset_penalty=-100.0, **kwargs):
         """
         Final reward function combining multiple penalty components.
 
@@ -258,14 +260,25 @@ class FinalReward(RewardFunction):
             center_weight: Weight for lumen center deviation penalty
             goal_weight: Weight for goal distance penalty
             obstruction_weight: Weight for obstruction penalty
+            alignment_threshold: Center alignment threshold for goal reaching (default 0.85)
+            alignment_steps: Number of cumulative steps above threshold for goal reaching (default 1500)
+            consecutive_negative_threshold: Number of consecutive -1 rewards before reset (default 50)
+            reset_penalty: Penalty applied when consecutive negative threshold is reached (default -100.0)
         """
         self.reward_scale = reward_scale
         self.eps = eps
         self.center_weight = center_weight
         self.goal_weight = goal_weight
         self.obstruction_weight = obstruction_weight
+        self.alignment_threshold = alignment_threshold
+        self.alignment_steps = alignment_steps
+        self.consecutive_negative_threshold = consecutive_negative_threshold
+        self.reset_penalty = reset_penalty
         self.goal_reached_per_env = None
         self.center_alignment_per_env = None  # Track center alignment for each environment
+        self.alignment_step_counter = None  # Count cumulative steps with alignment > threshold
+        self.consecutive_negative_counter = None  # Count consecutive -1 rewards per environment
+        self.should_reset_env = None  # Flag to indicate which environments should reset
 
     def reset(self, initial_positions, goals):
         self.initial_positions = initial_positions
@@ -274,6 +287,13 @@ class FinalReward(RewardFunction):
         num_envs = len(initial_positions)
         self.goal_reached_per_env = torch.zeros(num_envs, dtype=torch.bool, device=initial_positions.device)
         self.center_alignment_per_env = torch.zeros(num_envs, dtype=torch.float32, device=initial_positions.device)
+        # Initialize counter for cumulative steps with good alignment
+        # Shape: (num_envs,) - counts how many steps had alignment > threshold
+        self.alignment_step_counter = torch.zeros(num_envs, dtype=torch.int32, device=initial_positions.device)
+        # Initialize counter for consecutive -1 rewards
+        self.consecutive_negative_counter = torch.zeros(num_envs, dtype=torch.int32, device=initial_positions.device)
+        # Initialize reset flag
+        self.should_reset_env = torch.zeros(num_envs, dtype=torch.bool, device=initial_positions.device)
 
     def __call__(self, action, current_states, _previous_states):
         robot_positions = current_states["robot_positions"]
@@ -287,9 +307,13 @@ class FinalReward(RewardFunction):
             num_envs = len(robot_positions)
             self.goal_reached_per_env = torch.zeros(num_envs, dtype=torch.bool, device=robot_positions.device)
             self.center_alignment_per_env = torch.zeros(num_envs, dtype=torch.float32, device=robot_positions.device)
+            self.alignment_step_counter = torch.zeros(num_envs, dtype=torch.int32, device=robot_positions.device)
+            self.consecutive_negative_counter = torch.zeros(num_envs, dtype=torch.int32, device=robot_positions.device)
+            self.should_reset_env = torch.zeros(num_envs, dtype=torch.bool, device=robot_positions.device)
             self.high_quadrants_per_env = []  # Store quadrant for each environment (using threshold_high)
         else:
             self.goal_reached_per_env.fill_(False)
+            self.should_reset_env.fill_(False)
             self.high_quadrants_per_env = []
 
         for i, (robot_position, depth_img, goal, entry_pos) in enumerate(zip(robot_positions, depth_images, goals, entry_poss)):
@@ -316,28 +340,19 @@ class FinalReward(RewardFunction):
             # Find the centroid of the region with different thresholds based on proximity to wall
             # When close to wall (min_depth < 0.05), use lower thresholds to find the opening
             # Otherwise, use higher thresholds to focus on deeper lumen regions
-            depth_threshold_low = 0.6 * max_depth
-            depth_threshold_high = 0.7 * max_depth
-            if min_depth < 0.03:
+            depth_threshold_low = 0.9 * max_depth
+            depth_threshold_high = 1.0 * max_depth
+            #print(f"using thresholds 0.6 and 0.7")
+            if min_depth < 0.05:
                 depth_threshold_low = 0.1 * max_depth
                 depth_threshold_high = 0.2 * max_depth
+                #print(f"using thresholds 0.1 and 0.2")
             # else:
             #     depth_threshold_low = 0.9 * max_depth
             #     depth_threshold_high = 1.0 * max_depth
             # if max_depth < 0.3:
             #     depth_threshold_low = 0.9 * max_depth
             #     depth_threshold_high = 1.0 * max_depth
-            deep_pixels_mask = (depth_img_np >= depth_threshold_low) & (depth_img_np <= depth_threshold_high)
-            deep_pixel_coords = np.argwhere(deep_pixels_mask)  # Returns (row, col) pairs
-
-            # Calculate the centroid of the deep region
-            if len(deep_pixel_coords) > 0:
-                max_depth_row = np.mean(deep_pixel_coords[:, 0])
-                max_depth_col = np.mean(deep_pixel_coords[:, 1])
-            else:
-                # Fallback to absolute deepest point if no pixels found (shouldn't happen)
-                max_depth_idx = np.unravel_index(np.argmax(depth_img_np), depth_img_np.shape)
-                max_depth_row, max_depth_col = max_depth_idx
 
             # Compute centroids for threshold_low and threshold_high regions separately
             # Region 1: pixels >= threshold_low
@@ -368,7 +383,7 @@ class FinalReward(RewardFunction):
             # else:
             #     print(f"Env {i} - threshold_low region: No pixels found")
 
-            # Compute centroid for threshold_high region (THIS IS USED FOR ACTION CLIPPING)
+            # Compute centroid for threshold_high region (THIS IS USED FOR CENTER ALIGNMENT AND ACTION CLIPPING)
             if len(high_region_coords) > 0:
                 high_centroid_row = np.mean(high_region_coords[:, 0])
                 high_centroid_col = np.mean(high_region_coords[:, 1])
@@ -376,7 +391,10 @@ class FinalReward(RewardFunction):
                 #print(f"Env {i} - threshold_high centroid: ({high_centroid_row:.1f}, {high_centroid_col:.1f}), quadrant: {high_quadrant}")
                 self.high_quadrants_per_env.append(high_quadrant)
             else:
-                print(f"Env {i} - threshold_high region: No pixels found")
+                # Fallback to absolute deepest point if no pixels found
+                max_depth_idx = np.unravel_index(np.argmax(depth_img_np), depth_img_np.shape)
+                high_centroid_row, high_centroid_col = max_depth_idx
+                print(f"Env {i} - threshold_high region: No pixels found, using deepest point")
                 self.high_quadrants_per_env.append("center")  # Default when no pixels found
 
             # Calculate ratio of pixels with "good depth" (indicates wide open lumen vs narrow view)
@@ -395,9 +413,10 @@ class FinalReward(RewardFunction):
             # Calculate max possible distance from center (for normalization)
             max_center_distance = np.sqrt(img_center_row**2 + img_center_col**2)
 
-            # Distance from deepest point to image center
-            deepest_point_deviation = np.sqrt((max_depth_row - img_center_row)**2 +
-                                             (max_depth_col - img_center_col)**2)
+            # Distance from high_centroid (threshold_high region centroid) to image center
+            # This aligns the camera with the deepest part of the lumen
+            deepest_point_deviation = np.sqrt((high_centroid_row - img_center_row)**2 +
+                                             (high_centroid_col - img_center_col)**2)
             deepest_point_normalized = deepest_point_deviation / max_center_distance
 
             # print(f"Depth stats - min: {min_depth:.3f}, max: {max_depth:.3f}, mean: {mean_depth:.3f}, "
@@ -477,19 +496,52 @@ class FinalReward(RewardFunction):
             if min_depth < 0.01:
                 total_reward = -1.0
 
-            # Goal reached - maximum reward
-            if d2target < self.eps:
-                total_reward = 100.0
-                self.goal_reached_per_env[i] = True
-                print(f"Goal reached in environment {i}!")
-
             # Normalize the reward to be in range [-1, 1]
             # The weighted combination naturally stays in this range for normal operation
             # Special conditions are already normalized
             total_reward = np.clip(total_reward, -1.0, 1.0)
 
-            # # Debug output
-            # print(f"Env {i} - Center: {reward_components['center_alignment']:.3f}, "
+            # Track consecutive -1 rewards and trigger reset if threshold is reached
+            if abs(total_reward - (-1.0)) < 1e-6:  # Check if reward is -1
+                self.consecutive_negative_counter[i] += 1
+                print(f"Env {i} - Consecutive -1 rewards: {self.consecutive_negative_counter[i].item()}/{self.consecutive_negative_threshold}")
+
+                if self.consecutive_negative_counter[i] >= self.consecutive_negative_threshold:
+                    # Apply reset penalty
+                    total_reward = self.reset_penalty
+                    self.should_reset_env[i] = True
+                    # Reset the counter for this environment
+                    self.consecutive_negative_counter[i] = 0
+                    print(f"Env {i} - Reset triggered! Applied penalty of {self.reset_penalty}")
+            else:
+                # Reset counter if reward is not -1
+                self.consecutive_negative_counter[i] = 0
+
+            # Update alignment step counter: increment if conditions met
+            # Condition 1: center_alignment > 0.85
+            # Condition 2: center_alignment > 0.7 AND lumen_visibility > 0
+            # STRICT RULE: Never increment when total_reward = -1.0 (severe penalty)
+            condition_1 = center_alignment > 0.85
+            condition_2 = center_alignment > 0.7 and lumen_visibility_penalty > -0.15
+            not_severe_penalty = abs(total_reward - (-1.0)) > 1e-6
+
+            if (condition_1 or condition_2) and not_severe_penalty:
+                self.alignment_step_counter[i] += 1
+
+            # Print center alignment counter
+            #print(f"Env {i} - center_alignment: {center_alignment:.3f}, lumen_visibility: {lumen_visibility_penalty:.3f}, total_reward: {total_reward:.3f}, counter: {self.alignment_step_counter[i].item()}/{self.alignment_steps}")
+
+            # Goal reached - new condition: cumulative steps with center_alignment > threshold
+            # Check if the counter has reached the required number of steps
+            alignment_goal_reached = self.alignment_step_counter[i] >= self.alignment_steps
+
+            if alignment_goal_reached:
+                total_reward = 100.0
+                self.goal_reached_per_env[i] = True
+                print(f"Goal reached in environment {i}! Center alignment above {self.alignment_threshold} for {self.alignment_step_counter[i].item()} cumulative steps (required: {self.alignment_steps}).")
+
+            # Print reward components and total reward
+            # print(f"Env {i} - Reward - Center: {reward_components['center_alignment']:.3f}, "
             #       f"Goal: {reward_components['goal_progress']:.3f}, "
             #       f"Lumen_Visibility: {reward_components['lumen_visibility']:.3f}, "
             #       f"Total: {total_reward:.3f}")

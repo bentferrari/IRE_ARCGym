@@ -665,8 +665,8 @@ class SoftEndoscopeChain(BaseRobot):
         if init_rot is not None:
             self.init_rot = torch.tensor(init_rot, device=self.device)
 
-    def _load_joint_positions_from_csv(self, csv_filepath: str, num_envs: int, source_env_id: int = 0) -> torch.Tensor:
-        """Load joint positions from a CSV file saved during teleoperation.
+    def _load_joint_positions_from_csv(self, csv_filepath: str, num_envs: int, source_env_id: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+        """Load joint positions and root state from a CSV file saved during teleoperation.
 
         Args:
             csv_filepath: Path to the CSV file (e.g., "saved_states/robot_state_20251215_143022.csv")
@@ -674,7 +674,9 @@ class SoftEndoscopeChain(BaseRobot):
             source_env_id: Which environment's configuration to use from the CSV (default: 0)
 
         Returns:
-            Joint positions tensor. Shape: (num_envs, num_joints)
+            Tuple of (joint_positions, root_state):
+                - joint_positions: Joint positions tensor. Shape: (num_envs, num_joints)
+                - root_state: Root state tensor (pos, quat, lin_vel, ang_vel). Shape: (num_envs, 13)
         """
         import pandas as pd
         import os
@@ -703,12 +705,39 @@ class SoftEndoscopeChain(BaseRobot):
                 f"Number of joints in CSV ({len(joint_positions)}) doesn't match robot ({self.robot.num_joints})"
             )
 
-        # Convert to tensor and replicate for all environments
+        # Convert joint positions to tensor and replicate for all environments
         joint_pos_single = torch.tensor(joint_positions, dtype=torch.float32, device=self.device)
         joint_pos = joint_pos_single.unsqueeze(0).repeat(num_envs, 1)
 
-        logging.info(f"Loaded joint positions from {csv_filepath} (env {source_env_id})")
-        return joint_pos
+        # Extract root state (position, quaternion, linear velocity, angular velocity)
+        root_state_single = torch.zeros(13, dtype=torch.float32, device=self.device)
+
+        # Position (x, y, z)
+        root_state_single[0] = row['root_pos_x']
+        root_state_single[1] = row['root_pos_y']
+        root_state_single[2] = row['root_pos_z']
+
+        # Quaternion (w, x, y, z)
+        root_state_single[3] = row['root_quat_w']
+        root_state_single[4] = row['root_quat_x']
+        root_state_single[5] = row['root_quat_y']
+        root_state_single[6] = row['root_quat_z']
+
+        # Linear velocity (x, y, z)
+        root_state_single[7] = row['root_lin_vel_x']
+        root_state_single[8] = row['root_lin_vel_y']
+        root_state_single[9] = row['root_lin_vel_z']
+
+        # Angular velocity (x, y, z)
+        root_state_single[10] = row['root_ang_vel_x']
+        root_state_single[11] = row['root_ang_vel_y']
+        root_state_single[12] = row['root_ang_vel_z']
+
+        # Replicate for all environments
+        root_state = root_state_single.unsqueeze(0).repeat(num_envs, 1)
+
+        logging.info(f"Loaded joint positions and root state from {csv_filepath} (env {source_env_id})")
+        return joint_pos, root_state
 
     def generate_random_joint_positions(
         self,
@@ -777,43 +806,49 @@ class SoftEndoscopeChain(BaseRobot):
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
 
-        # Get default root state
-        root_state = self.robot.data.default_root_state[env_ids].clone()
+        # Check if loading from CSV file (includes both joint and root state)
+        load_from_csv = isinstance(joint_positions, str) and joint_positions.endswith('.csv')
 
-        # Set position
-        if self.env_init_pos is not None and self.env_init_pos.shape[0] == len(env_ids):
-            root_state[:, :3] = self.env_init_pos
+        if load_from_csv:
+            # Load both joint positions and root state from CSV
+            joint_pos, csv_root_state = self._load_joint_positions_from_csv(joint_positions, len(env_ids))
+            # Use root state from CSV
+            root_state = csv_root_state
         else:
-            origins = self.scene.env_origins[env_ids]
-            root_state[:, :3] = origins + self.init_pos
+            # Get default root state
+            root_state = self.robot.data.default_root_state[env_ids].clone()
 
-        # Set orientation and zero velocities
-        root_state[:, 3:7] = self.init_rot.repeat(len(env_ids), 1)
-        root_state[:, 7:] = 0.0
+            # Set position
+            if self.env_init_pos is not None and self.env_init_pos.shape[0] == len(env_ids):
+                root_state[:, :3] = self.env_init_pos
+            else:
+                origins = self.scene.env_origins[env_ids]
+                root_state[:, :3] = origins + self.init_pos
+
+            # Set orientation and zero velocities
+            root_state[:, 3:7] = self.init_rot.repeat(len(env_ids), 1)
+            root_state[:, 7:] = 0.0
+
+            # Set joint positions (zero, random, or specified values) with zero velocities
+            if joint_positions is None:
+                joint_pos = torch.zeros((len(env_ids), self.robot.num_joints), device=self.device)
+            elif isinstance(joint_positions, str):
+                if joint_positions.lower() == 'random':
+                    # Generate random smooth configurations
+                    joint_pos = self.generate_random_joint_positions(num_configs=len(env_ids))
+                else:
+                    raise ValueError(f"Invalid string value for joint_positions: {joint_positions}")
+            else:
+                # Validate shape
+                if joint_positions.shape != (len(env_ids), self.robot.num_joints):
+                    raise ValueError(
+                        f"joint_positions shape {joint_positions.shape} doesn't match expected shape "
+                        f"({len(env_ids)}, {self.robot.num_joints})"
+                    )
+                joint_pos = joint_positions.to(self.device)
 
         # Write state to simulation
         self.robot.write_root_state_to_sim(root_state, env_ids)
-
-        # Set joint positions (zero, random, from CSV, or specified values) with zero velocities
-        if joint_positions is None:
-            joint_pos = torch.zeros((len(env_ids), self.robot.num_joints), device=self.device)
-        elif isinstance(joint_positions, str):
-            if joint_positions.lower() == 'random':
-                # Generate random smooth configurations
-                joint_pos = self.generate_random_joint_positions(num_configs=len(env_ids))
-            elif joint_positions.endswith('.csv'):
-                # Load from CSV file
-                joint_pos = self._load_joint_positions_from_csv(joint_positions, len(env_ids))
-            else:
-                raise ValueError(f"Invalid string value for joint_positions: {joint_positions}")
-        else:
-            # Validate shape
-            if joint_positions.shape != (len(env_ids), self.robot.num_joints):
-                raise ValueError(
-                    f"joint_positions shape {joint_positions.shape} doesn't match expected shape "
-                    f"({len(env_ids)}, {self.robot.num_joints})"
-                )
-            joint_pos = joint_positions.to(self.device)
 
         joint_vel = torch.zeros((len(env_ids), self.robot.num_joints), device=self.device)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)

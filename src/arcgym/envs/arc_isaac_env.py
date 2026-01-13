@@ -147,7 +147,20 @@ class ARCIsaacEnv(DirectRLEnv):
         reward_type = self.reward_config["reward_type"]
 
         self.show_markers = self.debug_config["show_markers"]
-            
+
+        # Override CSV initialization if teleoperate mode is enabled
+        if self.env_config.get("teleoperate_mode", False):
+            # Set start position CSV
+            teleop_start_csv = self.env_config.get("teleoperate_init_csv", "/home/guanglin/arcgym/saved_states/env1_c1t2_start.csv")
+            self.env_config["init_from_csv"] = teleop_start_csv
+            logging.info(f"Teleoperate mode enabled - using start CSV: {teleop_start_csv}")
+
+            # Optionally set end position CSV if provided
+            teleop_end_csv = self.env_config.get("teleoperate_endpose_csv", None)
+            if teleop_end_csv is not None:
+                self.env_config["init_endpose_from_csv"] = teleop_end_csv
+                logging.info(f"Teleoperate mode - using end CSV: {teleop_end_csv}")
+
         super().__init__(cfg, self.render_mode, **kwargs)
 
         self.action_scale = self.cfg.action_scale
@@ -200,6 +213,16 @@ class ARCIsaacEnv(DirectRLEnv):
         self.stuck_threshold = 15  # Number of steps with poor alignment to consider stuck
         self.backward_duration = 10  # Number of steps to move backward when stuck
         self.alignment_threshold = 0.7  # Center alignment below this is considered poor
+
+        # Lumen visibility tracking for backward motion
+        self.lumen_visibility_negative_counter = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        self.lumen_negative_threshold = 20  # Number of consecutive poor lumen visibility steps
+        self.lumen_visibility_threshold = -0.4  # Lumen visibility threshold for counter increment
+        # Calculate number of steps for 0.5 time units
+        # step_dt = decimation * physics_dt, so steps = 0.5 / step_dt
+        step_dt = self.cfg.decimation * self.cfg.sim.dt
+        self.lumen_backward_steps = int(0.5 / step_dt)  # Steps to go backward for 0.5 time units
+        self.lumen_backward_remaining = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
 
         # Bright region avoidance tracking
         self.bright_region_directions = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
@@ -382,6 +405,81 @@ class ARCIsaacEnv(DirectRLEnv):
         # This ensures PPO trains on the actions it actually outputs
         self.actions = scaled_actions
 
+        # Update lumen visibility counter and trigger backward motion if needed
+        self._update_lumen_visibility_tracking()
+
+    def _update_lumen_visibility_tracking(self) -> None:
+        """
+        Track consecutive steps where lumen_visibility < -0.4.
+        When the counter reaches the threshold (20 steps), trigger backward motion for 0.5 time units.
+        """
+        # Compute lumen visibility for all environments
+        if hasattr(self.robot, 'get_depth'):
+            try:
+                _, lumen_visibilities, _ = self._compute_movement_metrics()
+
+                # Update counters for each environment
+                for env_id in range(self.num_envs):
+                    lumen_vis = lumen_visibilities[env_id].item()
+
+                    # Check if lumen visibility is below threshold (-0.4)
+                    if lumen_vis < self.lumen_visibility_threshold:
+                        self.lumen_visibility_negative_counter[env_id] += 1
+
+                        # Trigger backward motion if threshold is reached
+                        if self.lumen_visibility_negative_counter[env_id] >= self.lumen_negative_threshold:
+                            if self.lumen_backward_remaining[env_id] == 0:  # Only trigger if not already going backward
+                                self.lumen_backward_remaining[env_id] = self.lumen_backward_steps
+                                print(f"Env {env_id} - Lumen visibility < {self.lumen_visibility_threshold} for {self.lumen_negative_threshold} steps. "
+                                      f"Triggering backward motion for {self.lumen_backward_steps} steps (0.5 time units).")
+                            # Reset counter after triggering
+                            self.lumen_visibility_negative_counter[env_id] = 0
+                    else:
+                        # Reset counter if lumen visibility is above threshold
+                        self.lumen_visibility_negative_counter[env_id] = 0
+
+            except Exception as e:
+                logging.warning(f"Failed to compute lumen visibility for tracking: {e}")
+
+    def _apply_backward_motion(self, actions: torch.Tensor) -> torch.Tensor:
+        """
+        Override actions with backward motion for environments that need to go backward.
+        Backward motion: negative forward velocity (action[2] < 0), zero lateral/vertical movement and rotation.
+
+        Args:
+            actions: Action tensor of shape (num_envs, 6)
+
+        Returns:
+            Modified actions with backward motion applied where needed
+        """
+        # Clone to avoid modifying input
+        modified_actions = actions.clone()
+
+        # Apply backward motion for environments with remaining backward steps
+        backward_mask = self.lumen_backward_remaining > 0
+
+        if backward_mask.any():
+            # Set backward motion: move backward (negative forward velocity)
+            # Action indices: [0] left/right, [1] up/down, [2] forward/back, [3-5] orientation
+            modified_actions[backward_mask, 0] = 0.0  # No left/right movement
+            modified_actions[backward_mask, 1] = 0.0  # No up/down movement
+            modified_actions[backward_mask, 2] = -0.1  # Move backward (negative forward velocity)
+            modified_actions[backward_mask, 3] = 0.0  # No pitch rotation
+            modified_actions[backward_mask, 4] = 0.0  # No yaw rotation
+            modified_actions[backward_mask, 5] = 0.0  # No roll rotation
+
+            # Decrement remaining backward steps
+            self.lumen_backward_remaining[backward_mask] -= 1
+
+            # Log when backward motion completes
+            completed_mask = (self.lumen_backward_remaining == 0) & backward_mask
+            if completed_mask.any():
+                completed_env_ids = torch.where(completed_mask)[0]
+                for env_id in completed_env_ids:
+                    print(f"Env {env_id} - Backward motion completed.")
+
+        return modified_actions
+
     def _apply_movement_constraints(self, actions: torch.Tensor) -> torch.Tensor:
         """
         Apply movement constraints based on quadrant of lumen centroid.
@@ -436,7 +534,7 @@ class ARCIsaacEnv(DirectRLEnv):
 
                 # Override quadrant with deepest point position if lumen visibility is poor
                 quadrant_source = "threshold_high"
-                if lumen_visibilities[env_id] < -0.10:
+                if lumen_visibilities[env_id] < -0.30:
                     # Poor visibility: compute quadrant from deepest point
                     try:
                         depth_images = self.robot.get_depth()
@@ -501,11 +599,7 @@ class ARCIsaacEnv(DirectRLEnv):
                 # Print quadrant and actions for each environment
                 clipped_action = constrained_actions[env_id]
                 lumen_vis = lumen_visibilities[env_id].item()
-                # print(f"Env {env_id} - Quadrant: {quadrant:12s} ({quadrant_source}) | LumenVis: {lumen_vis:6.3f} | "
-                #     #   f"Original: [L/R:{original_action[0]:6.3f}, U/D:{original_action[1]:6.3f}, F/B:{original_action[2]:6.3f}, "
-                #     #   f"Pitch:{original_action[3]:6.3f}, Yaw:{original_action[4]:6.3f}, Roll:{original_action[5]:6.3f}] | "
-                #       f"Clipped: [L/R:{clipped_action[0]:6.3f}, U/D:{clipped_action[1]:6.3f}, F/B:{clipped_action[2]:6.3f}, "
-                #       f"Pitch:{clipped_action[3]:6.3f}, Yaw:{clipped_action[4]:6.3f}, Roll:{clipped_action[5]:6.3f}]")
+                print(f"Env {env_id} - Quadrant: {quadrant:12s} ({quadrant_source}) | LumenVis: {lumen_vis:6.3f}")
 
         return constrained_actions
 
@@ -529,6 +623,9 @@ class ARCIsaacEnv(DirectRLEnv):
 
         # Apply movement constraints
         actions_to_apply = self._apply_movement_constraints(self.actions.clone())
+
+        # Override actions with backward motion if in backward motion mode
+        actions_to_apply = self._apply_backward_motion(actions_to_apply)
 
         # CRITICAL: Update self.actions to the clipped version for reward computation
         # This ensures PPO learns about the actions that were actually executed
@@ -608,9 +705,25 @@ class ARCIsaacEnv(DirectRLEnv):
                 if not hasattr(self, 'center_alignment'):
                     self.center_alignment = torch.ones(self.num_envs, dtype=torch.float32, device=self.device)
 
-        time_out = self.episode_length_buf >= self.max_episode_length - 1
-        truncated = time_out | self.truncate_now | self.colon_invalid
-        terminated = self.goal_reached | self.hit_wall
+        # Check if teleoperate mode is enabled - if so, disable ALL automatic resets
+        is_teleop_mode = self.env_config.get("teleoperate_mode", False)
+
+        if is_teleop_mode:
+            # In teleoperate mode, disable all automatic resets
+            # User maintains full control - no termination or truncation
+            terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            truncated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        else:
+            # Normal mode: apply all reset conditions
+            # Check if any environment should reset due to consecutive negative rewards
+            should_reset = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            if hasattr(self.reward_function, 'should_reset_env') and self.reward_function.should_reset_env is not None:
+                should_reset = self.reward_function.should_reset_env.clone()
+
+            time_out = self.episode_length_buf >= self.max_episode_length - 1
+            truncated = time_out | self.truncate_now | self.colon_invalid | should_reset
+            terminated = self.goal_reached | self.hit_wall
+
         return terminated, truncated
 
     def _get_rewards(self) -> torch.Tensor:
@@ -636,6 +749,10 @@ class ARCIsaacEnv(DirectRLEnv):
         # Also save center alignment for logging
         if hasattr(self, 'center_alignment'):
             self.extras["center_alignment"] = self.center_alignment.clone()
+
+        # Save reset trigger status for logging
+        if hasattr(self.reward_function, 'should_reset_env') and self.reward_function.should_reset_env is not None:
+            self.extras["reset_triggered"] = self.reward_function.should_reset_env.clone()
 
         self.previous_states = current_states
         self.latest_rewards = rewards
@@ -686,6 +803,10 @@ class ARCIsaacEnv(DirectRLEnv):
         self.poor_alignment_counter = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
         self.backward_steps_remaining = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
 
+        # Reset lumen visibility tracking
+        self.lumen_visibility_negative_counter = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        self.lumen_backward_remaining = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+
         # Reset bright region tracking
         self.bright_region_directions = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
         self.has_bright_regions = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -715,20 +836,21 @@ class ARCIsaacEnv(DirectRLEnv):
             goals=self.targets,
         )
 
-        # Set robot positions based on colon entry points
-        self.robot.set_pos(self.entry_positions)
-
-        # CRITICAL: Write data to sim and forward kinematics
-        self.scene.write_data_to_sim()
-        self.sim.forward()
-
-        # Generate initial joint configurations
-
+        # Generate initial joint configurations first to determine if we're loading from CSV
         if csv_init_file is not None:
             # Load from CSV file
             initial_joint_positions = csv_init_file
             logging.info(f"Initializing from CSV: {csv_init_file}")
+            # When loading from CSV, DON'T call set_pos() - let the robot's reset() method
+            # use the position from the CSV file instead of colon entry positions
         else:
+            # Set robot positions based on colon entry points (only when NOT loading from CSV)
+            self.robot.set_pos(self.entry_positions)
+
+            # CRITICAL: Write data to sim and forward kinematics
+            self.scene.write_data_to_sim()
+            self.sim.forward()
+
             # Check if random initialization is enabled in config
             use_random_init = self.config.get("env_config", {}).get("random_initial_configuration", True)
 
@@ -793,19 +915,18 @@ class ARCIsaacEnv(DirectRLEnv):
             goals=self.targets,
         )
 
-        # Set robot position based on colon entry point
-        self.robot.set_pos(self.entry_positions)
-
-        # Write and forward to update sim buffers
-        self.scene.write_data_to_sim()
-        self.sim.forward()
-
-        # Reset robot (which now starts at the correct position)
-
+        # Check if CSV initialization is used first
         if csv_init_file is not None:
-            # Use CSV file for reset
+            # Use CSV file for reset - DON'T call set_pos() as position comes from CSV
             self.robot.reset(env_ids, joint_positions=csv_init_file)
         else:
+            # Set robot position based on colon entry point (only when NOT loading from CSV)
+            self.robot.set_pos(self.entry_positions)
+
+            # Write and forward to update sim buffers
+            self.scene.write_data_to_sim()
+            self.sim.forward()
+
             # Use default behavior (random or straight)
             use_random_init = self.config.get("env_config", {}).get("random_initial_configuration", True)
             if use_random_init:
@@ -824,6 +945,10 @@ class ARCIsaacEnv(DirectRLEnv):
         # Reset stuck detection for these environments
         self.poor_alignment_counter[env_ids] = 0
         self.backward_steps_remaining[env_ids] = 0
+
+        # Reset lumen visibility tracking for these environments
+        self.lumen_visibility_negative_counter[env_ids] = 0
+        self.lumen_backward_remaining[env_ids] = 0
 
         # Reset bright region tracking for these environments
         self.bright_region_directions[env_ids] = 0.0

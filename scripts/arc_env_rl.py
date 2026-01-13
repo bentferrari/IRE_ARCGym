@@ -144,12 +144,12 @@ env_config = {
     "env_spacing" : env_spacing,
     "num_envs" : args_cli.num_envs,
     "replicate_physics" : False,
-    "action_scale" : 0.2,
+    "action_scale" : 0.1,
     "debug_vis" : False,
-    "episode_length_s" : 20.0 if args_cli.train else 20000.0,
+    "episode_length_s" : 30.0 if args_cli.train else 2000000.0,
     "constraint_point_A": 1,  # Distance from robot tip to constraint point A along the robot's local z-axis
-    "init_from_csv": "./saved_states/env1_c1t1_start.csv" if args_cli.train else None,
-    "init_endpose_from_csv": "./saved_states/env1_c1t1_end.csv" if args_cli.train else None,
+    "init_from_csv": "./saved_states/env1_c1t2_start.csv", #if args_cli.train else None,
+    "init_endpose_from_csv": "./saved_states/env1_c1t2_end.csv" if args_cli.train else None,
     "random_initial_configuration": False,  # Use straight configuration (especially for teleoperation mode)
     "disable_movement_constraints": not args_cli.train,  # Disable constraints in teleoperation mode for free movement
     "use_txt_files_for_attachments": True  # Use txt files to load precise vertex indices for colon attachments
@@ -158,13 +158,13 @@ env_config = {
 reward_config = {
     "reward_type" : "final_reward", #"test_reward_action",#"depth_goal",#"default",#,"final_reward"
     "reward_scale" : 1.0,
-    "eps" : 0.15,
+    "eps" : 0.1,
     "running_penalty" : -0.1,
     "goal_reward" : 50.0,
     # Make center alignment dominant in the reward function
     "center_weight": 0.5,      # Increased from 0.4 to 0.7 (dominant)
-    "goal_weight": 0.1,        # Decreased from 0.4 to 0.2
-    "obstruction_weight": 0.4, # Decreased from 0.2 to 0.1
+    "goal_weight": 0.0,        # Decreased from 0.4 to 0.2
+    "obstruction_weight": 0.5, # Decreased from 0.2 to 0.1
 }
 
 simulation_config = {
@@ -335,7 +335,7 @@ env = gym.make("ArcIsaacEnv-v0", cfg=env_cfg, robot_factory=robot_factory,
                config=config, tracer=tracer, disable_env_checker=True) # We need disable_env_checker=True because it fails due to the wrapper removing the 'policy' key
                #, render_mode = "rgb_array"
 
-env = FrameStack(env, n_stack=4)
+env = FrameStack(env, n_stack=10)
 
 video_kwargs = {
     "video_folder": video_save_path,
