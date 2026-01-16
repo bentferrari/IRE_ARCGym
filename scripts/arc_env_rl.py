@@ -14,12 +14,16 @@ parser = argparse.ArgumentParser(description="Create an application to launch AR
 parser.add_argument("--train", action="store_true", help="Run in training mode")
 parser.add_argument("--benchmark", action="store_true", help="benchmark a couple of steps using viztracer")
 parser.add_argument("--num_envs", type=int, default=2, help="Number of parallel environments")
+parser.add_argument("--clip_actions", action=argparse.BooleanOptionalAction, default=None,
+                    help="Enable action constraints (clipping/projection/masks)")
 
 # Append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 
 # Parse the arguments
 args_cli = parser.parse_args()
+if args_cli.clip_actions is None:
+    args_cli.clip_actions = args_cli.train
 
 # Enable cameras (needed for camera sensors)
 args_cli.enable_cameras = True
@@ -35,7 +39,7 @@ from stable_baselines3 import PPO, DQN, SAC
 from stable_baselines3.common.callbacks import CheckpointCallback, LogEveryNTimesteps
 from stable_baselines3.common.vec_env import VecNormalize
 
-from arcgym.utils.callbacks import PerEnvRewardCallback, TrajectoryDataSaver
+from arcgym.utils.callbacks import PerEnvRewardCallback, TrajectoryDataSaver, SuccessRateDataSaver
 
 from isaaclab.envs import (
     DirectRLEnvCfg,
@@ -144,14 +148,15 @@ env_config = {
     "env_spacing" : env_spacing,
     "num_envs" : args_cli.num_envs,
     "replicate_physics" : False,
-    "action_scale" : 0.1,
+    "action_scale" : 0.2,
     "debug_vis" : False,
-    "episode_length_s" : 30.0 if args_cli.train else 2000000.0,
+    "episode_length_s" : 40.0 if args_cli.train else 20000000.0,
     "constraint_point_A": 1,  # Distance from robot tip to constraint point A along the robot's local z-axis
-    "init_from_csv": "./saved_states/env1_c1t2_start.csv", #if args_cli.train else None,
-    "init_endpose_from_csv": "./saved_states/env1_c1t2_end.csv" if args_cli.train else None,
+    "init_from_csv": "./saved_states/c1t3_start.csv", #if args_cli.train else None,
+    "init_endpose_from_csv": "./saved_states/c1t2_start.csv" if args_cli.train else None,
     "random_initial_configuration": False,  # Use straight configuration (especially for teleoperation mode)
-    "disable_movement_constraints": not args_cli.train,  # Disable constraints in teleoperation mode for free movement
+    "clip_actions": args_cli.clip_actions,
+    "disable_movement_constraints": not args_cli.clip_actions,  # Back-compat: tie movement constraints to clip_actions
     "use_txt_files_for_attachments": True  # Use txt files to load precise vertex indices for colon attachments
 }
 
@@ -165,6 +170,11 @@ reward_config = {
     "center_weight": 0.5,      # Increased from 0.4 to 0.7 (dominant)
     "goal_weight": 0.0,        # Decreased from 0.4 to 0.2
     "obstruction_weight": 0.5, # Decreased from 0.2 to 0.1
+    # Parameters for calculating max_episode_length (used for success criterion)
+    "episode_length_s": 30.0 if args_cli.train else 2000000.0,
+    "decimation": 2,
+    "dt": 1.0 / 240.0,
+    "success_alignment_ratio": 0.9,  # 90% of steps must have center_alignment > 0.85
 }
 
 simulation_config = {
@@ -335,7 +345,7 @@ env = gym.make("ArcIsaacEnv-v0", cfg=env_cfg, robot_factory=robot_factory,
                config=config, tracer=tracer, disable_env_checker=True) # We need disable_env_checker=True because it fails due to the wrapper removing the 'policy' key
                #, render_mode = "rgb_array"
 
-env = FrameStack(env, n_stack=10)
+env = FrameStack(env, n_stack=5)
 
 video_kwargs = {
     "video_folder": video_save_path,
@@ -476,7 +486,14 @@ if args_cli.train:
         verbose=1
     )
 
-    model.learn(learning_config["total_timesteps"], callback=[checkpoint_callback, log_callback, per_env_reward_callback, trajectory_callback])
+    # Create success rate data saver callback (saves to trajectory_data folder)
+    success_rate_callback = SuccessRateDataSaver(
+        save_dir=trajectory_save_path,
+        save_interval_episodes=10,  # Save every 10 episodes
+        verbose=1
+    )
+
+    model.learn(learning_config["total_timesteps"], callback=[checkpoint_callback, log_callback, per_env_reward_callback, trajectory_callback, success_rate_callback])
     
     final_model_path = os.path.join(model_save_path, f"ppo_arc_final_{timestamp}")
     model.save(final_model_path)

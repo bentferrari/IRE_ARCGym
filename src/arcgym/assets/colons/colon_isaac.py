@@ -399,8 +399,12 @@ class ColonModel:
     def get_entry_pos(self, env_ids: torch.Tensor = None, csv_filepath: str = None) -> torch.Tensor:
         """Get entry positions based on lowest mesh vertices or from CSV file.
 
+        IMPORTANT: When loading from CSV, we load the position from env_0's row and
+        translate it for other environments using env_origins. This ensures all robots
+        start with the same relative position to their colon.
+
         Args:
-            env_ids: Environment IDs (not used currently but kept for compatibility)
+            env_ids: Environment IDs to get positions for
             csv_filepath: Optional path to CSV file containing root positions
 
         Returns:
@@ -412,7 +416,14 @@ class ColonModel:
         else:
             device = self.colon_body.data.nodal_state_w.device
 
-        # If CSV file is provided, load entry positions from it
+        # Determine env_ids
+        if env_ids is not None:
+            env_ids_tensor = env_ids if isinstance(env_ids, torch.Tensor) else torch.tensor(env_ids, device=device, dtype=torch.long)
+        else:
+            env_ids_tensor = torch.arange(self.colon_body.num_instances, device=device)
+        env_count = int(env_ids_tensor.numel())
+
+        # If CSV file is provided, load entry position from env_0 and translate for others
         if csv_filepath is not None and csv_filepath.endswith('.csv'):
             import pandas as pd
             import os
@@ -422,16 +433,37 @@ class ColonModel:
 
             df = pd.read_csv(csv_filepath)
 
-            # Extract root positions for all environments in the CSV
-            entry_positions = []
-            for _, row in df.iterrows():
-                pos = [row['root_pos_x'], row['root_pos_y'], row['root_pos_z']]
-                entry_positions.append(pos)
+            # ALWAYS load from env_0 row - this is the reference position
+            if 0 not in df['env_id'].values:
+                raise ValueError(f"env_id 0 not found in CSV file: {csv_filepath}")
 
-            entry_pos_tensor = torch.tensor(entry_positions, dtype=torch.float32, device=device)
-            logging.info(f"Loaded entry positions from CSV: {csv_filepath}")
-            logging.info(f"Entry positions shape: {entry_pos_tensor.shape}")
-            return entry_pos_tensor
+            env0_row = df[df['env_id'] == 0].iloc[0]
+            env0_pos = torch.tensor([
+                env0_row['root_pos_x'],
+                env0_row['root_pos_y'],
+                env0_row['root_pos_z']
+            ], dtype=torch.float32, device=device)
+
+            # Get environment origins for translation (relative to env_0)
+            env_origins = self.env_translation
+
+            # Create entry positions for all requested environments
+            entry_positions = torch.zeros((env_count, 3), dtype=torch.float32, device=device)
+
+            for idx, env_id in enumerate(env_ids_tensor.tolist()):
+                # Get translation for this environment (relative to env_0)
+                if env_id < len(env_origins):
+                    translation = env_origins[env_id]
+                else:
+                    translation = torch.zeros(3, device=device)
+
+                # Position: env_0's position + translation
+                entry_positions[idx] = env0_pos + translation
+
+            logging.info(f"Loaded entry position from env_0 in CSV: {csv_filepath}")
+            logging.info(f"env_0 position: {env0_pos}")
+            logging.info(f"Translated entry positions: {entry_positions}")
+            return entry_positions
 
         # Default behavior - use hardcoded positions
         #bottom_center = torch.tensor([0.2882, 0.2539, 0.3108]).to(device)
@@ -462,17 +494,21 @@ class ColonModel:
         else:
             entry_pos = torch.tensor([0.643, 1.119, -2.017]).to(device)
             delta_trans = torch.tensor([[0.0, 0.0, 0.0],
-                                        # [0.0, 5, 0.0],
-                                        # [-5, 0.0, 0.0],
-                                        # [-5, 5, 0.0],
-                                        # [-10, 0.0, 0.0]
+                                        [0.0, 5, 0.0],
+                                        [-5, 0.0, 0.0],
+                                        [-5, 5, 0.0],
+                                        [-10, 0.0, 0.0]
                                         ]).to(device)
 
         #print("entry_pos + delta_trans:", entry_pos + delta_trans)
         #print("self.colon_body.data.root_pos_w:", self.colon_body.data.root_pos_w)
 
         #return bottom_center + self.colon_body.data.root_pos_w#self.env_translation
-        return entry_pos + delta_trans
+        entry_positions = entry_pos + delta_trans
+        if env_ids is not None:
+            env_ids_tensor = env_ids if isinstance(env_ids, torch.Tensor) else torch.tensor(env_ids, device=device, dtype=torch.long)
+            entry_positions = entry_positions[env_ids_tensor]
+        return entry_positions
         #return entry_pos
     
     def get_targets(self, env_ids: torch.Tensor = None, csv_filepath: str = None) -> torch.Tensor:
@@ -518,7 +554,11 @@ class ColonModel:
             ]).to(device)
 
         targets = []
-        for translation in self.env_translation:
+        translations = self.env_translation
+        if env_ids is not None:
+            env_ids_tensor = env_ids if isinstance(env_ids, torch.Tensor) else torch.tensor(env_ids, device=device, dtype=torch.long)
+            translations = translations[env_ids_tensor]
+        for translation in translations:
             targets.append(base_target + translation)
         print("targets", targets)
         return torch.stack(targets)
@@ -630,8 +670,8 @@ class ColonModel:
             self.colon_body.write_nodal_state_to_sim(self.colon_body._data.nodal_state_w[env_ids], env_ids)
 
         # Reapply nodal attachments (pass env_ids to only reset specified environments)
-        self._attach_colon_nodals(env_ids, use_txt_files=self.use_txt_files_for_attachments)
-
+        #self._attach_colon_nodals(env_ids, use_txt_files=self.use_txt_files_for_attachments)
+        self._attach_colon_nodals(env_ids, use_txt_files=False)
         # Print the lowest position after reset (for environment 0)
         if 0 in env_ids or env_ids.numel() == self.colon_body.num_instances:
             self.print_all_lowest_positions()

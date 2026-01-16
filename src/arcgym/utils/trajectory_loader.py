@@ -19,7 +19,7 @@ def load_trajectory(trajectory_dir: str) -> Dict:
         Dictionary containing:
             - 'root_states': numpy array of shape (num_steps, 13)
             - 'metadata': dictionary with episode information
-            - 'images': list of PIL Images (if available)
+            - 'images': list of image file paths (if available) - use Image.open() to load
 
     Example:
         >>> data = load_trajectory("trajectory_data/env_0/episode_000010")
@@ -41,12 +41,14 @@ def load_trajectory(trajectory_dir: str) -> Dict:
     metadata = json.loads(metadata_str)
 
     # Load images if available
+    # Note: Images are loaded lazily to avoid "too many open files" error
+    # Store file paths instead of loaded images
     images = []
     images_dir = trajectory_dir / "images"
     if images_dir.exists():
         image_files = sorted(images_dir.glob("frame_*.png"))
-        for img_file in image_files:
-            images.append(Image.open(img_file))
+        # Store just the paths, we'll load them when needed
+        images = [str(f) for f in image_files]
 
     return {
         'root_states': root_states,
@@ -118,7 +120,7 @@ def find_episodes(save_dir: str, env_idx: Optional[int] = None,
 
 
 def plot_trajectory_3d(root_states: np.ndarray, title: str = "3D Trajectory",
-                       figsize: Tuple[int, int] = (12, 8)) -> plt.Figure:
+                       figsize: Tuple[int, int] = (14.52, 9.68)) -> plt.Figure:
     """
     Plot 3D trajectory of the capsule from root_states.
 
@@ -160,25 +162,140 @@ def plot_trajectory_3d(root_states: np.ndarray, title: str = "3D Trajectory",
     return fig
 
 
-def plot_trajectory_analysis(trajectory_dir: str, save_plot: bool = False) -> plt.Figure:
+def plot_trajectory_3d_standalone(trajectory_dir: str, save_plot: bool = False,
+                                   max_steps: int = 4000,
+                                   figsize: Tuple[int, int] = (10, 8)) -> plt.Figure:
+    """
+    Plot standalone 3D trajectory of the capsule.
+
+    Args:
+        trajectory_dir: Path to the episode directory
+        save_plot: If True, save the plot as a PNG file
+        max_steps: Maximum number of steps to plot (default: 4000)
+        figsize: Figure size
+
+    Returns:
+        Matplotlib figure object
+    """
+    data = load_trajectory(trajectory_dir)
+    root_states = data['root_states']
+    metadata = data['metadata']
+
+    # Limit trajectory to max_steps
+    total_steps = root_states.shape[0]
+    if total_steps > max_steps:
+        root_states = root_states[:max_steps]
+        print(f"  Note: Trajectory truncated from {total_steps} to {max_steps} steps for plotting")
+
+    positions = root_states[:, :3]
+
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111, projection='3d')
+
+    ax.plot(positions[:, 0], positions[:, 1], positions[:, 2], 'b-', linewidth=2)
+    ax.scatter(positions[0, 0], positions[0, 1], positions[0, 2],
+               c='green', s=100, marker='o', label='Start')
+    ax.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2],
+               c='red', s=100, marker='X', label='End')
+
+    ax.set_xlabel('X (m)')
+    ax.set_ylabel('Y (m)')
+    ax.set_zlabel('Z (m)')
+    ax.legend()
+    ax.grid(True)
+
+    success_str = "SUCCESS" if metadata.get('goal_reached', False) else "INCOMPLETE"
+    reward = metadata.get('episode_reward', 'N/A')
+    fig.suptitle(
+        f"3D Trajectory - Episode {metadata['episode_num']} (Env {metadata['env_idx']}) - {success_str}\n"
+        f"Reward: {reward:.2f}, Steps: {total_steps}",
+        fontsize=12, fontweight='bold'
+    )
+
+    if save_plot:
+        plot_path = Path(trajectory_dir) / "trajectory_3d.png"
+        fig.savefig(plot_path, dpi=150, bbox_inches='tight')
+        print(f"Plot saved to: {plot_path}")
+
+    return fig
+
+
+def plot_position_over_time(trajectory_dir: str, save_plot: bool = False,
+                            max_steps: int = 4000,
+                            figsize: Tuple[int, int] = (10, 6)) -> plt.Figure:
+    """
+    Plot position (x, y, z) over time.
+
+    Args:
+        trajectory_dir: Path to the episode directory
+        save_plot: If True, save the plot as a PNG file
+        max_steps: Maximum number of steps to plot (default: 4000)
+        figsize: Figure size
+
+    Returns:
+        Matplotlib figure object
+    """
+    data = load_trajectory(trajectory_dir)
+    root_states = data['root_states']
+    metadata = data['metadata']
+
+    # Limit trajectory to max_steps
+    total_steps = root_states.shape[0]
+    if total_steps > max_steps:
+        root_states = root_states[:max_steps]
+        print(f"  Note: Trajectory truncated from {total_steps} to {max_steps} steps for plotting")
+
+    num_steps = root_states.shape[0]
+    time_steps = np.arange(num_steps)
+    positions = root_states[:, :3]
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    ax.plot(time_steps, positions[:, 0], label='X', linewidth=2)
+    ax.plot(time_steps, positions[:, 1], label='Y', linewidth=2)
+    ax.plot(time_steps, positions[:, 2], label='Z', linewidth=2)
+
+    ax.set_xlabel('Time Step')
+    ax.set_ylabel('Position (m)')
+    ax.legend()
+    ax.grid(True)
+
+    success_str = "SUCCESS" if metadata.get('goal_reached', False) else "INCOMPLETE"
+    reward = metadata.get('episode_reward', 'N/A')
+    fig.suptitle(
+        f"Position over Time - Episode {metadata['episode_num']} (Env {metadata['env_idx']}) - {success_str}\n"
+        f"Reward: {reward:.2f}, Steps: {total_steps}",
+        fontsize=12, fontweight='bold'
+    )
+
+    if save_plot:
+        plot_path = Path(trajectory_dir) / "position_over_time.png"
+        fig.savefig(plot_path, dpi=150, bbox_inches='tight')
+        print(f"Plot saved to: {plot_path}")
+
+    return fig
+
+
+def plot_trajectory_analysis(trajectory_dir: str, save_plot: bool = False, num_frames: int = 6, max_steps: int = 4000) -> plt.Figure:
     """
     Create a comprehensive analysis plot for a trajectory.
 
     Includes:
     - 3D trajectory plot
     - Position over time (x, y, z)
-    - Velocity over time (linear and angular)
-    - Sample images from the trajectory
+    - Sample endoscope images from the trajectory
 
     Args:
         trajectory_dir: Path to the episode directory
         save_plot: If True, save the plot as a PNG file in the trajectory directory
+        num_frames: Number of endoscope frames to display (default: 6)
+        max_steps: Maximum number of steps to plot (default: 4000)
 
     Returns:
         Matplotlib figure object
 
     Example:
-        >>> fig = plot_trajectory_analysis("trajectory_data/env_0/episode_000010", save_plot=True)
+        >>> fig = plot_trajectory_analysis("trajectory_data/env_0/episode_000010", save_plot=True, num_frames=9)
         >>> plt.show()
     """
     data = load_trajectory(trajectory_dir)
@@ -186,31 +303,57 @@ def plot_trajectory_analysis(trajectory_dir: str, save_plot: bool = False) -> pl
     metadata = data['metadata']
     images = data['images']
 
+    # Limit trajectory to max_steps
+    total_steps = root_states.shape[0]
+    if total_steps > max_steps:
+        root_states = root_states[:max_steps]
+        # Also adjust images to match the truncated trajectory
+        if images:
+            images = images[:max_steps]
+        print(f"  Note: Trajectory truncated from {total_steps} to {max_steps} steps for plotting")
+
     num_steps = root_states.shape[0]
     time_steps = np.arange(num_steps)
 
-    # Extract components
+    # Extract positions
     positions = root_states[:, :3]
-    quaternions = root_states[:, 3:7]
-    lin_velocities = root_states[:, 7:10]
-    ang_velocities = root_states[:, 10:13]
 
-    # Compute magnitudes
-    lin_vel_mag = np.linalg.norm(lin_velocities, axis=1)
-    ang_vel_mag = np.linalg.norm(ang_velocities, axis=1)
+    # Calculate grid layout for frames
+    frames_per_row = 6
+    num_frame_rows = 1
 
     # Create figure with subplots
-    fig = plt.figure(figsize=(16, 12))
-    gs = fig.add_gridspec(4, 3, hspace=0.3, wspace=0.3)
+    # Layout: 1 row for trajectory plots + 1 row for frames
+    total_rows = 2
+    total_cols = 6
+    fig = plt.figure(figsize=(12.96, 9.5))
+    height_ratios = [2.6, 0.6]
+    gs = fig.add_gridspec(
+        total_rows,
+        total_cols,
+        hspace=0.25,
+        wspace=0.8,
+        left=0.04,
+        right=0.99,
+        top=0.90,
+        bottom=0.06,
+        height_ratios=height_ratios
+    )
 
     # Title
     success_str = "SUCCESS" if metadata.get('goal_reached', False) else "INCOMPLETE"
     reward = metadata.get('episode_reward', 'N/A')
-    fig.suptitle(f"Episode {metadata['episode_num']} (Env {metadata['env_idx']}) - {success_str}\n"
-                 f"Reward: {reward:.2f}, Steps: {num_steps}", fontsize=14, fontweight='bold')
+    truncated_str = f" (showing first {num_steps})" if total_steps > max_steps else ""
+    fig.suptitle(
+        f"Episode {metadata['episode_num']} (Env {metadata['env_idx']}) - {success_str}\n"
+        f"Reward: {reward:.2f}, Steps: {total_steps}{truncated_str}",
+        fontsize=14,
+        fontweight='bold',
+        y=0.97
+    )
 
     # 3D Trajectory
-    ax1 = fig.add_subplot(gs[0:2, 0], projection='3d')
+    ax1 = fig.add_subplot(gs[0, 0:2], projection='3d')
     ax1.plot(positions[:, 0], positions[:, 1], positions[:, 2], 'b-', linewidth=2)
     ax1.scatter(positions[0, 0], positions[0, 1], positions[0, 2],
                 c='green', s=100, marker='o', label='Start')
@@ -219,53 +362,48 @@ def plot_trajectory_analysis(trajectory_dir: str, save_plot: bool = False) -> pl
     ax1.set_xlabel('X (m)')
     ax1.set_ylabel('Y (m)')
     ax1.set_zlabel('Z (m)')
-    ax1.set_title('3D Trajectory')
+    ax1.set_title('')
     ax1.legend()
     ax1.grid(True)
 
     # Position over time
-    ax2 = fig.add_subplot(gs[0, 1:])
+    ax2 = fig.add_subplot(gs[0, 2:5])
     ax2.plot(time_steps, positions[:, 0], label='X', linewidth=2)
     ax2.plot(time_steps, positions[:, 1], label='Y', linewidth=2)
     ax2.plot(time_steps, positions[:, 2], label='Z', linewidth=2)
     ax2.set_xlabel('Time Step')
     ax2.set_ylabel('Position (m)')
-    ax2.set_title('Position over Time')
+    ax2.set_title('')
     ax2.legend()
     ax2.grid(True)
 
-    # Linear velocity
-    ax3 = fig.add_subplot(gs[1, 1:])
-    ax3.plot(time_steps, lin_velocities[:, 0], label='Vx', alpha=0.7)
-    ax3.plot(time_steps, lin_velocities[:, 1], label='Vy', alpha=0.7)
-    ax3.plot(time_steps, lin_velocities[:, 2], label='Vz', alpha=0.7)
-    ax3.plot(time_steps, lin_vel_mag, label='|V|', linewidth=2, color='black')
-    ax3.set_xlabel('Time Step')
-    ax3.set_ylabel('Linear Velocity (m/s)')
-    ax3.set_title('Linear Velocity over Time')
-    ax3.legend()
-    ax3.grid(True)
+    # Align the top edges so titles land on the same horizontal line.
+    pos1 = ax1.get_position()
+    pos2 = ax2.get_position()
+    top = max(pos1.y1, pos2.y1)
+    ax1.set_position([pos1.x0, pos1.y0, pos1.width, top - pos1.y0])
+    ax2.set_position([pos2.x0, pos2.y0, pos2.width, top - pos2.y0])
+    pos1 = ax1.get_position()
+    pos2 = ax2.get_position()
+    title_y = min(0.94, max(pos1.y1, pos2.y1) + 0.01)
+    fig.text(pos1.x0 + pos1.width / 2, title_y, '3D Trajectory', ha='center', va='bottom')
+    fig.text(pos2.x0 + pos2.width / 2, title_y, 'Position over Time', ha='center', va='bottom')
 
-    # Angular velocity
-    ax4 = fig.add_subplot(gs[2, :])
-    ax4.plot(time_steps, ang_velocities[:, 0], label='ωx', alpha=0.7)
-    ax4.plot(time_steps, ang_velocities[:, 1], label='ωy', alpha=0.7)
-    ax4.plot(time_steps, ang_velocities[:, 2], label='ωz', alpha=0.7)
-    ax4.plot(time_steps, ang_vel_mag, label='|ω|', linewidth=2, color='black')
-    ax4.set_xlabel('Time Step')
-    ax4.set_ylabel('Angular Velocity (rad/s)')
-    ax4.set_title('Angular Velocity over Time')
-    ax4.legend()
-    ax4.grid(True)
-
-    # Sample images
+    # Sample endoscope frames
     if images:
-        num_sample_images = min(3, len(images))
+        num_sample_images = min(num_frames, len(images))
         sample_indices = np.linspace(0, len(images) - 1, num_sample_images, dtype=int)
 
         for i, idx in enumerate(sample_indices):
-            ax = fig.add_subplot(gs[3, i])
-            ax.imshow(images[idx])
+            row = 1
+            col = i % frames_per_row
+            ax = fig.add_subplot(gs[row, col])
+            # Load image on-demand and close it after use
+            img_path = images[idx]
+            with Image.open(img_path) as img:
+                # Convert to numpy array so we can close the file
+                img_array = np.array(img)
+            ax.imshow(img_array)
             ax.set_title(f'Frame {idx}/{len(images)-1}')
             ax.axis('off')
 

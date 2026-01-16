@@ -157,4 +157,3 @@ def pre_process_actions(
     delta_pose = teleop_data
     delta_pose = torch.tensor(delta_pose, dtype=torch.float, device=device)
     return delta_pose
-

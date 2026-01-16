@@ -17,12 +17,14 @@ class PerEnvRewardCallback(BaseCallback):
     allowing you to track performance of each parallel environment separately.
     """
 
-    def __init__(self, verbose=0):
+    def __init__(self, verbose=0, save_plot_data=True, plot_data_file="episode_rewards.npz"):
         """
         Initialize the callback.
 
         Args:
             verbose: Verbosity level (0: not verbose, 1: info, 2: debug)
+            save_plot_data: Whether to save episode rewards for plotting (default: True)
+            plot_data_file: Filename to save episode reward data (default: "episode_rewards.npz")
         """
         super().__init__(verbose)
         self.episode_rewards = {}
@@ -34,6 +36,12 @@ class PerEnvRewardCallback(BaseCallback):
         # Track overall statistics across all environments
         self.total_episodes = 0
         self.total_successes = 0
+
+        # For plotting: store all rewards in order
+        self.save_plot_data = save_plot_data
+        self.plot_data_file = plot_data_file
+        self.all_episode_rewards = []  # List of (episode_num, env_idx, reward)
+        self.global_episode_counter = 0
 
     def _on_step(self) -> bool:
         """
@@ -84,6 +92,16 @@ class PerEnvRewardCallback(BaseCallback):
                     self.episode_rewards[env_idx].append(episode_reward)
                     self.episode_lengths[env_idx].append(episode_length)
                     self.episode_counts[env_idx] += 1
+
+                    # Store for plotting
+                    if self.save_plot_data:
+                        self.all_episode_rewards.append({
+                            'global_episode': self.global_episode_counter,
+                            'env_idx': env_idx,
+                            'reward': episode_reward,
+                            'length': episode_length
+                        })
+                        self.global_episode_counter += 1
 
                     # Check if episode was successful (goal_reached)
                     is_success = False
@@ -265,6 +283,244 @@ class PerEnvRewardCallback(BaseCallback):
                 print(f"  Env {env_idx}: {self.episode_counts[env_idx]} episodes, "
                       f"Mean Reward={mean_reward:.2f}, Mean Length={mean_length:.2f}{success_str}{stress_str}")
 
+            print("="*80)
+
+        # Save episode rewards for plotting
+        if self.save_plot_data and self.all_episode_rewards:
+            import numpy as np
+            # Convert to arrays for easy plotting
+            data = {
+                'episodes': np.array([d['global_episode'] for d in self.all_episode_rewards]),
+                'env_indices': np.array([d['env_idx'] for d in self.all_episode_rewards]),
+                'rewards': np.array([d['reward'] for d in self.all_episode_rewards]),
+                'lengths': np.array([d['length'] for d in self.all_episode_rewards]),
+            }
+            np.savez(self.plot_data_file, **data)
+            if self.verbose > 0:
+                print(f"\nSaved episode reward data to {self.plot_data_file} for plotting")
+
+
+class SuccessRateDataSaver(BaseCallback):
+    """
+    Callback for saving success rate data for all environments to a JSON file.
+
+    This callback tracks and periodically saves:
+    - Per-environment success rates (rolling window and cumulative)
+    - Overall success rate across all environments
+    - Episode counts and success counts per environment
+    - Timestamped history of success rates
+
+    Data is saved to: trajectory_data/success_rate_data.json
+    """
+
+    def __init__(self, save_dir="trajectory_data", save_interval_episodes=10, verbose=0):
+        """
+        Initialize the success rate data saver callback.
+
+        Args:
+            save_dir: Directory to save success rate data (default: "trajectory_data")
+            save_interval_episodes: Save data every N episodes across all envs (default: 10)
+            verbose: Verbosity level (0: not verbose, 1: info, 2: debug)
+        """
+        super().__init__(verbose)
+        self.save_dir = Path(save_dir)
+        self.save_interval_episodes = save_interval_episodes
+
+        # Track success/failure for each environment
+        # Format: {env_idx: [1, 0, 1, ...]} where 1=success, 0=failure
+        self.episode_successes = {}
+        self.episode_rewards = {}
+        self.episode_lengths = {}
+
+        # Track overall statistics
+        self.total_episodes = 0
+        self.total_successes = 0
+
+        # History of success rates over time (for plotting)
+        # Each entry: {'timestep': int, 'episode': int, 'env_success_rates': {env_idx: rate}, 'overall_rate': float}
+        self.success_rate_history = []
+
+        # Create save directory
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.verbose > 0:
+            print(f"SuccessRateDataSaver initialized: saving to '{save_dir}' every {save_interval_episodes} episodes")
+
+    def _on_step(self) -> bool:
+        """
+        Called at each step. Track episode completions and save data periodically.
+
+        Returns:
+            bool: Always returns True to continue training
+        """
+        # Check if any episodes finished
+        if 'dones' in self.locals and 'infos' in self.locals:
+            dones = self.locals['dones']
+            infos = self.locals['infos']
+
+            for env_idx, (done, info) in enumerate(zip(dones, infos)):
+                if done and 'episode' in info:
+                    # Initialize tracking for this environment if needed
+                    if env_idx not in self.episode_successes:
+                        self.episode_successes[env_idx] = []
+                        self.episode_rewards[env_idx] = []
+                        self.episode_lengths[env_idx] = []
+
+                    # Check if episode was successful (goal_reached)
+                    is_success = False
+                    if 'goal_reached' in info:
+                        is_success = bool(info['goal_reached'])
+
+                    # Record episode data
+                    self.episode_successes[env_idx].append(1 if is_success else 0)
+                    self.episode_rewards[env_idx].append(float(info['episode']['r']))
+                    self.episode_lengths[env_idx].append(int(info['episode']['l']))
+
+                    # Update overall statistics
+                    self.total_episodes += 1
+                    if is_success:
+                        self.total_successes += 1
+
+                    # Save data at specified interval
+                    if self.total_episodes % self.save_interval_episodes == 0:
+                        self._save_success_rate_data()
+
+                        if self.verbose > 0:
+                            overall_rate = self.total_successes / self.total_episodes if self.total_episodes > 0 else 0
+                            print(f"✓ Saved success rate data at episode {self.total_episodes} "
+                                  f"(Overall: {overall_rate:.1%})")
+
+        return True
+
+    def _compute_success_rates(self):
+        """
+        Compute success rates for all environments.
+
+        Returns:
+            dict: Dictionary containing various success rate metrics
+        """
+        env_success_rates = {}
+        env_success_rates_10ep = {}
+        env_success_rates_100ep = {}
+
+        for env_idx in sorted(self.episode_successes.keys()):
+            successes = self.episode_successes[env_idx]
+
+            # Cumulative success rate
+            env_success_rates[env_idx] = np.mean(successes) if successes else 0.0
+
+            # Rolling window success rates
+            if len(successes) >= 10:
+                env_success_rates_10ep[env_idx] = np.mean(successes[-10:])
+            else:
+                env_success_rates_10ep[env_idx] = np.mean(successes) if successes else 0.0
+
+            if len(successes) >= 100:
+                env_success_rates_100ep[env_idx] = np.mean(successes[-100:])
+            else:
+                env_success_rates_100ep[env_idx] = np.mean(successes) if successes else 0.0
+
+        # Overall success rate
+        overall_rate = self.total_successes / self.total_episodes if self.total_episodes > 0 else 0.0
+
+        return {
+            'env_success_rates_cumulative': env_success_rates,
+            'env_success_rates_10ep': env_success_rates_10ep,
+            'env_success_rates_100ep': env_success_rates_100ep,
+            'overall_success_rate': overall_rate,
+        }
+
+    def _save_success_rate_data(self):
+        """
+        Save success rate data to JSON file.
+        """
+        try:
+            # Compute current success rates
+            rates = self._compute_success_rates()
+
+            # Record in history
+            history_entry = {
+                'timestep': self.num_timesteps,
+                'total_episodes': self.total_episodes,
+                'total_successes': self.total_successes,
+                'overall_success_rate': rates['overall_success_rate'],
+                'env_success_rates_cumulative': {str(k): v for k, v in rates['env_success_rates_cumulative'].items()},
+                'env_success_rates_10ep': {str(k): v for k, v in rates['env_success_rates_10ep'].items()},
+                'env_success_rates_100ep': {str(k): v for k, v in rates['env_success_rates_100ep'].items()},
+            }
+            self.success_rate_history.append(history_entry)
+
+            # Prepare full data structure
+            data = {
+                'summary': {
+                    'total_episodes': self.total_episodes,
+                    'total_successes': self.total_successes,
+                    'overall_success_rate': rates['overall_success_rate'],
+                    'num_environments': len(self.episode_successes),
+                },
+                'per_environment': {},
+                'history': self.success_rate_history,
+            }
+
+            # Add per-environment detailed data
+            for env_idx in sorted(self.episode_successes.keys()):
+                env_data = {
+                    'total_episodes': len(self.episode_successes[env_idx]),
+                    'total_successes': sum(self.episode_successes[env_idx]),
+                    'success_rate_cumulative': rates['env_success_rates_cumulative'].get(env_idx, 0.0),
+                    'success_rate_10ep': rates['env_success_rates_10ep'].get(env_idx, 0.0),
+                    'success_rate_100ep': rates['env_success_rates_100ep'].get(env_idx, 0.0),
+                    'mean_reward': np.mean(self.episode_rewards[env_idx]) if self.episode_rewards[env_idx] else 0.0,
+                    'mean_length': np.mean(self.episode_lengths[env_idx]) if self.episode_lengths[env_idx] else 0.0,
+                    'episode_successes': self.episode_successes[env_idx],
+                    'episode_rewards': self.episode_rewards[env_idx],
+                    'episode_lengths': self.episode_lengths[env_idx],
+                }
+                data['per_environment'][str(env_idx)] = env_data
+
+            # Save to JSON file
+            save_path = self.save_dir / "success_rate_data.json"
+            with open(save_path, 'w') as f:
+                json.dump(data, f, indent=2)
+
+            if self.verbose > 1:
+                print(f"  Saved to {save_path}")
+
+        except Exception as e:
+            print(f"Error saving success rate data: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _on_training_start(self) -> None:
+        """Called at the beginning of training."""
+        if self.verbose > 0:
+            print(f"SuccessRateDataSaver: Starting success rate tracking")
+            print(f"  Save directory: {self.save_dir.absolute()}")
+            print(f"  Save interval: every {self.save_interval_episodes} episodes")
+
+    def _on_training_end(self) -> None:
+        """Called at the end of training. Save final data."""
+        # Save final data
+        self._save_success_rate_data()
+
+        if self.verbose > 0:
+            print("\n" + "="*80)
+            print("SUCCESS RATE DATA SAVER - FINAL SUMMARY")
+            print("="*80)
+
+            overall_rate = self.total_successes / self.total_episodes if self.total_episodes > 0 else 0
+            print(f"\nOverall Success Rate: {overall_rate:.2%} ({self.total_successes}/{self.total_episodes})")
+
+            print("\nPer-Environment Success Rates:")
+            for env_idx in sorted(self.episode_successes.keys()):
+                successes = self.episode_successes[env_idx]
+                total = len(successes)
+                success_count = sum(successes)
+                rate = np.mean(successes) if successes else 0
+                print(f"  Env {env_idx}: {rate:.2%} ({success_count}/{total} episodes)")
+
+            save_path = self.save_dir / "success_rate_data.json"
+            print(f"\nData saved to: {save_path.absolute()}")
             print("="*80)
 
 

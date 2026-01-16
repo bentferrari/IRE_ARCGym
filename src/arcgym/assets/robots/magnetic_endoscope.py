@@ -4,6 +4,7 @@ import torch
 import pdb
 import numpy as np
 import gymnasium as gym
+from typing import Optional
 from gymnasium.spaces import Box, Dict, Discrete
 from pxr import Usd, UsdGeom, UsdPhysics, Gf, Sdf, UsdShade, PhysxSchema
 import isaaclab.sim as sim_utils
@@ -722,6 +723,74 @@ class RobotEndoscopeChain(BaseRobot):
         root_quat_list = []
         joint_pos_list = []
 
+        # If this is an entry CSV (start/strat), use env_0 as the reference
+        # and translate the root pose for the rest of the environments.
+        basename = os.path.basename(csv_filepath).lower()
+        use_env0_reference = basename.endswith("start.csv") or basename.endswith("strat.csv")
+
+        # Compute translations relative to env_0 if needed
+        if use_env0_reference:
+            env_ids_tensor = torch.tensor(env_ids_list, device=self.device, dtype=torch.long)
+            translations = None
+            if getattr(self, "colon", None) is not None and hasattr(self.colon, "env_translation"):
+                translations = self.colon.env_translation
+            elif hasattr(self.scene, "env_origins") and self.scene.env_origins is not None:
+                translations = self.scene.env_origins - self.scene.env_origins[0]
+
+            if translations is None:
+                translations = torch.zeros((len(env_ids_list), 3), device=self.device)
+            else:
+                translations = translations.to(self.device)
+                if translations.shape[0] <= env_ids_tensor.max().item():
+                    translations = torch.zeros((len(env_ids_list), 3), device=self.device)
+                else:
+                    translations = translations[env_ids_tensor]
+                if not torch.isfinite(translations).all():
+                    logging.warning("Non-finite env translations detected; falling back to zeros.")
+                    translations = torch.zeros((len(env_ids_list), 3), device=self.device)
+
+            # Load env_0 as the base configuration
+            if 0 not in df['env_id'].values:
+                raise ValueError(f"env_id 0 not found in CSV file: {csv_filepath}")
+
+            env0_row = df[df['env_id'] == 0].iloc[0]
+            base_root_pos = torch.tensor(
+                [env0_row['root_pos_x'], env0_row['root_pos_y'], env0_row['root_pos_z']],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            base_root_quat = torch.tensor(
+                [env0_row['root_quat_w'], env0_row['root_quat_x'], env0_row['root_quat_y'], env0_row['root_quat_z']],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            base_joint_positions = [env0_row[col] for col in joint_cols]
+
+            # Handle mismatch between CSV joints and robot joints
+            if len(base_joint_positions) != self.robot.num_joints:
+                if len(base_joint_positions) > self.robot.num_joints:
+                    base_joint_positions = base_joint_positions[:self.robot.num_joints]
+                else:
+                    base_joint_positions.extend([0.0] * (self.robot.num_joints - len(base_joint_positions)))
+
+            for idx in range(len(env_ids_list)):
+                root_pos_list.append((base_root_pos + translations[idx]).tolist())
+                root_quat_list.append(base_root_quat.tolist())
+                joint_pos_list.append(list(base_joint_positions))
+
+            root_pos_batch = torch.tensor(root_pos_list, dtype=torch.float32, device=self.device)
+            root_quat_batch = torch.tensor(root_quat_list, dtype=torch.float32, device=self.device)
+            joint_pos_batch = torch.tensor(joint_pos_list, dtype=torch.float32, device=self.device)
+
+            root_pos_batch = torch.nan_to_num(root_pos_batch, nan=0.0, posinf=0.0, neginf=0.0)
+            root_quat_batch = torch.nan_to_num(root_quat_batch, nan=0.0, posinf=0.0, neginf=0.0)
+            joint_pos_batch = torch.nan_to_num(joint_pos_batch, nan=0.0, posinf=0.0, neginf=0.0)
+
+            logging.info(
+                f"Loaded env_0 state from {csv_filepath} and translated to {len(env_ids_list)} environments"
+            )
+            return root_pos_batch, root_quat_batch, joint_pos_batch
+
         for env_id in env_ids_list:
             # Get the row for this environment
             if env_id not in df['env_id'].values:
@@ -756,6 +825,10 @@ class RobotEndoscopeChain(BaseRobot):
         root_pos_batch = torch.tensor(root_pos_list, dtype=torch.float32, device=self.device)
         root_quat_batch = torch.tensor(root_quat_list, dtype=torch.float32, device=self.device)
         joint_pos_batch = torch.tensor(joint_pos_list, dtype=torch.float32, device=self.device)
+
+        root_pos_batch = torch.nan_to_num(root_pos_batch, nan=0.0, posinf=0.0, neginf=0.0)
+        root_quat_batch = torch.nan_to_num(root_quat_batch, nan=0.0, posinf=0.0, neginf=0.0)
+        joint_pos_batch = torch.nan_to_num(joint_pos_batch, nan=0.0, posinf=0.0, neginf=0.0)
 
         logging.info(f"Loaded robot state from {csv_filepath} for {len(env_ids_list)} environments")
         return root_pos_batch, root_quat_batch, joint_pos_batch
@@ -881,16 +954,21 @@ class RobotEndoscopeChain(BaseRobot):
         # Write joint state to simulation first
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
 
-        # Compute and set individual link states based on joint configuration using forward kinematics
-        # This directly sets each link's pose in the simulation to match the joint configuration
-        self._reset_link_states_directly(env_ids, joint_pos)
+        # Compute and set individual link states based on joint configuration using forward kinematics.
+        # Pass the intended root_state to avoid using stale cached data.
+        self._reset_link_states_directly(env_ids, joint_pos, root_state=root_state)
 
         # Mark as initialized after first reset
         if not self._is_initialized:
             self._is_initialized = True
             logging.info("Robot initialization completed after first reset")
 
-    def _reset_link_states_directly(self, env_ids: torch.Tensor, joint_positions: torch.Tensor) -> None:
+    def _reset_link_states_directly(
+        self,
+        env_ids: torch.Tensor,
+        joint_positions: torch.Tensor,
+        root_state: Optional[torch.Tensor] = None,
+    ) -> None:
         """Directly set each link's state in simulation based on joint configuration.
 
         This method computes each link's position and orientation using forward kinematics,
@@ -906,8 +984,10 @@ class RobotEndoscopeChain(BaseRobot):
         link_radius = self.config["robot_config"].get("link_radius", 0.01)
         link_height = self.config["robot_config"].get("link_height", 0.05)
 
-        # Get the root state for calculating relative link positions
-        root_state = self.robot.data.root_state_w[env_ids]
+        # Get the root state for calculating relative link positions.
+        # Use the provided root_state when available to avoid stale buffer reads.
+        if root_state is None:
+            root_state = self.robot.data.root_state_w[env_ids]
         root_pos = root_state[:, :3]  # (len(env_ids), 3)
         root_quat = root_state[:, 3:7]  # (len(env_ids), 4) - (w, x, y, z)
 

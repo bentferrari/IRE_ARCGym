@@ -112,9 +112,34 @@ class GoalReward(RewardFunction):
         self.eps = eps
         self.reward_scale = reward_scale
 
-    def reset(self, initial_positions, goals):
-        self.initial_positions = initial_positions
-        self.goals = goals
+    def reset(self, initial_positions, goals, env_ids=None):
+        # Check if this is the first initialization
+        is_first_init = not hasattr(self, 'initial_positions') or self.initial_positions is None
+
+        # Check if env_ids contains indices larger than current tensor size
+        needs_full_init = is_first_init
+        if not is_first_init and env_ids is not None and len(env_ids) > 0:
+            max_env_id = int(env_ids.max().item()) if isinstance(env_ids, torch.Tensor) else max(env_ids)
+            if max_env_id >= len(self.initial_positions):
+                needs_full_init = True
+
+        if env_ids is None or needs_full_init:
+            if env_ids is not None and len(env_ids) > 0:
+                max_env_id = int(env_ids.max().item()) if isinstance(env_ids, torch.Tensor) else max(env_ids)
+                num_envs = max_env_id + 1
+                device = initial_positions.device
+                self.initial_positions = torch.zeros((num_envs, initial_positions.shape[-1]), dtype=initial_positions.dtype, device=device)
+                self.goals = torch.zeros((num_envs,) + goals.shape[1:], dtype=goals.dtype, device=device)
+                self.initial_positions[env_ids] = initial_positions
+                self.goals[env_ids] = goals
+            else:
+                self.initial_positions = initial_positions
+                self.goals = goals
+        else:
+            # Partial reset for specific environments
+            if len(env_ids) > 0:
+                self.initial_positions[env_ids] = initial_positions
+                self.goals[env_ids] = goals
 
     def __call__(self, action, current_states, _previous_states):
         robot_positions = current_states["robot_positions"]
@@ -135,11 +160,39 @@ class PointToPointLineDistanceReward(RewardFunction):
         self.initial_distances = None
         self.eps = eps
         self.reward_scale = reward_scale
-    
-    def reset(self, initial_positions, goals):
-        self.initial_positions = initial_positions.unsqueeze(1)
-        self.goals = goals
-        self.initial_distances = torch.norm(self.initial_positions - self.goals, dim=2)
+
+    def reset(self, initial_positions, goals, env_ids=None):
+        # Check if this is the first initialization
+        is_first_init = not hasattr(self, 'initial_positions') or self.initial_positions is None
+
+        # Check if env_ids contains indices larger than current tensor size
+        needs_full_init = is_first_init
+        if not is_first_init and env_ids is not None and len(env_ids) > 0:
+            max_env_id = int(env_ids.max().item()) if isinstance(env_ids, torch.Tensor) else max(env_ids)
+            if max_env_id >= len(self.initial_positions):
+                needs_full_init = True
+
+        if env_ids is None or needs_full_init:
+            if env_ids is not None and len(env_ids) > 0:
+                max_env_id = int(env_ids.max().item()) if isinstance(env_ids, torch.Tensor) else max(env_ids)
+                num_envs = max_env_id + 1
+                device = initial_positions.device
+                self.initial_positions = torch.zeros((num_envs, 1, initial_positions.shape[-1]), dtype=initial_positions.dtype, device=device)
+                self.goals = torch.zeros((num_envs,) + goals.shape[1:], dtype=goals.dtype, device=device)
+                self.initial_distances = torch.zeros((num_envs, goals.shape[1]), dtype=initial_positions.dtype, device=device)
+                self.initial_positions[env_ids] = initial_positions.unsqueeze(1)
+                self.goals[env_ids] = goals
+                self.initial_distances[env_ids] = torch.norm(self.initial_positions[env_ids] - self.goals[env_ids], dim=2)
+            else:
+                self.initial_positions = initial_positions.unsqueeze(1)
+                self.goals = goals
+                self.initial_distances = torch.norm(self.initial_positions - self.goals, dim=2)
+        else:
+            # Partial reset for specific environments
+            if len(env_ids) > 0:
+                self.initial_positions[env_ids] = initial_positions.unsqueeze(1)
+                self.goals[env_ids] = goals
+                self.initial_distances[env_ids] = torch.norm(self.initial_positions[env_ids] - self.goals[env_ids], dim=1)
 
     def __call__(self, action, current_states, _previous_states):
         robot_positions = current_states["robot_positions"]
@@ -158,12 +211,41 @@ class DepthDistanceReward(RewardFunction):
         self.reward_scale = reward_scale
         self.goal_reached_per_env = None  # Will store per-environment goal status
 
-    def reset(self, initial_positions, goals):
-        self.initial_positions = initial_positions
-        self.goals = goals
-        # Reset goal_reached status for all environments
-        num_envs = len(initial_positions)
-        self.goal_reached_per_env = torch.zeros(num_envs, dtype=torch.bool, device=initial_positions.device)
+    def reset(self, initial_positions, goals, env_ids=None):
+        # Check if this is the first initialization
+        is_first_init = not hasattr(self, 'initial_positions') or self.initial_positions is None
+
+        # Check if env_ids contains indices larger than current tensor size
+        needs_full_init = is_first_init
+        if not is_first_init and env_ids is not None and len(env_ids) > 0:
+            max_env_id = int(env_ids.max().item()) if isinstance(env_ids, torch.Tensor) else max(env_ids)
+            if max_env_id >= len(self.goal_reached_per_env):
+                needs_full_init = True
+
+        if env_ids is None or needs_full_init:
+            if env_ids is not None and len(env_ids) > 0:
+                max_env_id = int(env_ids.max().item()) if isinstance(env_ids, torch.Tensor) else max(env_ids)
+                num_envs = max_env_id + 1
+            else:
+                num_envs = len(initial_positions)
+
+            device = initial_positions.device
+            self.initial_positions = torch.zeros((num_envs, initial_positions.shape[-1]), dtype=initial_positions.dtype, device=device)
+            self.goals = torch.zeros((num_envs,) + goals.shape[1:], dtype=goals.dtype, device=device)
+            self.goal_reached_per_env = torch.zeros(num_envs, dtype=torch.bool, device=device)
+
+            if env_ids is not None and len(env_ids) > 0:
+                self.initial_positions[env_ids] = initial_positions
+                self.goals[env_ids] = goals
+            else:
+                self.initial_positions = initial_positions
+                self.goals = goals
+        else:
+            # Partial reset for specific environments
+            if len(env_ids) > 0:
+                self.initial_positions[env_ids] = initial_positions
+                self.goals[env_ids] = goals
+                self.goal_reached_per_env[env_ids] = False
 
     def __call__(self, action, current_states, _previous_states):
         # obs = current_states["obs"] why cannot access obs?
@@ -249,8 +331,9 @@ class DepthDistanceReward(RewardFunction):
 
 class FinalReward(RewardFunction):
     def __init__(self, eps, reward_scale, center_weight=0.4, goal_weight=0.4, obstruction_weight=0.2,
-                 alignment_threshold=0.85, alignment_steps=2800,
-                 consecutive_negative_threshold=2400, reset_penalty=-100.0, **kwargs):
+                 alignment_threshold=0.90, consecutive_negative_threshold=200, reset_penalty=-100.0,
+                 episode_length_s=30.0, decimation=2, dt=1.0/240.0,
+                 success_alignment_ratio=0.90, **kwargs):
         """
         Final reward function combining multiple penalty components.
 
@@ -260,10 +343,13 @@ class FinalReward(RewardFunction):
             center_weight: Weight for lumen center deviation penalty
             goal_weight: Weight for goal distance penalty
             obstruction_weight: Weight for obstruction penalty
-            alignment_threshold: Center alignment threshold for goal reaching (default 0.85)
-            alignment_steps: Number of cumulative steps above threshold for goal reaching (default 1500)
+            alignment_threshold: Center alignment threshold for goal reaching (default 0.95)
             consecutive_negative_threshold: Number of consecutive -1 rewards before reset (default 50)
             reset_penalty: Penalty applied when consecutive negative threshold is reached (default -100.0)
+            episode_length_s: Episode length in seconds (default 40.0, used in training mode)
+            decimation: Number of physics steps per environment step (default 2)
+            dt: Physics time step in seconds (default 1/240)
+            success_alignment_ratio: Required ratio of steps with high alignment for success (default 0.90)
         """
         self.reward_scale = reward_scale
         self.eps = eps
@@ -271,29 +357,80 @@ class FinalReward(RewardFunction):
         self.goal_weight = goal_weight
         self.obstruction_weight = obstruction_weight
         self.alignment_threshold = alignment_threshold
-        self.alignment_steps = alignment_steps
         self.consecutive_negative_threshold = consecutive_negative_threshold
         self.reset_penalty = reset_penalty
+        self.success_alignment_ratio = success_alignment_ratio
+        # Calculate max_episode_length from episode_length_s, decimation, and dt
+        # Formula: max_episode_length = episode_length_s / (decimation * dt)
+        self.max_episode_length = int(episode_length_s / (decimation * dt))
         self.goal_reached_per_env = None
         self.center_alignment_per_env = None  # Track center alignment for each environment
         self.alignment_step_counter = None  # Count cumulative steps with alignment > threshold
         self.consecutive_negative_counter = None  # Count consecutive -1 rewards per environment
         self.should_reset_env = None  # Flag to indicate which environments should reset
+        # Track high-alignment steps for percentage-based success
+        self.high_alignment_step_counter = None  # Steps with center_alignment > 0.95
 
-    def reset(self, initial_positions, goals):
-        self.initial_positions = initial_positions
-        self.goals = goals
-        # Reset goal_reached status for all environments
-        num_envs = len(initial_positions)
-        self.goal_reached_per_env = torch.zeros(num_envs, dtype=torch.bool, device=initial_positions.device)
-        self.center_alignment_per_env = torch.zeros(num_envs, dtype=torch.float32, device=initial_positions.device)
-        # Initialize counter for cumulative steps with good alignment
-        # Shape: (num_envs,) - counts how many steps had alignment > threshold
-        self.alignment_step_counter = torch.zeros(num_envs, dtype=torch.int32, device=initial_positions.device)
-        # Initialize counter for consecutive -1 rewards
-        self.consecutive_negative_counter = torch.zeros(num_envs, dtype=torch.int32, device=initial_positions.device)
-        # Initialize reset flag
-        self.should_reset_env = torch.zeros(num_envs, dtype=torch.bool, device=initial_positions.device)
+    def reset(self, initial_positions, goals, env_ids=None):
+        """
+        Reset reward function state.
+
+        Args:
+            initial_positions: Entry positions for environments
+            goals: Target positions for environments
+            env_ids: Optional tensor of environment indices to reset. If None, resets all environments
+                     and reinitializes all tensors. If provided, only resets specified environments.
+        """
+        # Check if this is the first initialization (no tensors exist yet)
+        is_first_init = not hasattr(self, 'initial_positions') or self.initial_positions is None
+
+        # Check if env_ids contains indices larger than current tensor size
+        # This means we need to do a full initialization with the correct size
+        needs_full_init = is_first_init
+        if not is_first_init and env_ids is not None and len(env_ids) > 0:
+            max_env_id = int(env_ids.max().item()) if isinstance(env_ids, torch.Tensor) else max(env_ids)
+            if max_env_id >= len(self.goal_reached_per_env):
+                needs_full_init = True
+
+        if env_ids is None or needs_full_init:
+            # Full reset - determine the correct number of environments
+            if env_ids is not None and len(env_ids) > 0:
+                max_env_id = int(env_ids.max().item()) if isinstance(env_ids, torch.Tensor) else max(env_ids)
+                num_envs = max_env_id + 1
+            else:
+                num_envs = len(initial_positions)
+
+            # Initialize all tensors with correct size
+            device = initial_positions.device
+            self.initial_positions = torch.zeros((num_envs, initial_positions.shape[-1]), dtype=initial_positions.dtype, device=device)
+            self.goals = torch.zeros((num_envs,) + goals.shape[1:], dtype=goals.dtype, device=device)
+            self.goal_reached_per_env = torch.zeros(num_envs, dtype=torch.bool, device=device)
+            self.center_alignment_per_env = torch.zeros(num_envs, dtype=torch.float32, device=device)
+            self.alignment_step_counter = torch.zeros(num_envs, dtype=torch.int32, device=device)
+            self.consecutive_negative_counter = torch.zeros(num_envs, dtype=torch.int32, device=device)
+            self.should_reset_env = torch.zeros(num_envs, dtype=torch.bool, device=device)
+            self.high_alignment_step_counter = torch.zeros(num_envs, dtype=torch.int32, device=device)
+
+            # Set values for the environments being reset
+            if env_ids is not None and len(env_ids) > 0:
+                self.initial_positions[env_ids] = initial_positions
+                self.goals[env_ids] = goals
+            else:
+                self.initial_positions = initial_positions
+                self.goals = goals
+        else:
+            # Partial reset - only reset specified environments without resizing tensors
+            # Update positions and goals for specific environments
+            if len(env_ids) > 0:
+                self.initial_positions[env_ids] = initial_positions
+                self.goals[env_ids] = goals
+                # Reset counters for specific environments
+                self.goal_reached_per_env[env_ids] = False
+                self.center_alignment_per_env[env_ids] = 0.0
+                self.alignment_step_counter[env_ids] = 0
+                self.consecutive_negative_counter[env_ids] = 0
+                self.should_reset_env[env_ids] = False
+                self.high_alignment_step_counter[env_ids] = 0
 
     def __call__(self, action, current_states, _previous_states):
         robot_positions = current_states["robot_positions"]
@@ -311,6 +448,7 @@ class FinalReward(RewardFunction):
             self.consecutive_negative_counter = torch.zeros(num_envs, dtype=torch.int32, device=robot_positions.device)
             self.should_reset_env = torch.zeros(num_envs, dtype=torch.bool, device=robot_positions.device)
             self.high_quadrants_per_env = []  # Store quadrant for each environment (using threshold_high)
+            self.high_alignment_step_counter = torch.zeros(num_envs, dtype=torch.int32, device=robot_positions.device)
         else:
             self.goal_reached_per_env.fill_(False)
             self.should_reset_env.fill_(False)
@@ -343,16 +481,9 @@ class FinalReward(RewardFunction):
             depth_threshold_low = 0.9 * max_depth
             depth_threshold_high = 1.0 * max_depth
             #print(f"using thresholds 0.6 and 0.7")
-            if min_depth < 0.05:
+            if min_depth < 0.05 and max_depth > 0.15:
                 depth_threshold_low = 0.1 * max_depth
                 depth_threshold_high = 0.2 * max_depth
-                #print(f"using thresholds 0.1 and 0.2")
-            # else:
-            #     depth_threshold_low = 0.9 * max_depth
-            #     depth_threshold_high = 1.0 * max_depth
-            # if max_depth < 0.3:
-            #     depth_threshold_low = 0.9 * max_depth
-            #     depth_threshold_high = 1.0 * max_depth
 
             # Compute centroids for threshold_low and threshold_high regions separately
             # Region 1: pixels >= threshold_low
@@ -397,11 +528,16 @@ class FinalReward(RewardFunction):
                 print(f"Env {i} - threshold_high region: No pixels found, using deepest point")
                 self.high_quadrants_per_env.append("center")  # Default when no pixels found
 
-            # Calculate ratio of pixels with "good depth" (indicates wide open lumen vs narrow view)
-            GOOD_DEPTH_THRESHOLD = 0.12  # Pixels above this are considered "good depth"
-            high_depth_pixels = np.sum(depth_img_np > GOOD_DEPTH_THRESHOLD)
+            # Calculate ratio of far-depth pixels using a dynamic threshold over the depth range
+            depth_range = max_depth - min_depth
             total_pixels = depth_img_np.size
-            high_depth_ratio = high_depth_pixels / total_pixels
+            FAR_DEPTH_FRACTION = 0.7  # Top fraction of depth range treated as "far"
+            far_threshold = min_depth + FAR_DEPTH_FRACTION * depth_range
+            if depth_range > 1e-6:
+                high_depth_pixels = np.sum(depth_img_np >= far_threshold)
+                high_depth_ratio = high_depth_pixels / total_pixels
+            else:
+                high_depth_ratio = 0.0
 
             # Check if too many pixels are in the shallow depth range (very close to camera)
             # This indicates facing a wall or obstruction
@@ -432,61 +568,44 @@ class FinalReward(RewardFunction):
             reward_components['center_alignment'] = center_alignment
             self.center_alignment_per_env[i] = center_alignment
 
-            # 2. Lumen visibility quality: combines max_depth AND high_depth_ratio
+            # 2. Lumen visibility quality: normalized lumen score in [-1, 1]
             # Good lumen view requires BOTH deep point AND wide open view
             LUMEN_MIN_DEPTH = 0.20  # Minimum max depth for good lumen
             WALL_MAX_DEPTH = 0.05   # Maximum depth indicating wall
-            MIN_HIGH_DEPTH_RATIO = 0.40  # Minimum ratio of "good depth" pixels for quality view
+            MIN_HIGH_DEPTH_RATIO = 0.20  # Minimum ratio of far-depth pixels for quality view
+            DEPTH_RANGE_MIN = 0.04  # Minimum depth range to consider lumen present
+            DEPTH_RANGE_GOOD = 0.12  # Depth range considered strong lumen
 
-            # First check max_depth (is lumen visible at all?)
-            if max_depth < WALL_MAX_DEPTH:
-                # Very low max depth - definitely facing wall (BAD)
-                lumen_visibility_penalty = -1.0
+            if max_depth < WALL_MAX_DEPTH or depth_range < DEPTH_RANGE_MIN or shallow_ratio > 0.6:
+                lumen_reward = -1.0
                 reward_components['center_alignment'] = -1.0  # Override center alignment
-            elif max_depth < LUMEN_MIN_DEPTH:
-                # Low max depth - partially obstructed
-                base_penalty = -0.5 * (LUMEN_MIN_DEPTH - max_depth) / (LUMEN_MIN_DEPTH - WALL_MAX_DEPTH)
-
-                # Further penalize if high_depth_ratio is low (narrow view)
-                if high_depth_ratio < MIN_HIGH_DEPTH_RATIO:
-                    ratio_penalty = -0.3 * (MIN_HIGH_DEPTH_RATIO - high_depth_ratio) / MIN_HIGH_DEPTH_RATIO
-                    lumen_visibility_penalty = base_penalty + ratio_penalty
-                else:
-                    lumen_visibility_penalty = base_penalty
             else:
-                # Good max depth - but check if view is wide open or narrow
-                if high_depth_ratio < MIN_HIGH_DEPTH_RATIO:
-                    # Narrow view - can see lumen but not well positioned (YOUR CASE)
-                    # Penalize proportionally to how narrow the view is
-                    lumen_visibility_penalty = -0.4 * (MIN_HIGH_DEPTH_RATIO - high_depth_ratio) / MIN_HIGH_DEPTH_RATIO
-                elif high_depth_ratio < 0.25:
-                    # Decent view but not optimal
-                    lumen_visibility_penalty = 0.1
-                else:
-                    # Wide open lumen view - excellent! (GOOD)
-                    lumen_visibility_penalty = 0.2
+                depth_span = max(LUMEN_MIN_DEPTH - WALL_MAX_DEPTH, 1e-6)
+                depth_score = (max_depth - WALL_MAX_DEPTH) / depth_span
+                depth_score = np.clip(depth_score, 0.0, 1.0)
 
-            reward_components['lumen_visibility'] = lumen_visibility_penalty
+                ratio_score = np.clip((high_depth_ratio - MIN_HIGH_DEPTH_RATIO) / (1.0 - MIN_HIGH_DEPTH_RATIO), 0.0, 1.0)
+                range_score = np.clip((depth_range - DEPTH_RANGE_MIN) / max(DEPTH_RANGE_GOOD - DEPTH_RANGE_MIN, 1e-6), 0.0, 1.0)
+
+                lumen_score = (0.6 * depth_score + 0.4 * ratio_score) * range_score
+                lumen_reward = 2.0 * lumen_score - 1.0
+
+            reward_components['lumen_visibility'] = lumen_reward
 
             # print(f"max_depth: {max_depth:.3f}, high_depth_ratio: {high_depth_ratio:.3f}, "
-            #       f"lumen_visibility: {lumen_visibility_penalty:.3f}")
+            #       f"lumen_visibility: {lumen_reward:.3f}")
 
             # 3. Penalty for deviation from robot position to goal position
             reward_components['goal_progress'] = 1.0 - (d2target / d_max).item()
 
             # Combine reward components with weights
             total_reward = (self.center_weight * reward_components['center_alignment'] +
-                          self.goal_weight * reward_components['goal_progress'] +
+                          #self.goal_weight * reward_components['goal_progress'] +
                           self.obstruction_weight * reward_components['lumen_visibility'])
 
             # Poor center alignment penalty - penalize when not well-aligned with lumen center
             # if center_alignment < 0.8:
             #     total_reward = -1.0
-
-            # Special conditions override the weighted sum
-            # Poor lumen visibility - severe penalty
-            if lumen_visibility_penalty < 0:
-                total_reward = total_reward - 0.5
 
             # Too many shallow pixels - indicates facing wall/obstruction
             if shallow_ratio > 0.6:
@@ -521,30 +640,38 @@ class FinalReward(RewardFunction):
             # Condition 1: center_alignment > 0.85
             # Condition 2: center_alignment > 0.7 AND lumen_visibility > 0
             # STRICT RULE: Never increment when total_reward = -1.0 (severe penalty)
-            condition_1 = center_alignment > 0.85
-            condition_2 = center_alignment > 0.7 and lumen_visibility_penalty > -0.15
+            condition_1 = center_alignment > self.alignment_threshold
+            condition_2 = center_alignment > 0.7 and lumen_reward > -0.15
             not_severe_penalty = abs(total_reward - (-1.0)) > 1e-6
 
-            if (condition_1 or condition_2) and not_severe_penalty:
-                self.alignment_step_counter[i] += 1
+            if condition_1 and not_severe_penalty:
+                self.high_alignment_step_counter[i] += 1
+                print("High alignment step counted", self.high_alignment_step_counter[i].item())
 
-            # Print center alignment counter
-            #print(f"Env {i} - center_alignment: {center_alignment:.3f}, lumen_visibility: {lumen_visibility_penalty:.3f}, total_reward: {total_reward:.3f}, counter: {self.alignment_step_counter[i].item()}/{self.alignment_steps}")
+            # # Increment high alignment counter if center_alignment > threshold
+            # if center_alignment > self.alignment_threshold:
+            #     self.high_alignment_step_counter[i] += 1
+            #     print("High alignment step counted", self.high_alignment_step_counter[i].item())
 
-            # Goal reached - new condition: cumulative steps with center_alignment > threshold
-            # Check if the counter has reached the required number of steps
-            alignment_goal_reached = self.alignment_step_counter[i] >= self.alignment_steps
+            # Calculate alignment percentage for this episode
+            alignment_percentage = self.high_alignment_step_counter[i].float() / self.max_episode_length
+            print(f"Env {i} - Alignment Percentage: {alignment_percentage.item()*100:.2f}%")
 
-            if alignment_goal_reached:
-                total_reward = 100.0
+            percentage_success = (alignment_percentage >= self.success_alignment_ratio)
+
+            if percentage_success:
+                total_reward = 1.0
                 self.goal_reached_per_env[i] = True
-                print(f"Goal reached in environment {i}! Center alignment above {self.alignment_threshold} for {self.alignment_step_counter[i].item()} cumulative steps (required: {self.alignment_steps}).")
+                print(f"Goal reached in environment {i}! Center alignment > 0.95 for {alignment_percentage.item()*100:.1f}% of {self.max_episode_length} steps (required: {self.success_alignment_ratio*100:.0f}%).")
+
+            # Final clamp after reset/goal overrides for normalized rewards
+            total_reward = np.clip(total_reward, -1.0, 1.0)
 
             # Print reward components and total reward
-            # print(f"Env {i} - Reward - Center: {reward_components['center_alignment']:.3f}, "
-            #       f"Goal: {reward_components['goal_progress']:.3f}, "
-            #       f"Lumen_Visibility: {reward_components['lumen_visibility']:.3f}, "
-            #       f"Total: {total_reward:.3f}")
+            print(f"Env {i} - Reward - Center: {reward_components['center_alignment']:.3f}, "
+                  f"Goal: {reward_components['goal_progress']:.3f}, "
+                  f"Lumen_Visibility: {reward_components['lumen_visibility']:.3f}, "
+                  f"Total: {total_reward:.3f}")
 
             rewards.append(torch.tensor(total_reward,
                                        dtype=torch.float32,

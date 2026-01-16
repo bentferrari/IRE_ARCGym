@@ -665,18 +665,26 @@ class SoftEndoscopeChain(BaseRobot):
         if init_rot is not None:
             self.init_rot = torch.tensor(init_rot, device=self.device)
 
-    def _load_joint_positions_from_csv(self, csv_filepath: str, num_envs: int, source_env_id: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+    def _load_joint_positions_from_csv(self, csv_filepath: str, num_envs: int, env_ids: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
         """Load joint positions and root state from a CSV file saved during teleoperation.
+
+        IMPORTANT: This method loads the FULL configuration from env_0's row in the CSV file,
+        including all joint angles and the root pose (position + orientation). For environments
+        other than env_0, it applies the env_origins translation to position the robot correctly
+        in each environment's coordinate space.
+
+        This ensures all robots start with the same joint configuration and orientation,
+        just translated to their respective environment positions.
 
         Args:
             csv_filepath: Path to the CSV file (e.g., "saved_states/robot_state_20251215_143022.csv")
             num_envs: Number of environments to generate positions for
-            source_env_id: Which environment's configuration to use from the CSV (default: 0)
+            env_ids: Optional tensor of environment IDs to reset. If None, resets env_ids 0 to num_envs-1.
 
         Returns:
             Tuple of (joint_positions, root_state):
-                - joint_positions: Joint positions tensor. Shape: (num_envs, num_joints)
-                - root_state: Root state tensor (pos, quat, lin_vel, ang_vel). Shape: (num_envs, 13)
+                - joint_positions: Joint positions tensor (same for all envs). Shape: (num_envs, num_joints)
+                - root_state: Root state tensor with translated positions. Shape: (num_envs, 13)
         """
         import pandas as pd
         import os
@@ -687,56 +695,83 @@ class SoftEndoscopeChain(BaseRobot):
         # Load the CSV
         df = pd.read_csv(csv_filepath)
 
-        # Verify source environment exists
-        if source_env_id not in df['env_id'].values:
-            raise ValueError(f"Environment {source_env_id} not found in CSV file. Available: {df['env_id'].values.tolist()}")
+        # Determine which env_ids to reset
+        if env_ids is None:
+            env_ids_to_reset = list(range(num_envs))
+        else:
+            env_ids_to_reset = env_ids.cpu().tolist() if isinstance(env_ids, torch.Tensor) else list(env_ids)
 
-        # Get the row for source environment
-        row = df[df['env_id'] == source_env_id].iloc[0]
-
-        # Extract joint positions
+        # Extract joint column names
         joint_cols = [col for col in df.columns if col.startswith('joint_') and col.endswith('_pos')]
         joint_cols = sorted(joint_cols, key=lambda x: int(x.split('_')[1]))  # Sort by joint number
-        joint_positions = [row[col] for col in joint_cols]
+
+        # ALWAYS load from env_0 row - this is the reference configuration
+        if 0 not in df['env_id'].values:
+            raise ValueError(f"env_id 0 not found in CSV file: {csv_filepath}")
+
+        env0_row = df[df['env_id'] == 0].iloc[0]
+
+        # Extract joint positions from env_0 (same for all environments)
+        env0_joint_positions = [env0_row[col] for col in joint_cols]
+        env0_joint_pos = torch.tensor(env0_joint_positions, dtype=torch.float32, device=self.device)
+
+        # Extract root state from env_0
+        env0_root_pos = torch.tensor([
+            env0_row['root_pos_x'],
+            env0_row['root_pos_y'],
+            env0_row['root_pos_z']
+        ], dtype=torch.float32, device=self.device)
+
+        env0_root_quat = torch.tensor([
+            env0_row['root_quat_w'],
+            env0_row['root_quat_x'],
+            env0_row['root_quat_y'],
+            env0_row['root_quat_z']
+        ], dtype=torch.float32, device=self.device)
+
+        # Initialize output tensors
+        joint_pos = torch.zeros((num_envs, len(joint_cols)), dtype=torch.float32, device=self.device)
+        root_state = torch.zeros((num_envs, 13), dtype=torch.float32, device=self.device)
+
+        # Calculate environment translations from scene.env_origins
+        # env_origins gives the world-space origin of each environment
+        env_origins = self.scene.env_origins  # Shape: (total_num_envs, 3)
+        env0_origin = env_origins[0]  # Reference origin
+
+        logging.info(f"env_origins[0]: {env0_origin}")
+        logging.info(f"env0_root_pos from CSV: {env0_root_pos}")
+        logging.info(f"env0_root_quat from CSV: {env0_root_quat}")
+
+        # Apply configuration to each environment with appropriate translation
+        for target_idx, env_id in enumerate(env_ids_to_reset):
+            # Joint positions are the same for all environments
+            joint_pos[target_idx] = env0_joint_pos
+
+            # Calculate translation from env_0 to this environment
+            translation = env_origins[env_id] - env0_origin
+
+            logging.info(f"env_id={env_id}: translation={translation}")
+
+            # Position: env_0's position + translation to this env's origin
+            root_state[target_idx, :3] = env0_root_pos + translation
+
+            # Orientation: same as env_0 (no rotation change)
+            root_state[target_idx, 3:7] = env0_root_quat
+
+            # Velocities: zero (fresh start)
+            root_state[target_idx, 7:] = 0.0
+
+            logging.info(f"env_id={env_id}: final root_pos={root_state[target_idx, :3]}")
 
         # Verify number of joints matches
-        if len(joint_positions) != self.robot.num_joints:
+        if joint_pos.shape[1] != self.robot.num_joints:
             raise ValueError(
-                f"Number of joints in CSV ({len(joint_positions)}) doesn't match robot ({self.robot.num_joints})"
+                f"Number of joints in CSV ({joint_pos.shape[1]}) doesn't match robot ({self.robot.num_joints})"
             )
 
-        # Convert joint positions to tensor and replicate for all environments
-        joint_pos_single = torch.tensor(joint_positions, dtype=torch.float32, device=self.device)
-        joint_pos = joint_pos_single.unsqueeze(0).repeat(num_envs, 1)
-
-        # Extract root state (position, quaternion, linear velocity, angular velocity)
-        root_state_single = torch.zeros(13, dtype=torch.float32, device=self.device)
-
-        # Position (x, y, z)
-        root_state_single[0] = row['root_pos_x']
-        root_state_single[1] = row['root_pos_y']
-        root_state_single[2] = row['root_pos_z']
-
-        # Quaternion (w, x, y, z)
-        root_state_single[3] = row['root_quat_w']
-        root_state_single[4] = row['root_quat_x']
-        root_state_single[5] = row['root_quat_y']
-        root_state_single[6] = row['root_quat_z']
-
-        # Linear velocity (x, y, z)
-        root_state_single[7] = row['root_lin_vel_x']
-        root_state_single[8] = row['root_lin_vel_y']
-        root_state_single[9] = row['root_lin_vel_z']
-
-        # Angular velocity (x, y, z)
-        root_state_single[10] = row['root_ang_vel_x']
-        root_state_single[11] = row['root_ang_vel_y']
-        root_state_single[12] = row['root_ang_vel_z']
-
-        # Replicate for all environments
-        root_state = root_state_single.unsqueeze(0).repeat(num_envs, 1)
-
-        logging.info(f"Loaded joint positions and root state from {csv_filepath} (env {source_env_id})")
+        logging.info(f"Loaded configuration from env_0 in {csv_filepath}, applied to {num_envs} environments")
+        logging.info(f"env_0 root position: {env0_root_pos}")
+        logging.info(f"Translated root positions: {root_state[:, :3]}")
         return joint_pos, root_state
 
     def generate_random_joint_positions(
@@ -811,7 +846,8 @@ class SoftEndoscopeChain(BaseRobot):
 
         if load_from_csv:
             # Load both joint positions and root state from CSV
-            joint_pos, csv_root_state = self._load_joint_positions_from_csv(joint_positions, len(env_ids))
+            # Pass env_ids so each environment gets its own position from the CSV
+            joint_pos, csv_root_state = self._load_joint_positions_from_csv(joint_positions, len(env_ids), env_ids)
             # Use root state from CSV
             root_state = csv_root_state
         else:
@@ -847,14 +883,14 @@ class SoftEndoscopeChain(BaseRobot):
                     )
                 joint_pos = joint_positions.to(self.device)
 
-        # Write state to simulation
+        # Reset the articulation internal state FIRST (this resets to defaults)
+        self.robot.reset(env_ids)
+
+        # Then write our custom state to simulation (this overwrites the defaults)
         self.robot.write_root_state_to_sim(root_state, env_ids)
 
         joint_vel = torch.zeros((len(env_ids), self.robot.num_joints), device=self.device)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
-
-        # Reset the articulation internal state
-        self.robot.reset(env_ids)
 
         # Mark as initialized after first reset
         if not self._is_initialized:

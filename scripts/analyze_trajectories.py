@@ -42,13 +42,16 @@ def main():
     parser.add_argument("--save-plots", action="store_true", help="Save plots as PNG files")
     parser.add_argument("--export-csv", action="store_true", help="Export trajectories to CSV")
     parser.add_argument("--max-episodes", type=int, default=5, help="Maximum number of episodes to analyze")
+    parser.add_argument("--num-frames", type=int, default=6, help="Number of endoscope frames to display (default: 6)")
+    parser.add_argument("--max-steps", type=int, default=4000, help="Maximum number of steps to plot (default: 4000)")
 
     args = parser.parse_args()
 
     if args.episode:
         # Analyze a specific episode
         print(f"Loading trajectory from: {args.episode}")
-        analyze_episode(args.episode, save_plot=args.save_plots, export_csv=args.export_csv)
+        analyze_episode(args.episode, save_plot=args.save_plots, export_csv=args.export_csv,
+                       num_frames=args.num_frames, max_steps=args.max_steps)
 
     elif args.save_dir:
         # Find and analyze multiple episodes
@@ -81,7 +84,8 @@ def main():
 
             for i, ep_dir in enumerate(episodes[:num_to_analyze]):
                 print(f"\n[{i+1}/{num_to_analyze}] Analyzing: {ep_dir}")
-                analyze_episode(ep_dir, save_plot=args.save_plots, export_csv=args.export_csv)
+                analyze_episode(ep_dir, save_plot=args.save_plots, export_csv=args.export_csv,
+                               num_frames=args.num_frames, max_steps=args.max_steps)
 
             plt.show()  # Show all plots at once
 
@@ -90,7 +94,7 @@ def main():
         print("\nError: Must specify either --episode or --save-dir")
 
 
-def analyze_episode(episode_dir, save_plot=False, export_csv=False):
+def analyze_episode(episode_dir, save_plot=False, export_csv=False, num_frames=6, max_steps=4000):
     """Analyze a single episode."""
     try:
         # Load metadata first
@@ -102,7 +106,7 @@ def analyze_episode(episode_dir, save_plot=False, export_csv=False):
         print(f"  Colon stress: {metadata.get('colon_stress', 'N/A')}")
 
         # Create analysis plot
-        fig = plot_trajectory_analysis(episode_dir, save_plot=save_plot)
+        fig = plot_trajectory_analysis(episode_dir, save_plot=save_plot, num_frames=num_frames, max_steps=max_steps)
 
         # Export to CSV if requested
         if export_csv:

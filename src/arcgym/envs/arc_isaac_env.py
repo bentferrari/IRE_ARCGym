@@ -310,12 +310,23 @@ class ARCIsaacEnv(DirectRLEnv):
 
             # Depth statistics
             max_depth = np.max(depth_img_np)
-
-            # Calculate ratio of pixels with "good depth"
-            GOOD_DEPTH_THRESHOLD = 0.12
-            high_depth_pixels = np.sum(depth_img_np > GOOD_DEPTH_THRESHOLD)
+            min_depth = np.min(depth_img_np)
+            depth_range = max_depth - min_depth
             total_pixels = depth_img_np.size
-            high_depth_ratio = high_depth_pixels / total_pixels
+
+            # Calculate ratio of far-depth pixels using a dynamic threshold over the depth range
+            FAR_DEPTH_FRACTION = 0.7
+            far_threshold = min_depth + FAR_DEPTH_FRACTION * depth_range
+            if depth_range > 1e-6:
+                high_depth_pixels = np.sum(depth_img_np >= far_threshold)
+                high_depth_ratio = high_depth_pixels / total_pixels
+            else:
+                high_depth_ratio = 0.0
+
+            # Check if too many pixels are very shallow (close to camera)
+            SHALLOW_DEPTH_ABSOLUTE = 0.05
+            shallow_pixels = np.sum(depth_img_np < SHALLOW_DEPTH_ABSOLUTE)
+            shallow_ratio = shallow_pixels / total_pixels
 
             # Find the deepest point location (highest depth value = farthest point)
             max_depth_idx = np.unravel_index(np.argmax(depth_img_np), depth_img_np.shape)
@@ -335,25 +346,23 @@ class ARCIsaacEnv(DirectRLEnv):
 
             # Compute lumen visibility (same logic as in FinalReward)
             LUMEN_MIN_DEPTH = 0.20
-            WALL_MAX_DEPTH = 0.10
-            MIN_HIGH_DEPTH_RATIO = 0.40
+            WALL_MAX_DEPTH = 0.05
+            MIN_HIGH_DEPTH_RATIO = 0.20
+            DEPTH_RANGE_MIN = 0.04
+            DEPTH_RANGE_GOOD = 0.12
 
-            if max_depth < WALL_MAX_DEPTH:
+            if max_depth < WALL_MAX_DEPTH or depth_range < DEPTH_RANGE_MIN or shallow_ratio > 0.6:
                 lumen_visibility = -1.0
-            elif max_depth < LUMEN_MIN_DEPTH:
-                base_penalty = -0.5 * (LUMEN_MIN_DEPTH - max_depth) / (LUMEN_MIN_DEPTH - WALL_MAX_DEPTH)
-                if high_depth_ratio < MIN_HIGH_DEPTH_RATIO:
-                    ratio_penalty = -0.3 * (MIN_HIGH_DEPTH_RATIO - high_depth_ratio) / MIN_HIGH_DEPTH_RATIO
-                    lumen_visibility = base_penalty + ratio_penalty
-                else:
-                    lumen_visibility = base_penalty
             else:
-                if high_depth_ratio < MIN_HIGH_DEPTH_RATIO:
-                    lumen_visibility = -0.4 * (MIN_HIGH_DEPTH_RATIO - high_depth_ratio) / MIN_HIGH_DEPTH_RATIO
-                elif high_depth_ratio < 0.25:
-                    lumen_visibility = 0.1
-                else:
-                    lumen_visibility = 0.2
+                depth_span = max(LUMEN_MIN_DEPTH - WALL_MAX_DEPTH, 1e-6)
+                depth_score = (max_depth - WALL_MAX_DEPTH) / depth_span
+                depth_score = np.clip(depth_score, 0.0, 1.0)
+
+                ratio_score = np.clip((high_depth_ratio - MIN_HIGH_DEPTH_RATIO) / (1.0 - MIN_HIGH_DEPTH_RATIO), 0.0, 1.0)
+                range_score = np.clip((depth_range - DEPTH_RANGE_MIN) / max(DEPTH_RANGE_GOOD - DEPTH_RANGE_MIN, 1e-6), 0.0, 1.0)
+
+                lumen_score = (0.6 * depth_score + 0.4 * ratio_score) * range_score
+                lumen_visibility = 2.0 * lumen_score - 1.0
 
             lumen_visibilities.append(lumen_visibility)
 
@@ -430,8 +439,8 @@ class ARCIsaacEnv(DirectRLEnv):
                         if self.lumen_visibility_negative_counter[env_id] >= self.lumen_negative_threshold:
                             if self.lumen_backward_remaining[env_id] == 0:  # Only trigger if not already going backward
                                 self.lumen_backward_remaining[env_id] = self.lumen_backward_steps
-                                print(f"Env {env_id} - Lumen visibility < {self.lumen_visibility_threshold} for {self.lumen_negative_threshold} steps. "
-                                      f"Triggering backward motion for {self.lumen_backward_steps} steps (0.5 time units).")
+                                # print(f"Env {env_id} - Lumen visibility < {self.lumen_visibility_threshold} for {self.lumen_negative_threshold} steps. "
+                                #       f"Triggering backward motion for {self.lumen_backward_steps} steps (0.5 time units).")
                             # Reset counter after triggering
                             self.lumen_visibility_negative_counter[env_id] = 0
                     else:
@@ -484,8 +493,8 @@ class ARCIsaacEnv(DirectRLEnv):
         """
         Apply movement constraints based on quadrant of lumen centroid.
 
-        When lumen visibility is poor (< -0.15), uses the deepest point position.
-        Otherwise, uses the threshold_high centroid from the reward function.
+        When lumen visibility is poor (< -0.30), backs out and scans using the escape
+        direction; otherwise, uses the threshold_high centroid from the reward function.
 
         ALWAYS forces forward motion (v_forward_back = 0.1) and clips other actions based on quadrant:
         - upper-left: clip to go up and left (v_left_right ≤ 0, v_up_down ≤ 0, ω_pitch ≤ 0, ω_yaw ≤ 0)
@@ -517,12 +526,14 @@ class ARCIsaacEnv(DirectRLEnv):
         # Compute lumen visibility to determine quadrant source
         if hasattr(self.robot, 'get_depth'):
             try:
-                _, lumen_visibilities, _ = self._compute_movement_metrics()
+                _, lumen_visibilities, escape_directions = self._compute_movement_metrics()
             except Exception as e:
                 logging.warning(f"Failed to compute lumen visibility: {e}")
                 lumen_visibilities = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+                escape_directions = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
         else:
             lumen_visibilities = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+            escape_directions = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
 
         # Get quadrant information from reward function (using threshold_high centroid)
         if hasattr(self.reward_function, 'high_quadrants_per_env') and self.reward_function.high_quadrants_per_env:
@@ -534,7 +545,7 @@ class ARCIsaacEnv(DirectRLEnv):
 
                 # Override quadrant with deepest point position if lumen visibility is poor
                 quadrant_source = "threshold_high"
-                if lumen_visibilities[env_id] < -0.30:
+                if lumen_visibilities[env_id] < 0.20:
                     # Poor visibility: compute quadrant from deepest point
                     try:
                         depth_images = self.robot.get_depth()
@@ -562,8 +573,29 @@ class ARCIsaacEnv(DirectRLEnv):
                     except Exception as e:
                         logging.warning(f"Failed to compute deepest point quadrant: {e}")
 
+                    # Back out and scan when lumen is poor
+                    constrained_actions[env_id, 0] = 0.0  # no left/right translation
+                    constrained_actions[env_id, 1] = 0.0  # no up/down translation
+                    constrained_actions[env_id, 2] = -0.02  # back out slowly
+                    constrained_actions[env_id, 5] = 0.0  # no roll
+
+                    scan_yaw = torch.clamp(escape_directions[env_id, 0], -0.4, 0.4)
+                    scan_pitch = torch.clamp(escape_directions[env_id, 1], -0.4, 0.4)
+                    if torch.abs(scan_yaw) < 1e-3 and torch.abs(scan_pitch) < 1e-3:
+                        scan_yaw = torch.clamp(constrained_actions[env_id, 4], -0.2, 0.2)
+                        scan_pitch = torch.clamp(constrained_actions[env_id, 3], -0.2, 0.2)
+
+                    constrained_actions[env_id, 4] = scan_yaw
+                    constrained_actions[env_id, 3] = scan_pitch
+
+                    # Print quadrant and actions for each environment
+                    clipped_action = constrained_actions[env_id]
+                    lumen_vis = lumen_visibilities[env_id].item()
+                    #print(f"Env {env_id} - Quadrant: {quadrant:12s} (backout_scan) | LumenVis: {lumen_vis:6.3f}")
+                    continue
+
                 # Clip forward/back motion to range [0.01, 0.05]
-                constrained_actions[env_id, 2] = torch.clamp(constrained_actions[env_id, 2], min=0.05, max=0.10)
+                constrained_actions[env_id, 2] = torch.clamp(constrained_actions[env_id, 2], min=0.01, max=0.05)
 
                 # Always disable roll (set to 0)
                 constrained_actions[env_id, 5] = 0.0
@@ -599,7 +631,7 @@ class ARCIsaacEnv(DirectRLEnv):
                 # Print quadrant and actions for each environment
                 clipped_action = constrained_actions[env_id]
                 lumen_vis = lumen_visibilities[env_id].item()
-                print(f"Env {env_id} - Quadrant: {quadrant:12s} ({quadrant_source}) | LumenVis: {lumen_vis:6.3f}")
+                #print(f"Env {env_id} - Quadrant: {quadrant:12s} ({quadrant_source}) | LumenVis: {lumen_vis:6.3f}")
 
         return constrained_actions
 
@@ -618,16 +650,18 @@ class ARCIsaacEnv(DirectRLEnv):
                 logging.warning(f"Failed to compute center alignment: {e}")
 
         # Apply conditional logic to actions BEFORE passing to robot
-        # Store original PPO actions for debugging
-        original_ppo_actions = self.actions.clone()
 
-        # Apply movement constraints
-        actions_to_apply = self._apply_movement_constraints(self.actions.clone())
+        actions_to_apply = self.actions.clone()
+        if self.env_config.get("clip_actions", True):
+            # Apply movement constraints
+            actions_to_apply = self._apply_movement_constraints(actions_to_apply)
+            print("Applied movement constraints to actions.")
+            # Override actions with backward motion if in backward motion mode
+            actions_to_apply = self._apply_backward_motion(actions_to_apply)
+        else:
+            actions_to_apply[:, 2] = torch.clamp(actions_to_apply[:, 2], min=0.01, max=0.05)
 
-        # Override actions with backward motion if in backward motion mode
-        actions_to_apply = self._apply_backward_motion(actions_to_apply)
-
-        # CRITICAL: Update self.actions to the clipped version for reward computation
+        # CRITICAL: Update self.actions to the executed version for reward computation
         # This ensures PPO learns about the actions that were actually executed
         self.actions = actions_to_apply
 
@@ -765,6 +799,17 @@ class ARCIsaacEnv(DirectRLEnv):
         # The camera data is still fresh from _get_dones()
 
         robot_obs = self.robot.get_observation(use_pose_in_obs=self.use_pose_in_obs, use_camera=self.use_camera)
+        if isinstance(robot_obs, dict):
+            warned_keys = getattr(self, "_warned_nan_obs", set())
+            for key, value in robot_obs.items():
+                if isinstance(value, torch.Tensor) and not torch.isfinite(value).all():
+                    if key not in warned_keys:
+                        logging.warning(
+                            f"Non-finite values detected in observation '{key}'. Replacing with zeros."
+                        )
+                        warned_keys.add(key)
+                    robot_obs[key] = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
+            self._warned_nan_obs = warned_keys
 
         obs = {"policy": robot_obs}
 
@@ -782,6 +827,11 @@ class ARCIsaacEnv(DirectRLEnv):
 
         robot_positions = self.robot.get_pose()[:, :3]
         depth_data = self.robot.get_depth()
+        if isinstance(depth_data, torch.Tensor) and not torch.isfinite(depth_data).all():
+            if not getattr(self, "_warned_nan_depth", False):
+                logging.warning("Non-finite values detected in depth data. Replacing with zeros.")
+                self._warned_nan_depth = True
+            depth_data = torch.nan_to_num(depth_data, nan=0.0, posinf=0.0, neginf=0.0)
 
         states = {
             "obs" : obs,
@@ -891,6 +941,10 @@ class ARCIsaacEnv(DirectRLEnv):
         return obs, extras
 
     def _reset_idx(self, env_ids: Sequence[int]):
+        # Convert env_ids to tensor at the start to ensure consistent handling
+        if not isinstance(env_ids, torch.Tensor):
+            env_ids = torch.tensor(env_ids, device=self.device, dtype=torch.long)
+
         # Call parent reset FIRST. This resets the scene and all actors to default.
         super()._reset_idx(env_ids)
 
@@ -907,12 +961,22 @@ class ARCIsaacEnv(DirectRLEnv):
         csv_init_endpose = self.config.get("env_config", {}).get("init_endpose_from_csv", None)
 
         # Get entry positions AFTER stepping - load from CSV if provided
-        self.entry_positions = self.colon.get_entry_pos(env_ids, csv_filepath=csv_init_file)
-        self.targets = self.colon.get_targets(env_ids, csv_filepath=csv_init_endpose)
+        entry_positions_for_reset = self.colon.get_entry_pos(env_ids, csv_filepath=csv_init_file)
+        targets_for_reset = self.colon.get_targets(env_ids, csv_filepath=csv_init_endpose)
 
+        # Update the full entry_positions and targets arrays for the specific env_ids
+        if hasattr(self, 'entry_positions') and self.entry_positions is not None:
+            self.entry_positions[env_ids] = entry_positions_for_reset
+            self.targets[env_ids] = targets_for_reset
+        else:
+            self.entry_positions = entry_positions_for_reset
+            self.targets = targets_for_reset
+
+        # Pass env_ids to reward function for partial reset (don't resize tensors)
         self.reward_function.reset(
-            initial_positions=self.entry_positions,
-            goals=self.targets,
+            initial_positions=entry_positions_for_reset,
+            goals=targets_for_reset,
+            env_ids=env_ids,
         )
 
         # Check if CSV initialization is used first
@@ -935,27 +999,40 @@ class ARCIsaacEnv(DirectRLEnv):
                 self.robot.reset(env_ids)
 
         # Reset our internal environment flags
-        self.goal_reached[env_ids] = False
-        self.hit_wall[env_ids] = False
-        self.truncate_now[env_ids] = False
-        self.colon_invalid[env_ids] = False
-        self.colon_invalid_prev[env_ids] = False
-        self.poor_alignment[env_ids] = False
+        if len(env_ids) > 0:
+            self.goal_reached[env_ids] = False
+            self.hit_wall[env_ids] = False
+            self.truncate_now[env_ids] = False
+            self.colon_invalid[env_ids] = False
+            self.colon_invalid_prev[env_ids] = False
+            self.poor_alignment[env_ids] = False
 
-        # Reset stuck detection for these environments
-        self.poor_alignment_counter[env_ids] = 0
-        self.backward_steps_remaining[env_ids] = 0
+            # Reset stuck detection for these environments
+            self.poor_alignment_counter[env_ids] = 0
+            self.backward_steps_remaining[env_ids] = 0
 
-        # Reset lumen visibility tracking for these environments
-        self.lumen_visibility_negative_counter[env_ids] = 0
-        self.lumen_backward_remaining[env_ids] = 0
+            # Reset lumen visibility tracking for these environments
+            self.lumen_visibility_negative_counter[env_ids] = 0
+            self.lumen_backward_remaining[env_ids] = 0
 
-        # Reset bright region tracking for these environments
-        self.bright_region_directions[env_ids] = 0.0
-        self.has_bright_regions[env_ids] = False
+            # Reset bright region tracking for these environments
+            self.bright_region_directions[env_ids] = 0.0
+            self.has_bright_regions[env_ids] = False
 
     def step(self, action):
         obs, reward, terminated, truncated, info = super().step(action)  # See contents of super().step(action) below
+
+        # Print step counter for each episode
+        # for env_id in range(self.num_envs):
+        #     print(f"Env {env_id} - Episode step: {self.episode_length_buf[env_id].item()}")
+
+        # Print when episodes end
+        reset_mask = terminated | truncated
+        if reset_mask.any():
+            reset_env_ids = torch.where(reset_mask)[0]
+            for env_id in reset_env_ids:
+                print(f"Episode ended for Env {env_id.item()} - Total steps: {self.episode_length_buf[env_id].item()}")
+
         """
         def step(self, action: torch.Tensor) -> VecEnvStepReturn:
             '''Execute one time-step of the environment's dynamics.
