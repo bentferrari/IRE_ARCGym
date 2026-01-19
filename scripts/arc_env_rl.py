@@ -148,12 +148,12 @@ env_config = {
     "env_spacing" : env_spacing,
     "num_envs" : args_cli.num_envs,
     "replicate_physics" : False,
-    "action_scale" : 0.2,
+    "action_scale" : 0.1,
     "debug_vis" : False,
-    "episode_length_s" : 40.0 if args_cli.train else 20000000.0,
+    "episode_length_s" : 30.0 if args_cli.train else 20000000.0,
     "constraint_point_A": 1,  # Distance from robot tip to constraint point A along the robot's local z-axis
-    "init_from_csv": "./saved_states/c1t3_start.csv", #if args_cli.train else None,
-    "init_endpose_from_csv": "./saved_states/c1t2_start.csv" if args_cli.train else None,
+    "init_from_csv": "./saved_states/c1t2_start.csv", #if args_cli.train else None,
+    "init_endpose_from_csv": "./saved_states/c1t2_end.csv" if args_cli.train else None,
     "random_initial_configuration": False,  # Use straight configuration (especially for teleoperation mode)
     "clip_actions": args_cli.clip_actions,
     "disable_movement_constraints": not args_cli.clip_actions,  # Back-compat: tie movement constraints to clip_actions

@@ -331,7 +331,7 @@ class DepthDistanceReward(RewardFunction):
 
 class FinalReward(RewardFunction):
     def __init__(self, eps, reward_scale, center_weight=0.4, goal_weight=0.4, obstruction_weight=0.2,
-                 alignment_threshold=0.90, consecutive_negative_threshold=200, reset_penalty=-100.0,
+                 alignment_threshold=0.85, consecutive_negative_threshold=200, reset_penalty=-100.0,
                  episode_length_s=30.0, decimation=2, dt=1.0/240.0,
                  success_alignment_ratio=0.90, **kwargs):
         """
@@ -472,19 +472,20 @@ class FinalReward(RewardFunction):
             mean_depth = np.mean(depth_img_np)
             depth_variance = np.var(depth_img_np)
 
-            # Print depth statistics for each environment at each timestep
-            #print(f"Env {i} - min_depth: {min_depth:.4f}, max_depth: {max_depth:.4f}")
+            #Print depth statistics for each environment at each timestep
+            print(f"Env {i} - min_depth: {min_depth:.4f}, max_depth: {max_depth:.4f}")
 
             # Find the centroid of the region with different thresholds based on proximity to wall
             # When close to wall (min_depth < 0.05), use lower thresholds to find the opening
             # Otherwise, use higher thresholds to focus on deeper lumen regions
-            depth_threshold_low = 0.9 * max_depth
-            depth_threshold_high = 1.0 * max_depth
+            depth_threshold_low = 0.6 * max_depth
+            depth_threshold_high = 0.7 * max_depth
             #print(f"using thresholds 0.6 and 0.7")
-            if min_depth < 0.05 and max_depth > 0.15:
-                depth_threshold_low = 0.1 * max_depth
+            if min_depth < 0.06 and max_depth <0.9 and max_depth >0.2:
+                depth_threshold_low = 0.0 * max_depth
                 depth_threshold_high = 0.2 * max_depth
 
+                #print(f"Env {i} - close to wall, using thresholds 0.05 and 0.1")
             # Compute centroids for threshold_low and threshold_high regions separately
             # Region 1: pixels >= threshold_low
             low_region_mask = depth_img_np >= depth_threshold_low
@@ -607,9 +608,9 @@ class FinalReward(RewardFunction):
             # if center_alignment < 0.8:
             #     total_reward = -1.0
 
-            # Too many shallow pixels - indicates facing wall/obstruction
-            if shallow_ratio > 0.6:
-                total_reward = -1.0
+            # # Too many shallow pixels - indicates facing wall/obstruction
+            # if shallow_ratio > 0.6:
+            #     total_reward = -1.0
 
             # Hitting wall - severe penalty (very close collision)
             if min_depth < 0.01:
@@ -623,15 +624,15 @@ class FinalReward(RewardFunction):
             # Track consecutive -1 rewards and trigger reset if threshold is reached
             if abs(total_reward - (-1.0)) < 1e-6:  # Check if reward is -1
                 self.consecutive_negative_counter[i] += 1
-                print(f"Env {i} - Consecutive -1 rewards: {self.consecutive_negative_counter[i].item()}/{self.consecutive_negative_threshold}")
+                #print(f"Env {i} - Consecutive -1 rewards: {self.consecutive_negative_counter[i].item()}/{self.consecutive_negative_threshold}")
 
-                if self.consecutive_negative_counter[i] >= self.consecutive_negative_threshold:
-                    # Apply reset penalty
-                    total_reward = self.reset_penalty
-                    self.should_reset_env[i] = True
-                    # Reset the counter for this environment
-                    self.consecutive_negative_counter[i] = 0
-                    print(f"Env {i} - Reset triggered! Applied penalty of {self.reset_penalty}")
+                # if self.consecutive_negative_counter[i] >= self.consecutive_negative_threshold:
+                #     # Apply reset penalty
+                #     total_reward = self.reset_penalty
+                #     self.should_reset_env[i] = True
+                #     # Reset the counter for this environment
+                #     self.consecutive_negative_counter[i] = 0
+                #     print(f"Env {i} - Reset triggered! Applied penalty of {self.reset_penalty}")
             else:
                 # Reset counter if reward is not -1
                 self.consecutive_negative_counter[i] = 0
@@ -644,7 +645,8 @@ class FinalReward(RewardFunction):
             condition_2 = center_alignment > 0.7 and lumen_reward > -0.15
             not_severe_penalty = abs(total_reward - (-1.0)) > 1e-6
 
-            if condition_1 and not_severe_penalty:
+            #if condition_1 and not_severe_penalty:
+            if condition_1:
                 self.high_alignment_step_counter[i] += 1
                 print("High alignment step counted", self.high_alignment_step_counter[i].item())
 
@@ -655,7 +657,7 @@ class FinalReward(RewardFunction):
 
             # Calculate alignment percentage for this episode
             alignment_percentage = self.high_alignment_step_counter[i].float() / self.max_episode_length
-            print(f"Env {i} - Alignment Percentage: {alignment_percentage.item()*100:.2f}%")
+            #print(f"Env {i} - Alignment Percentage: {alignment_percentage.item()*100:.2f}%")
 
             percentage_success = (alignment_percentage >= self.success_alignment_ratio)
 

@@ -598,7 +598,7 @@ class ARCIsaacEnv(DirectRLEnv):
                 constrained_actions[env_id, 2] = torch.clamp(constrained_actions[env_id, 2], min=0.01, max=0.05)
 
                 # Always disable roll (set to 0)
-                constrained_actions[env_id, 5] = 0.0
+                constrained_actions[env_id, 5] = 0.0    
 
                 if quadrant == "upper-left":
                     # Clip to go up and left: translation left/up, yaw left, pitch up
@@ -631,7 +631,7 @@ class ARCIsaacEnv(DirectRLEnv):
                 # Print quadrant and actions for each environment
                 clipped_action = constrained_actions[env_id]
                 lumen_vis = lumen_visibilities[env_id].item()
-                #print(f"Env {env_id} - Quadrant: {quadrant:12s} ({quadrant_source}) | LumenVis: {lumen_vis:6.3f}")
+                print(f"Env {env_id} - Quadrant: {quadrant:12s} ({quadrant_source}) | LumenVis: {lumen_vis:6.3f}")
 
         return constrained_actions
 
