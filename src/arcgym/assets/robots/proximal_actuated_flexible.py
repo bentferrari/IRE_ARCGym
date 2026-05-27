@@ -65,7 +65,15 @@ class RobotEndoscopeChain(BaseRobot):
         logging.info("Continuum robot registered with scene")
 
     def _build_robot(self):
-        """Build multi-segment continuum robot with 20 passive links and a 6-DoF distal link."""
+        """Build multi-segment continuum robot with 20 passive links and proximal actuation.
+
+        Structure: world_anchor → (prismatic X) → passive_19 → ... → passive_0 (tip)
+        - Translational motion (forward/back) is applied via prismatic joint at proximal end
+        - Y/Z motion, pitch/yaw, and roll are applied via anchor velocity
+
+        This structure uses 20 joints total (19 revolute + 1 prismatic), matching magnetic_endoscope.py
+        for CSV state compatibility.
+        """
         robot_config = self.config["robot_config"]
         PASSIVE_COLOR = Gf.Vec3f(0.5, 0.5, 0.5)  # Grey
         BASE_COLOR    = Gf.Vec3f(0.8, 0.2, 0.2)  # Red (unused now but kept)
@@ -75,24 +83,24 @@ class RobotEndoscopeChain(BaseRobot):
         num_passive_cfg = robot_config.get("num_passive_segments", robot_config.get("num_passive_links", 20))
         num_active_cfg = robot_config.get("num_active_segments", robot_config.get("num_active_links", 5))
 
-        # === Enforce: 20 links total, all passive, last link on D6 joint ===
+        # === Enforce: 20 links total, all passive, proximal link actuated ===
         num_links_total = robot_config.get("num_links_total", 20)
         num_passive = num_links_total
         num_active = 0  # no active section anymore
 
         logging.info(f"Building robot with TOTAL_LINKS={num_links_total} (num_passive={num_passive}, num_active={num_active})")
-        
+
         link_radius = robot_config.get("link_radius", 0.01)
         link_height = robot_config.get("link_height", 0.05)
         passive_stiffness = robot_config.get("passive_stiffness", 1e2)
         passive_damping = robot_config.get("passive_damping", 1e3)
 
-        # 20 links -> 19 joints in the chain (passive_1_joint to passive_19_joint)
-        # Plus 1 prismatic joint to world = 20 total joints
+        # 20 links -> 19 revolute joints in the chain (passive_1_joint to passive_19_joint)
+        # Plus 1 prismatic joint at proximal end = 20 total joints (matching magnetic_endoscope.py)
         num_revolute_joints = num_passive - 1  # 19 revolute joints connecting the links
-        self.num_joints = num_passive  # Total joints including prismatic = 20
+        self.num_joints = num_passive  # Total joints: 19 revolute + 1 prismatic = 20
         self.active_joint_indices = []  # all joints passive; no actively-driven section
-        self.prismatic_joint_index = num_revolute_joints  # The prismatic joint is the last joint (index 19)
+        self.prismatic_joint_index = num_revolute_joints  # The prismatic joint index (19)
 
         logging.info(f"Total joints: {self.num_joints} (19 revolute + 1 prismatic)")
         logging.info(f"Active joint indices: {self.active_joint_indices}, count: {len(self.active_joint_indices)}")
@@ -117,17 +125,18 @@ class RobotEndoscopeChain(BaseRobot):
                 damping=passive_damping,
             )
 
-        # Prismatic joint actuator (for up/down motion)
-        actuators["world_prismatic_joint"] = ImplicitActuatorCfg(
-            joint_names_expr=[".*world_prismatic_joint"],
+        # Prismatic joint actuator (for translation along X at proximal end)
+        # Use low stiffness and high damping for velocity control
+        actuators["proximal_prismatic_joint"] = ImplicitActuatorCfg(
+            joint_names_expr=[".*proximal_prismatic_joint"],
             effort_limit=1e4,
             velocity_limit=10.0,
-            stiffness=1e3,
-            damping=1e3,
+            stiffness=0.0,  # No position stiffness for velocity control
+            damping=1e4,    # High damping to respond to velocity targets
         )
 
         # No base_joint, no active joints anymore
-        # (All links passively follow the root via revolute joints with PD actuators)
+        # (All links passively follow the proximal end via revolute joints with PD actuators)
 
         # === Build USD ===
         stage = self.scene.stage
@@ -136,13 +145,15 @@ class RobotEndoscopeChain(BaseRobot):
         for env_id in range(self.num_envs):
             env_path = f"/World/envs/env_{env_id}/Robot"
 
-            # Build chain: world_anchor (fixed root in X/Y) → (prismatic Z) → passive_0 (tip, X/Y fixed) → passive_1 → ... → passive_19 (free end)
-            # The articulation root is the world_anchor at the tip position
-            # The tip (passive_0) is constrained to only move in Z via prismatic joint
+            # Build chain: world_anchor (fixed root) → (prismatic X) → proximal_base → (twist X) → passive_19 (proximal) → ... → passive_0 (distal tip with camera)
+            # The articulation root is the world_anchor at the proximal position
+            # Translation and twist are applied at the proximal end (passive_19 side)
 
-            # Create a fixed world anchor at the tip position as the articulation root
+            # Create a fixed world anchor at the proximal position as the articulation root
             world_anchor_path = f"{env_path}/world_anchor"
-            world_anchor_pos = Gf.Vec3f(-0.5 * link_height, 0.0, link_radius)  # At tip (passive_0) position
+            # Position at proximal end (passive_19 position, which is at x ≈ -(num_passive - 0.5) * link_height)
+            proximal_x = -(num_passive - 0.5) * link_height
+            world_anchor_pos = Gf.Vec3f(proximal_x - link_height / 2, 0.0, link_radius)  # Just behind proximal link
             # Create a very small fixed link as anchor
             anchor = UsdGeom.Sphere.Define(stage, world_anchor_path)
             anchor.CreateRadiusAttr().Set(0.001)  # Very small
@@ -163,6 +174,9 @@ class RobotEndoscopeChain(BaseRobot):
             # Disable collisions for the anchor
             anchor_prim.CreateAttribute("physics:collisionEnabled", Sdf.ValueTypeNames.Bool).Set(False)
 
+            # Index of proximal link (passive_19)
+            proximal_link_idx = num_passive - 1
+
             prev_link_path = None
 
             for i in range(num_passive):
@@ -172,7 +186,6 @@ class RobotEndoscopeChain(BaseRobot):
                 pos = Gf.Vec3f(-(i + 0.5) * link_height, 0.0, link_radius)
                 self._create_link(stage, link_path, link_radius, link_height, pos, color=PASSIVE_COLOR)
 
-                # passive_0 is now NOT the articulation root, just a regular link
                 if i >= 1:
                     # passive_1 onwards: revolute joints connecting to previous link
                     # Connect at -X end of previous link to +X end of current link
@@ -192,24 +205,24 @@ class RobotEndoscopeChain(BaseRobot):
 
                 prev_link_path = link_path
 
-            # Create prismatic joint connecting world_anchor to passive_0 (tip)
-            # This allows passive_0 to slide along Z-axis (up/down) while X/Y are fixed
-            tip_link_path = f"{env_path}/passive_0"
+            # Create prismatic joint connecting world_anchor to passive_19 (proximal link)
+            # This allows translation along X-axis (forward/back) at the proximal end
+            proximal_link_path = f"{env_path}/passive_{proximal_link_idx}"
             self._create_prismatic_joint(
                 stage=stage,
-                joint_name="world_prismatic_joint",
+                joint_name="proximal_prismatic_joint",
                 body0_path=world_anchor_path,
-                body1_path=tip_link_path,
+                body1_path=proximal_link_path,
                 local_pos0=Gf.Vec3f(0, 0, 0),  # Center of anchor
-                local_pos1=Gf.Vec3f(link_height / 2, 0, 0),  # +X end of passive_0 (center of tip)
-                axis="Z",  # Allow sliding along Z-axis (up/down)
-                stiffness=1e3,
-                damping=1e3,
+                local_pos1=Gf.Vec3f(-link_height / 2, 0, 0),  # -X end of proximal link (passive_19)
+                axis="X",  # Allow sliding along X-axis (forward/back)
+                stiffness=0.0,   # No position stiffness for velocity control
+                damping=1e4,     # High damping to respond to velocity targets
                 target_pos=0.0
             )
 
             # --- Structure ---
-            # world_anchor (root, fixed in X/Y) → (prismatic Z) → passive_0 (tip with camera, X/Y fixed) → passive_1 → ... → passive_19 (free end)
+            # world_anchor (root, fixed) → (prismatic X) → passive_19 (proximal) → ... → passive_0 (distal tip with camera)
 
             # --- Create a hollow tube around the robot for this env ---
             # tube_path = f"{env_path}/Tube"
@@ -335,6 +348,7 @@ class RobotEndoscopeChain(BaseRobot):
         drive = UsdPhysics.DriveAPI.Apply(joint.GetPrim(), "linear")
         drive.CreateTypeAttr().Set("force")
         drive.CreateTargetPositionAttr().Set(target_pos)
+        drive.CreateTargetVelocityAttr().Set(0.0)  # Add velocity target attribute
         drive.CreateStiffnessAttr().Set(stiffness)
         drive.CreateDampingAttr().Set(damping)
         drive.CreateMaxForceAttr().Set(1e4)
@@ -583,8 +597,8 @@ class RobotEndoscopeChain(BaseRobot):
             action_scale: Scaling factor for actions
             **kwargs: Additional parameters for compatibility (e.g., center_alignment passed from env)
 
-        Structure: world_anchor (root) → (prismatic Z) → passive_19 → ... → passive_0 (tip with camera)
-        All commands are interpreted in the current tip frame and applied as a root pose increment.
+        Structure: world_anchor (root) → (prismatic X) → passive_19 (proximal) → ... → passive_0 (distal tip with camera)
+        All commands are interpreted in the current distal tip frame and applied as a root pose increment.
         """
         if not self._is_initialized:
             logging.warning("Cannot apply action - robot not initialized yet")
@@ -603,27 +617,47 @@ class RobotEndoscopeChain(BaseRobot):
         current_root_state = self.robot.data.root_state_w.clone()
         root_pos = current_root_state[:, :3]
         root_quat = current_root_state[:, 3:7]
+
+        # Get body states - shape: (num_envs, num_bodies, 13)
+        # where 13 = pos(3) + quat(4) + lin_vel(3) + ang_vel(3)
         body_state = self.robot.data.body_state_w
 
-        if not hasattr(self, "_distal_body_idx"):
+        # Find the correct body indices by name
+        # The body order in IsaacLab may not match creation order
+        body_names = self.robot.body_names
+
+        # Debug: print body names on first call
+        if not hasattr(self, '_body_names_printed'):
+            logging.info(f"Robot body names: {body_names}")
+            self._body_names_printed = True
+
+        # Find distal tip (passive_0) index and cache it.
+        if not hasattr(self, '_distal_body_idx'):
             self._distal_body_idx = None
-            for i, name in enumerate(self.robot.body_names):
+
+            for i, name in enumerate(body_names):
                 if name.endswith("passive_0") or "/passive_0" in name:
                     self._distal_body_idx = i
-                    break
+
             logging.info(f"Body index lookup - distal (passive_0): {self._distal_body_idx}")
 
+        # Get orientations from body states
         try:
-            tip_quat = body_state[:, self._distal_body_idx, 3:7] if self._distal_body_idx is not None else root_quat
+            if self._distal_body_idx is not None:
+                distal_quat = body_state[:, self._distal_body_idx, 3:7]  # (num_envs, 4)
+            else:
+                logging.warning("Distal body index not found, using root_quat")
+                distal_quat = root_quat
         except (IndexError, RuntimeError) as e:
-            logging.warning(f"Error getting distal body state: {e}, using root_quat")
-            tip_quat = root_quat
+            # Fallback to root orientation if body states not available
+            logging.warning(f"Error getting body states: {e}, using root_quat")
+            distal_quat = root_quat
 
         local_translation = torch.stack([delta_fb, delta_lr, delta_ud], dim=1)
-        world_translation = quat_apply(tip_quat, local_translation)
+        world_translation = quat_apply(distal_quat, local_translation)
 
         local_rotvec = torch.stack([delta_roll, delta_pitch, delta_yaw], dim=1)
-        world_rotvec = quat_apply(tip_quat, local_rotvec)
+        world_rotvec = quat_apply(distal_quat, local_rotvec)
         world_angle = torch.linalg.norm(world_rotvec, dim=1)
         fallback_axis = torch.zeros_like(world_rotvec)
         fallback_axis[:, 0] = 1.0
@@ -956,11 +990,10 @@ class RobotEndoscopeChain(BaseRobot):
         # Write joint state to simulation first
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
 
-        # For the anchored magnetic endoscope, the articulation root is `world_anchor`
-        # rather than the first visible link. PhysX does not always propagate the just-
-        # written root pose through the whole chain before the first post-reset frame,
-        # so explicitly place the bodies using FK that matches the authored joint graph.
-        self._reset_link_states_directly(env_ids, joint_pos, root_state=root_state)
+        # Do not overwrite per-body poses here. This robot's articulation root is
+        # `world_anchor`, so the manual FK path does not match the actual
+        # world_anchor -> prismatic -> passive chain and can erase the configured
+        # root orientation. Let the articulation state we just wrote define the reset.
 
         # Mark as initialized after first reset
         if not self._is_initialized:
@@ -973,13 +1006,11 @@ class RobotEndoscopeChain(BaseRobot):
         joint_positions: torch.Tensor,
         root_state: Optional[torch.Tensor] = None,
     ) -> None:
-        """Directly set each body state in simulation based on joint configuration.
+        """Directly set each link's state in simulation based on joint configuration.
 
-        This robot is authored as:
-        world_anchor -> (prismatic Z) -> passive_0 -> passive_1 -> ... -> passive_N
-
-        The articulation root state corresponds to `world_anchor`, not `passive_0`, so we
-        compute body poses against that actual structure before writing them to PhysX.
+        This method computes each link's position and orientation using forward kinematics,
+        then directly writes these poses to the PhysX simulation, bypassing joint constraints.
+        This ensures links are immediately positioned correctly without waiting for physics settling.
 
         Args:
             env_ids: Environment indices to reset.
@@ -987,6 +1018,7 @@ class RobotEndoscopeChain(BaseRobot):
         """
         from isaaclab.utils import math as math_utils
 
+        link_radius = self.config["robot_config"].get("link_radius", 0.01)
         link_height = self.config["robot_config"].get("link_height", 0.05)
 
         # Get the root state for calculating relative link positions.
@@ -996,9 +1028,9 @@ class RobotEndoscopeChain(BaseRobot):
         root_pos = root_state[:, :3]  # (len(env_ids), 3)
         root_quat = root_state[:, 3:7]  # (len(env_ids), 4) - (w, x, y, z)
 
-        # Compute all body poses using forward kinematics that matches the authored USD.
+        # Compute all link poses using forward kinematics
         link_poses = self._compute_forward_kinematics(
-            root_pos, root_quat, joint_positions, link_height
+            root_pos, root_quat, joint_positions, link_height, link_radius
         )
 
         # Access the PhysX view to directly set body transforms
@@ -1084,83 +1116,86 @@ class RobotEndoscopeChain(BaseRobot):
         root_quat: torch.Tensor,
         joint_positions: torch.Tensor,
         link_height: float,
+        link_radius: float,
     ) -> torch.Tensor:
-        """Compute forward kinematics for the authored anchored magnetic endoscope.
+        """Compute forward kinematics to get link poses from joint positions.
+
+        This computes the world position and orientation of each link based on the
+        kinematic chain and joint angles.
 
         Args:
-            root_pos: `world_anchor` positions. Shape: (num_envs, 3)
-            root_quat: `world_anchor` orientations (w,x,y,z). Shape: (num_envs, 4)
-            joint_positions: Joint states. Shape: (num_envs, num_joints)
+            root_pos: Root link positions. Shape: (num_envs, 3)
+            root_quat: Root link orientations (w,x,y,z). Shape: (num_envs, 4)
+            joint_positions: Joint angles. Shape: (num_envs, num_joints)
             link_height: Length of each link
+            link_radius: Radius of each link
 
         Returns:
-            Body poses (position + quaternion) for all articulation bodies in body-name order.
-            Shape: (num_envs, num_bodies, 7)
+            Link poses (position + quaternion) for all links. Shape: (num_envs, num_bodies, 7)
         """
         from isaaclab.utils import math as math_utils
 
         num_envs = len(root_pos)
         num_bodies = self.robot.num_bodies
+
+        # Initialize output: (num_envs, num_bodies, 7) where 7 = [pos(3), quat(4)]
         link_poses = torch.zeros((num_envs, num_bodies, 7), device=self.device)
 
-        body_names = getattr(self.robot, "body_names", [])
-        body_name_to_index = {}
-        for idx, name in enumerate(body_names):
-            if name.endswith("world_anchor") or "/world_anchor" in name:
-                body_name_to_index["world_anchor"] = idx
-            for passive_idx in range(self.config["robot_config"].get("num_links_total", 20)):
-                key = f"passive_{passive_idx}"
-                if name.endswith(key) or f"/{key}" in name:
-                    body_name_to_index[key] = idx
+        # Link 0 (passive_0) is the root - its pose is the root pose
+        link_poses[:, 0, :3] = root_pos
+        link_poses[:, 0, 3:7] = root_quat
 
-        if "world_anchor" not in body_name_to_index:
-            body_name_to_index["world_anchor"] = 0
+        # For subsequent links, compute pose based on previous link and joint angle
+        # Joint i connects link i-1 to link i
+        for link_idx in range(1, num_bodies):
+            joint_idx = link_idx - 1  # Joint index (joint_1 connects passive_0 to passive_1)
 
-        # Root body pose: world_anchor.
-        anchor_idx = body_name_to_index["world_anchor"]
-        link_poses[:, anchor_idx, :3] = root_pos
-        link_poses[:, anchor_idx, 3:7] = root_quat
+            # Get previous link's pose
+            prev_pos = link_poses[:, link_idx - 1, :3]
+            prev_quat = link_poses[:, link_idx - 1, 3:7]
 
-        num_passive = self.config["robot_config"].get("num_links_total", 20)
+            # Joint rotation axis alternates between Y and Z
+            # passive_1 (joint_idx=0) uses Z, passive_2 (joint_idx=1) uses Y, etc.
+            if joint_idx % 2 == 0:
+                axis = "Z"
+            else:
+                axis = "Y"
 
-        # passive_0 is connected to world_anchor by a prismatic joint whose axis is local Z.
-        prismatic_disp = joint_positions[:, self.prismatic_joint_index]
-        local_passive0_offset = torch.zeros((num_envs, 3), device=self.device)
-        local_passive0_offset[:, 0] = -link_height / 2
-        local_passive0_offset[:, 2] = prismatic_disp
+            # Get joint angle for this joint
+            joint_angle = joint_positions[:, joint_idx]  # (num_envs,)
 
-        passive0_pos = root_pos + quat_apply(root_quat, local_passive0_offset)
-        passive0_quat = root_quat
+            # Create rotation quaternion for the joint angle
+            if axis == "Z":
+                # Rotation around Z axis
+                axis_vec = torch.tensor([0.0, 0.0, 1.0], device=self.device)
+            else:  # axis == "Y"
+                # Rotation around Y axis
+                axis_vec = torch.tensor([0.0, 1.0, 0.0], device=self.device)
 
-        passive0_idx = body_name_to_index.get("passive_0", 1 if num_bodies > 1 else 0)
-        link_poses[:, passive0_idx, :3] = passive0_pos
-        link_poses[:, passive0_idx, 3:7] = passive0_quat
+            # Create quaternion from axis-angle
+            joint_quat = math_utils.quat_from_angle_axis(joint_angle, axis_vec.repeat(num_envs, 1))
 
-        prev_pos = passive0_pos
-        prev_quat = passive0_quat
+            # Local offset from previous link center to joint (at -X end of previous link)
+            local_offset_to_joint = torch.zeros((num_envs, 3), device=self.device)
+            local_offset_to_joint[:, 0] = -link_height / 2  # Joint at -X end
 
-        axis_z = torch.tensor([0.0, 0.0, 1.0], device=self.device).repeat(num_envs, 1)
-        axis_y = torch.tensor([0.0, 1.0, 0.0], device=self.device).repeat(num_envs, 1)
-        local_prev_joint_offset = torch.zeros((num_envs, 3), device=self.device)
-        local_prev_joint_offset[:, 0] = -link_height / 2
-        local_child_center_from_joint = torch.zeros((num_envs, 3), device=self.device)
-        local_child_center_from_joint[:, 0] = -link_height / 2
+            # Transform to world frame
+            world_offset_to_joint = quat_apply(prev_quat, local_offset_to_joint)
+            joint_pos = prev_pos + world_offset_to_joint
 
-        for passive_idx in range(1, num_passive):
-            joint_angle = joint_positions[:, passive_idx - 1]
-            joint_axis = axis_z if passive_idx % 2 == 1 else axis_y
-            joint_quat = math_utils.quat_from_angle_axis(joint_angle, joint_axis)
-
-            joint_world_pos = prev_pos + quat_apply(prev_quat, local_prev_joint_offset)
+            # Current link orientation = previous orientation * joint rotation
             current_quat = math_utils.quat_mul(prev_quat, joint_quat)
-            current_pos = joint_world_pos + quat_apply(current_quat, local_child_center_from_joint)
 
-            body_idx = body_name_to_index.get(f"passive_{passive_idx}")
-            if body_idx is not None:
-                link_poses[:, body_idx, :3] = current_pos
-                link_poses[:, body_idx, 3:7] = current_quat
+            # Local offset from joint to current link center (at +X end of current link in local frame)
+            local_offset_to_center = torch.zeros((num_envs, 3), device=self.device)
+            local_offset_to_center[:, 0] = link_height / 2  # Link center at +X/2 from joint
 
-            prev_pos = current_pos
-            prev_quat = current_quat
+            # Transform to world frame using current orientation
+            world_offset_to_center = quat_apply(current_quat, local_offset_to_center)
+            current_pos = joint_pos + world_offset_to_center
+
+            # Store link pose
+            link_poses[:, link_idx, :3] = current_pos
+            link_poses[:, link_idx, 3:7] = current_quat
 
         return link_poses

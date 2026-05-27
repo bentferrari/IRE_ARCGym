@@ -16,13 +16,15 @@ import arcgym.utils.colon_utils as colon_utils
 
 
 model_folder = os.path.dirname(__file__)
-model_full_path = os.path.join(model_folder, "noncollapsed_0000_origincollid.usd")
+#model_full_path = os.path.join(model_folder, "noncollapsed_0000_origincollid.usd")
 # Rotation to lay colon horizontally
 FLAT_ROTATION_Y = (0.7071068, 0, 0.7071068, 0)  # 90° rotation around Y-axis
 
-#obj_model_full_path = os.path.join(model_folder, "noncollapsed_0000_shell.obj")
-#obj_model_full_path = os.path.join(model_folder, "shell_hole_0000.stl")
-obj_model_full_path = os.path.join(model_folder, "outputconv_shell_hole_0000.obj")
+obj_model_full_path = os.path.join(model_folder, "outputconv_shell_hole_0000.obj") #colon1
+#obj_model_full_path = os.path.join(model_folder, "conv_shell_hole_0000_IJK_1000_600_600_3mmthick_hole2.obj") #colon2
+#obj_model_full_path = os.path.join(model_folder, "conv_shell_hole_0002_IJK_1000_600_600_3mmthick_hole2.obj") #colon3
+#obj_model_full_path = os.path.join(model_folder, "conv_shell_hole_0003_IJK_1000_600_600_3mmthick_hole2.obj") #colon4
+#obj_model_full_path = os.path.join(model_folder, "conv_shell_hole_0006_IJK_1000_600_600_3mmthick_hole2.obj") #colon5
 #shader_full_path = os.path.join(model_folder, "materials/colon_surface_material_realistic.usd")  # Use realistic material
 shader_full_path = os.path.join(model_folder, "materials/colon_surface_material.usd")  # Original material
 
@@ -216,11 +218,34 @@ class ColonModel:
         self.init_pos = init_pos
         self.init_rot = init_rot
         self._env_translation = None
+        self._base_default_nodal_state_w = None
 
         # Get attachment configuration from env_config
         self.use_txt_files_for_attachments = cfg1.get("env_config", {}).get("use_txt_files_for_attachments", True)
 
         self._setup()
+
+    def _quat_to_rot_matrix(self, quat, device):
+        """Convert a (w, x, y, z) quaternion to a 3x3 rotation matrix."""
+        quat_t = torch.tensor(quat, dtype=torch.float32, device=device)
+        quat_t = quat_t / torch.linalg.norm(quat_t)
+        w, x, y, z = quat_t
+
+        return torch.tensor([
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ], dtype=torch.float32, device=device)
+
+    def _get_rotated_default_nodal_state(self, env_ids: torch.Tensor) -> torch.Tensor:
+        """Return default nodal state for the given environments.
+
+        The rotation is already baked into the mesh vertices by the spawner (isaac_mesh.py)
+        via InitialStateCfg.rot — PhysX FEM ignores Xform orientation for deformable bodies,
+        so the spawner applies the rotation directly to vertices before creating the prim.
+        No additional rotation is applied here to avoid double-rotation.
+        """
+        return self.colon_body._data.default_nodal_state_w[env_ids].clone()
 
     def _setup(self):
         robot_type = self.robot_config.get("robot_type", None)
@@ -492,7 +517,7 @@ class ColonModel:
                                         [-1.0, 0.0, 0.0]
                                         ]).to(device)
         else:
-            entry_pos = torch.tensor([0.643, 1.119, -2.017]).to(device)
+            entry_pos = torch.tensor([5.6204, -1.3774, -1.8750]).to(device)
             delta_trans = torch.tensor([[0.0, 0.0, 0.0],
                                         [0.0, 5, 0.0],
                                         [-5, 0.0, 0.0],
@@ -574,8 +599,9 @@ class ColonModel:
         """
         if self.is_rigid:
             # For rigid body, use body state
-            # This might not give us individual vertices, so we use the body position
-            body_pos = self.colon_body.data.body_state_w[env_id, :3]
+            # body_state_w shape: (num_envs, num_bodies, 13) where 13 = pos(3) + quat(4) + lin_vel(3) + ang_vel(3)
+            # Since colon is a single body, we take index 0 for the body dimension
+            body_pos = self.colon_body.data.body_state_w[env_id, 0, :3]
             return body_pos
         else:
             # For deformable body, get all nodal positions
@@ -595,7 +621,7 @@ class ColonModel:
             env_id: Environment index to query. Default is 0.
         """
         lowest_pos = self.get_lowest_position(env_id)
-        print(f"Colon lowest position (env {env_id}): x={lowest_pos[0]:.4f}, y={lowest_pos[1]:.4f}, z={lowest_pos[2]:.4f}")
+        print(f"Colon lowest position (env {env_id}): x={lowest_pos[0].item():.4f}, y={lowest_pos[1].item():.4f}, z={lowest_pos[2].item():.4f}")
         return lowest_pos
 
     def get_all_lowest_positions(self) -> torch.Tensor:
@@ -606,7 +632,9 @@ class ColonModel:
         """
         if self.is_rigid:
             # For rigid body
-            return self.colon_body.data.body_state_w[:, :3]
+            # body_state_w shape: (num_envs, num_bodies, 13) where 13 = pos(3) + quat(4) + lin_vel(3) + ang_vel(3)
+            # Since colon is a single body, we take index 0 for the body dimension
+            return self.colon_body.data.body_state_w[:, 0, :3]
         else:
             # For deformable body
             num_envs = self.colon_body.data.nodal_state_w.shape[0]
@@ -626,7 +654,7 @@ class ColonModel:
         print("All colons' lowest positions:")
         for env_id in range(lowest_positions.shape[0]):
             pos = lowest_positions[env_id]
-            print(f"  Env {env_id}: x={pos[0]:.4f}, y={pos[1]:.4f}, z={pos[2]:.4f}")
+            print(f"  Env {env_id}: x={pos[0].item():.4f}, y={pos[1].item():.4f}, z={pos[2].item():.4f}")
         return lowest_positions
 
     def reset(self, env_ids: torch.Tensor = None):
@@ -640,12 +668,12 @@ class ColonModel:
         # For deformable bodies, explicitly restore nodal state to default
         # This ensures blown-away colons return to their original position
         if not self.is_rigid:
-            # Get the default nodal state (position and velocity)
-            default_nodal_state = self.colon_body._data.default_nodal_state_w.clone()
+            # Get the default nodal state — rotation is already baked into vertices at spawn time
+            default_nodal_state = self._get_rotated_default_nodal_state(env_ids)
 
             # Check if any colons have been "blown away" (nodes moved too far from default)
             current_nodal_pos = self.colon_body._data.nodal_state_w[env_ids, :, :3]  # Positions only
-            default_nodal_pos = default_nodal_state[env_ids, :, :3]
+            default_nodal_pos = default_nodal_state[:, :, :3]
 
             # Calculate max displacement per environment
             displacement = torch.norm(current_nodal_pos - default_nodal_pos, dim=2)  # (num_envs, num_nodes)
@@ -664,7 +692,7 @@ class ColonModel:
 
             # Write the default state back to the specified environments
             # This includes both position ([:3]) and velocity ([:3:6])
-            self.colon_body._data.nodal_state_w[env_ids] = default_nodal_state[env_ids]
+            self.colon_body._data.nodal_state_w[env_ids] = default_nodal_state
 
             # Write the nodal state to simulation
             self.colon_body.write_nodal_state_to_sim(self.colon_body._data.nodal_state_w[env_ids], env_ids)

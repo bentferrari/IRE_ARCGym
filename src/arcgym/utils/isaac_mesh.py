@@ -46,6 +46,16 @@ def spawn_from_mesh_file(
     """
     # load the mesh from file
     mesh = trimesh.load_mesh(cfg.file_path)
+
+    # For deformable bodies, PhysX FEM ignores the parent Xform's orientation when
+    # initialising the simulation mesh. Bake the rotation into the vertices directly.
+    if cfg.deformable_props is not None and orientation is not None:
+        import numpy as np
+        w, x, y, z = orientation
+        rot_matrix = trimesh.transformations.quaternion_matrix([w, x, y, z])
+        mesh.apply_transform(rot_matrix)
+        orientation = None  # already baked in — don't double-apply via Xform
+
     # spawn geometry if it doesn't exist.
     if not prim_utils.is_prim_path_valid(prim_path):
         prim_utils.create_prim(prim_path, prim_type="Xform", translation=translation, orientation=orientation)
@@ -91,9 +101,9 @@ def spawn_from_mesh_file(
         # apply deformable body properties
         schemas.define_deformable_body_properties(mesh_prim_path, cfg.deformable_props)
     elif cfg.collision_props is not None:
-        collision_approximation = "convexHull"
+        collision_approximation = "meshSimplification"
         # apply collision approximation to mesh
-        # note: for primitives, we use the convex hull approximation -- this should be sufficient for most cases.
+        # note: using meshSimplification to allow entry into hollow objects like the colon tube.
         mesh_collision_api = UsdPhysics.MeshCollisionAPI.Apply(mesh_prim)
         mesh_collision_api.GetApproximationAttr().Set(collision_approximation)
         # apply collision properties

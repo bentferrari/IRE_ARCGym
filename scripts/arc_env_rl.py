@@ -3,19 +3,207 @@ from datetime import datetime
 import logging
 import os
 import pdb
+import json
+import random
+import subprocess
+import sys
+import faulthandler
+import numpy as np
 
 from sane_rich_logging import setup_logging
 
 setup_logging()
+faulthandler.enable(all_threads=True)
+
+ABLATION_REWARD_RUNS = [
+    ("center_only", False),
+    ("depth_existence", False),
+    ("deep_area", False),
+    ("lumen_evidence", False),
+    ("full_reward", False),
+    ("full_reward", True),
+]
+
+
+def _strip_controlled_cli_args(argv, value_options, flag_options):
+    """Remove options controlled by the ablation launcher before spawning child runs."""
+    stripped = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        option = arg.split("=", 1)[0]
+        if option in value_options:
+            index += 1 if "=" in arg else 2
+            continue
+        if option in flag_options:
+            index += 1
+            continue
+        stripped.append(arg)
+        index += 1
+    return stripped
+
+
+def _run_reward_ablation_launcher_if_requested():
+    """
+    Launch reward ablations before importing Isaac/Kit.
+
+    Keeping the parent process free of Isaac native modules avoids brittle
+    repeated Kit initialization when the launcher starts six child trainings.
+    """
+    early_parser = argparse.ArgumentParser(add_help=False)
+    early_parser.add_argument("--ablation_t1", action="store_true")
+    early_parser.add_argument("--ablation_t2", action="store_true")
+    early_parser.add_argument("--ablation_t3", action="store_true")
+    early_parser.add_argument("--ablation_t4", action="store_true")
+    early_parser.add_argument("--ablation_episodes", type=int, default=300)
+    early_parser.add_argument("--colon_id", type=str, default="c1")
+    early_args, _ = early_parser.parse_known_args()
+
+    ablation_tasks = [
+        ("t1", early_args.ablation_t1),
+        ("t2", early_args.ablation_t2),
+        ("t3", early_args.ablation_t3),
+        ("t4", early_args.ablation_t4),
+    ]
+    selected_tasks = [task_id for task_id, enabled in ablation_tasks if enabled]
+    if not selected_tasks:
+        return
+    if len(selected_tasks) > 1:
+        raise SystemExit("Use only one of --ablation_t1, --ablation_t2, --ablation_t3, or --ablation_t4")
+
+    value_options = {
+        "--ablation_episodes",
+        "--stop_after_episodes",
+        "--model_path",
+        "--reward_variant",
+        "--colon_id",
+        "--task_id",
+    }
+    flag_options = {
+        "--ablation_t1",
+        "--ablation_t2",
+        "--ablation_t3",
+        "--ablation_t4",
+        "--train",
+        "--test",
+        "--continual_training",
+        "--data_sampling",
+        "--clip_actions",
+        "--no-clip_actions",
+    }
+    base_child_args = _strip_controlled_cli_args(sys.argv[1:], value_options, flag_options)
+    selected_task_id = selected_tasks[0]
+
+    for run_index, (variant, constrained) in enumerate(ABLATION_REWARD_RUNS, start=1):
+        child_cmd = [
+            sys.executable,
+            os.path.abspath(__file__),
+            *base_child_args,
+            "--train",
+            "--colon_id",
+            early_args.colon_id,
+            "--task_id",
+            selected_task_id,
+            "--reward_variant",
+            variant,
+            "--stop_after_episodes",
+            str(early_args.ablation_episodes),
+        ]
+        if constrained:
+            child_cmd.append("--clip_actions")
+            label = "constrained_full_reward"
+        else:
+            child_cmd.append("--no-clip_actions")
+            label = variant
+
+        logging.info(
+            "Reward ablation %s/%s for %s: %s",
+            run_index,
+            len(ABLATION_REWARD_RUNS),
+            selected_task_id,
+            label,
+        )
+        logging.info("Command: %s", " ".join(child_cmd))
+        completed = subprocess.run(child_cmd)
+        if completed.returncode != 0:
+            logging.error(
+                "Reward ablation run failed for task=%s variant=%s constrained=%s with exit code %s",
+                selected_task_id,
+                variant,
+                constrained,
+                completed.returncode,
+            )
+            sys.exit(completed.returncode)
+
+    logging.info(
+        "Completed reward ablation sequence for colon=%s task=%s, %s episodes per run",
+        early_args.colon_id,
+        selected_task_id,
+        early_args.ablation_episodes,
+    )
+    sys.exit(0)
+
+
+_run_reward_ablation_launcher_if_requested()
 
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Create an application to launch ARC environment")
 parser.add_argument("--train", action="store_true", help="Run in training mode")
+parser.add_argument("--test", action="store_true", help="Run in test mode (load and evaluate a trained model)")
+parser.add_argument("--continual_training", action="store_true",
+                    help="Continue training from a pre-trained model (for transfer learning to other colons)")
+parser.add_argument("--data_sampling", action="store_true",
+                    help="Run autonomous data-sampling mode with random actions projected into the constrained action space")
+parser.add_argument("--model_path", type=str, default=None,
+                    help="Path to the trained model to load for testing or continual training (e.g., ./models/ppo_arc_20260118_173006/ppo_arc_checkpoint_20260118_173006_2050000_steps.zip)")
+parser.add_argument("--test_episodes", type=int, default=1, help="Number of episodes to run in test mode")
 parser.add_argument("--benchmark", action="store_true", help="benchmark a couple of steps using viztracer")
 parser.add_argument("--num_envs", type=int, default=2, help="Number of parallel environments")
 parser.add_argument("--clip_actions", action=argparse.BooleanOptionalAction, default=None,
                     help="Enable action constraints (clipping/projection/masks)")
+parser.add_argument("--algo", type=str, default="PPO", choices=["PPO", "SAC", "TD3", "A2C", "DDPG"],
+                    help="RL algorithm to use (default: PPO)")
+parser.add_argument("--reward_variant", type=str, default=None,
+                    choices=["center_only", "depth_existence", "deep_area", "lumen_evidence", "full_reward"],
+                    help="Reward ablation variant. Omit to preserve the legacy full reward behavior.")
+parser.add_argument("--reward_wc", type=float, default=0.5,
+                    help="Center-alignment weight for full_reward ablations")
+parser.add_argument("--reward_wo", type=float, default=0.5,
+                    help="Lumen-visibility weight for full_reward ablations")
+parser.add_argument("--reward_lambda_o", type=float, default=1.0,
+                    help="Obstacle/lumen cue multiplier for partial reward ablations")
+parser.add_argument("--reward_beta", type=float, default=0.6,
+                    help="Weight on s_1 in lumen evidence and full lumen visibility")
+parser.add_argument("--train_with_normalized_reward", action="store_true",
+                    help="Use normalized reward for policy training instead of only logging it")
+parser.add_argument("--seed", type=int, default=0, help="Random seed recorded with the run")
+parser.add_argument("--colon_id", type=str, default="c1",
+                    help="Colon id metadata. Also selects saved_states/{colon_id}{task_id}_start.csv and _end.csv when present.")
+parser.add_argument("--task_id", type=str, default="t1",
+                    help="Task id metadata. Also selects saved_states/{colon_id}{task_id}_start.csv and _end.csv when present.")
+parser.add_argument("--eval_after_train", action="store_true",
+                    help="Run deterministic evaluation after training and write evaluation_metrics.json")
+parser.add_argument("--total_timesteps", type=float, default=1e7,
+                    help="Total SB3 training timesteps")
+parser.add_argument("--ablation_t1", action="store_true",
+                    help="Run the six reward-ablation trainings for task 1, stopping each after 300 completed episodes")
+parser.add_argument("--ablation_t2", action="store_true",
+                    help="Run the six reward-ablation trainings for task 2, stopping each after 300 completed episodes")
+parser.add_argument("--ablation_t3", action="store_true",
+                    help="Run the six reward-ablation trainings for task 3, stopping each after 300 completed episodes")
+parser.add_argument("--ablation_t4", action="store_true",
+                    help="Run the six reward-ablation trainings for task 4, stopping each after 300 completed episodes")
+parser.add_argument("--ablation_episodes", type=int, default=300,
+                    help="Number of completed episodes to train each reward variant in --ablation_t* mode")
+parser.add_argument("--stop_after_episodes", type=int, default=None,
+                    help="Stop a training run after this many completed episodes across all environments")
+parser.add_argument("--disable_video", action="store_true",
+                    help="Disable RecordVideo output during training/evaluation")
+parser.add_argument("--trajectory_save_interval", type=int, default=1,
+                    help="Save trajectory metadata every N completed episodes per environment")
+parser.add_argument("--save_trajectory_images", action=argparse.BooleanOptionalAction, default=True,
+                    help="Save per-frame camera PNGs in trajectory_data")
 
 # Append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -23,7 +211,58 @@ AppLauncher.add_app_launcher_args(parser)
 # Parse the arguments
 args_cli = parser.parse_args()
 if args_cli.clip_actions is None:
-    args_cli.clip_actions = args_cli.train
+    args_cli.clip_actions = args_cli.train or args_cli.test or args_cli.continual_training or args_cli.data_sampling
+
+active_modes = sum([args_cli.train, args_cli.test, args_cli.continual_training, args_cli.data_sampling])
+if active_modes > 1:
+    parser.error("Only one of --train, --test, --continual_training, or --data_sampling can be enabled at a time")
+
+# Validate test mode arguments
+if args_cli.test and args_cli.model_path is None:
+    parser.error("--model_path is required when using --test mode")
+
+# Validate continual training mode arguments
+if args_cli.continual_training and args_cli.model_path is None:
+    parser.error("--model_path is required when using --continual_training mode")
+
+random.seed(args_cli.seed)
+np.random.seed(args_cli.seed)
+
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+algo_name = args_cli.algo.lower()
+reward_variant_label = args_cli.reward_variant or "legacy_full_reward"
+constraint_label = "constrained" if args_cli.clip_actions else "nonconstrained"
+run_name = (
+    f"{algo_name}_{reward_variant_label}_{constraint_label}_"
+    f"colon-{args_cli.colon_id}_task-{args_cli.task_id}_seed-{args_cli.seed}_{timestamp}"
+)
+result_dir = os.path.join("./reward_ablation_results", run_name)
+log_dir = os.path.join(result_dir, "logs")
+tensorboard_log = os.path.join(result_dir, "tensorboard")
+model_save_path = os.path.join(result_dir, "checkpoints")
+video_save_path = os.path.join(tensorboard_log, "videos", "train")
+trajectory_save_path = os.path.join(result_dir, "trajectory_data")
+
+os.makedirs(log_dir, exist_ok=True)
+os.makedirs(tensorboard_log, exist_ok=True)
+os.makedirs(model_save_path, exist_ok=True)
+os.makedirs(trajectory_save_path, exist_ok=True)
+
+with open(os.path.join(result_dir, "prelaunch_status.json"), "w") as f:
+    json.dump(
+        {
+            "status": "created_before_isaac_app_launch",
+            "command": sys.argv,
+            "colon_id": args_cli.colon_id,
+            "task_id": args_cli.task_id,
+            "reward_variant": reward_variant_label,
+            "constrained": bool(args_cli.clip_actions),
+            "seed": args_cli.seed,
+            "timestamp": timestamp,
+        },
+        f,
+        indent=2,
+    )
 
 # Enable cameras (needed for camera sensors)
 args_cli.enable_cameras = True
@@ -35,11 +274,19 @@ simulation_app = app_launcher.app
 
 import gymnasium as gym
 
-from stable_baselines3 import PPO, DQN, SAC
+from stable_baselines3 import PPO, DQN, SAC, TD3, A2C, DDPG
 from stable_baselines3.common.callbacks import CheckpointCallback, LogEveryNTimesteps
 from stable_baselines3.common.vec_env import VecNormalize
 
-from arcgym.utils.callbacks import PerEnvRewardCallback, TrajectoryDataSaver, SuccessRateDataSaver
+from arcgym.utils.callbacks import (
+    FreezeLearningUntilAllEnvsNEpisodesCallback,
+    PerEnvRewardCallback,
+    RewardAblationMetricsCallback,
+    TrajectoryDataSaver,
+    SuccessRateDataSaver,
+    StopAfterAllEnvsNEpisodesCallback,
+    StopAfterTotalEpisodesCallback,
+)
 
 from isaaclab.envs import (
     DirectRLEnvCfg,
@@ -69,18 +316,6 @@ if args_cli.benchmark:
 else:
     tracer = None
 
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-log_dir = f"./logs/ppo_arc_{timestamp}/"
-tensorboard_log = f"./tensorboard_logs/ppo_arc_{timestamp}/"
-model_save_path = f"./models/ppo_arc_{timestamp}/"
-video_save_path = os.path.join(tensorboard_log, "videos", "train")
-trajectory_save_path = f"./trajectory_data/ppo_arc_{timestamp}/"
-
-os.makedirs(log_dir, exist_ok=True)
-os.makedirs(tensorboard_log, exist_ok=True)
-os.makedirs(model_save_path, exist_ok=True)
-os.makedirs(trajectory_save_path, exist_ok=True)
-
 register(
     id="ArcIsaacEnv-v0",
     entry_point="arcgym.envs.arc_isaac_env:ARCIsaacEnv",
@@ -94,13 +329,13 @@ use_camera = True
 device = args_cli.device
 
 learning_config = {
-    "total_timesteps": 1e7,
+    "total_timesteps": args_cli.total_timesteps,
     "learning_rate" : 1e-4,
     "batch_size" : 1024,
     "verbose" : True,
 }
 robot_config = {
-    "robot_type" : "magnetic_endoscope", # "capsule" or "soft_endoscope" or "magnetic_endoscope"
+    "robot_type" : "magnetic_endoscope", # "capsule" or "soft_endoscope" or "magnetic_endoscope" or "proximal_actuated"
     # Capsule config 
     "capsule_radius" : 0.004,
     "capsule_height" : 0.012,
@@ -109,15 +344,15 @@ robot_config = {
     # Soft endoscope specific parameters (from original soft_endoscope.py)
     "num_passive_links" : 25,
     "num_active_links" : 5,
-    "num_links_total" : 15,
+    "num_links_total" : 1,
     "link_radius" : 0.01,
     "link_height" : 0.02,
-    "passive_stiffness" : 1e1,
-    "passive_damping" : 1e2,
+    "passive_stiffness" : 1,
+    "passive_damping" : 1,
     "active_stiffness" : 1e1,
     "active_damping" : 1e2,
-    "max_linear_velocity": 1,
-    "max_angular_velocity": 1,
+    "max_linear_velocity": 10,
+    "max_angular_velocity": 10,
     #"link_density" : 0.1,
     # Camera and light configuration
     "camera_resolution" : (84, 84),
@@ -140,6 +375,22 @@ if robot_config["robot_type"] == "capsule":
 else:
     env_spacing = 5
 
+task_startpose_csv = f"./saved_states/{args_cli.colon_id}{args_cli.task_id}_start.csv"
+if not os.path.exists(task_startpose_csv):
+    logging.warning(
+        "Requested colon/task start-pose CSV does not exist: %s. Falling back to ./saved_states/c1t1_start.csv",
+        task_startpose_csv,
+    )
+    task_startpose_csv = "./saved_states/c1t1_start.csv"
+
+task_endpose_csv = f"./saved_states/{args_cli.colon_id}{args_cli.task_id}_end.csv"
+if not os.path.exists(task_endpose_csv):
+    logging.warning(
+        "Requested colon/task end-pose CSV does not exist: %s. Falling back to ./saved_states/c1t1_end.csv",
+        task_endpose_csv,
+    )
+    task_endpose_csv = "./saved_states/c1t1_end.csv"
+
 env_config = {
     "discrete_action_space" : False, # currently unsupported TODO: Figure out if this is something we want to be determinable from the outside, or if it is a property of the robot implementation.
     "use_pose" : False,
@@ -148,16 +399,25 @@ env_config = {
     "env_spacing" : env_spacing,
     "num_envs" : args_cli.num_envs,
     "replicate_physics" : False,
-    "action_scale" : 0.1,
+    "action_scale" : 0.001,
+    "translation_action_scale" : 0.001,
+    "rotation_action_scale" : 0.01,
     "debug_vis" : False,
-    "episode_length_s" : 30.0 if args_cli.train else 20000000.0,
+    "episode_length_s" : 40.0 if (args_cli.train or args_cli.test or args_cli.continual_training or args_cli.data_sampling) else 20000000.0,
     "constraint_point_A": 1,  # Distance from robot tip to constraint point A along the robot's local z-axis
-    "init_from_csv": "./saved_states/c1t2_start.csv", #if args_cli.train else None,
-    "init_endpose_from_csv": "./saved_states/c1t2_end.csv" if args_cli.train else None,
+    "init_from_csv": task_startpose_csv if (args_cli.train or args_cli.test or args_cli.continual_training or args_cli.data_sampling) else None,
+    "init_endpose_from_csv": task_endpose_csv if (args_cli.train or args_cli.test or args_cli.continual_training or args_cli.data_sampling) else None,
     "random_initial_configuration": False,  # Use straight configuration (especially for teleoperation mode)
     "clip_actions": args_cli.clip_actions,
     "disable_movement_constraints": not args_cli.clip_actions,  # Back-compat: tie movement constraints to clip_actions
-    "use_txt_files_for_attachments": True  # Use txt files to load precise vertex indices for colon attachments
+    "use_txt_files_for_attachments": True,  # Use txt files to load precise vertex indices for colon attachments
+    "disable_lumen_visibility_reset": args_cli.test,  # Disable lumen visibility counter reset in test mode
+    "teleoperate_mode": not args_cli.train and not args_cli.test and not args_cli.continual_training and not args_cli.data_sampling,
+    "data_sampling_mode": args_cli.data_sampling,
+    "target_depth_region_fraction": 0.7,
+    "colon_init_rot": (0.7071, 0.0, -0.7071, 0.0),
+    "robot_init_rot": (0.0, 0.7071, 0.0, 0.7071),
+    "robot_init_pos": (5.6430, -1.3124, -2),
 }
 
 reward_config = {
@@ -167,14 +427,26 @@ reward_config = {
     "running_penalty" : -0.1,
     "goal_reward" : 50.0,
     # Make center alignment dominant in the reward function
-    "center_weight": 0.5,      # Increased from 0.4 to 0.7 (dominant)
+    "center_weight": args_cli.reward_wc,      # Current default is 0.5
     "goal_weight": 0.0,        # Decreased from 0.4 to 0.2
-    "obstruction_weight": 0.5, # Decreased from 0.2 to 0.1
+    "obstruction_weight": args_cli.reward_wo, # Current default is 0.5
+    "reward_variant": args_cli.reward_variant,
+    "reward_wc": args_cli.reward_wc,
+    "reward_wo": args_cli.reward_wo,
+    "reward_lambda_o": args_cli.reward_lambda_o,
+    "reward_beta": args_cli.reward_beta,
+    "train_with_normalized_reward": args_cli.train_with_normalized_reward,
+    # Vanilla PPO (--no-clip_actions) resets and penalizes when lumen visibility is low.
+    "reset_on_low_lumen_visibility": not args_cli.clip_actions,
+    "low_lumen_visibility_threshold": -0.4,
+    "low_lumen_reset_penalty": -1.0,
     # Parameters for calculating max_episode_length (used for success criterion)
-    "episode_length_s": 30.0 if args_cli.train else 2000000.0,
+    "episode_length_s": 40.0 if (args_cli.train or args_cli.test or args_cli.continual_training) else 2000000.0,
     "decimation": 2,
     "dt": 1.0 / 240.0,
     "success_alignment_ratio": 0.9,  # 90% of steps must have center_alignment > 0.85
+    # Distance-based success criterion: robot tip must be within this threshold of target position
+    "success_distance_threshold": 0.2,
 }
 
 simulation_config = {
@@ -335,7 +607,24 @@ config = {
     "render_config" : render_config,
     "physx_config" : physx_config,
     "debug_config" : debug_config,
+    "run_config": {
+        "algorithm": args_cli.algo,
+        "reward_variant": reward_variant_label,
+        "constrained": bool(args_cli.clip_actions),
+        "colon_id": args_cli.colon_id,
+        "task_id": args_cli.task_id,
+        "seed": args_cli.seed,
+        "timestamp": timestamp,
+        "result_dir": result_dir,
+        "train_with_normalized_reward": bool(args_cli.train_with_normalized_reward),
+        "stop_after_episodes": args_cli.stop_after_episodes,
+        "disable_video": bool(args_cli.disable_video),
+        "trajectory_save_interval": args_cli.trajectory_save_interval,
+        "save_trajectory_images": bool(args_cli.save_trajectory_images),
+    },
 }
+with open(os.path.join(result_dir, "config.json"), "w") as f:
+    json.dump(config, f, indent=2, default=str)
 #pdb.set_trace()
 robot_factory = RobotFactory(config, device=device)
 #pdb.set_trace()
@@ -349,10 +638,11 @@ env = FrameStack(env, n_stack=5)
 
 video_kwargs = {
     "video_folder": video_save_path,
-    "step_trigger": lambda step: step % 25000 == 0,
+    "step_trigger": lambda step: step % 5000 == 0,
     "video_length": 5000,
 }
-env = gym.wrappers.RecordVideo(env, **video_kwargs)
+if not args_cli.disable_video:
+    env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
 env = Sb3VecEnvWrapper(env)
 
@@ -380,60 +670,139 @@ except Exception as e:
 # )
 
 # Debug your environment
-import numpy as np
 #pdb.set_trace()
 print(f"Obs space: {env.observation_space}")
 print(f"Action space: {env.action_space}")
 
 if config["env_config"]["discrete_action_space"]:
     raise NotImplementedError("Discrete action space is not currently supported")
-    model = DQN(
-        "MultiInputPolicy",
-        env,
-        verbose=learning_config["verbose"],
-        policy_kwargs={"normalize_images": False},
-        tensorboard_log=tensorboard_log,
-        device=device,
 
-        learning_rate=learning_config["learning_rate"],
-        batch_size=learning_config["batch_size"],
-        buffer_size=25000,
-        learning_starts=100,
 
-        tau=1.0,
-        gamma=0.99,
-        train_freq=4,
-        target_update_interval=1000,
-        exploration_fraction=0.1,
-        exploration_initial_eps=1.0,
-        exploration_final_eps=0.05,
-    )
-else:
-    # model = SAC(
-    #     "MultiInputPolicy",
-    #     env,
-    #     verbose=1,
-    #     policy_kwargs={"normalize_images": False},
-    #     tensorboard_log=tensorboard_log,
-    #     device="cuda",
-    #     ent_coef=0.5,
-    #     learning_starts=5000,
-    #     learning_rate=learning_config["learning_rate"],
-    #     buffer_size=5000,
-    #     batch_size=learning_config["batch_size"],
-    #     tau=0.005,
-    #     gamma=0.99,
-    #     train_freq=10,
-    #     gradient_steps=2,
-    # )
+def _float_from_info(info, key):
+    if key not in info or info[key] is None:
+        return None
+    value = info[key]
+    if hasattr(value, "item"):
+        value = value.item()
+    return float(value)
 
+
+def run_deterministic_evaluation(model, env, num_episodes, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    metric_keys = [
+        "raw_step_reward",
+        "normalized_step_reward",
+        "s_c",
+        "s_1",
+        "s_2",
+        "s_3",
+        "s_o",
+        "normalized_progress",
+        "roi_aligned",
+        "lumen_visible",
+    ]
+    metric_values = {key: [] for key in metric_keys}
+    episode_rewards = []
+    episode_lengths = []
+    episode_successes = []
+
+    obs = env.reset()
+    current_rewards = np.zeros(env.num_envs, dtype=np.float64)
+    current_lengths = np.zeros(env.num_envs, dtype=np.int64)
+    episodes_completed = 0
+    total_steps = 0
+
+    while episodes_completed < num_episodes:
+        action, _ = model.predict(obs, deterministic=True)
+        obs, rewards, dones, infos = env.step(action)
+        current_rewards += rewards
+        current_lengths += 1
+        total_steps += env.num_envs
+
+        for info in infos:
+            for key in metric_keys:
+                value = _float_from_info(info, key)
+                if value is not None:
+                    metric_values[key].append(value)
+
+        for env_idx, done in enumerate(dones):
+            if not done or episodes_completed >= num_episodes:
+                continue
+            info = infos[env_idx] if env_idx < len(infos) else {}
+            success = bool(info.get("goal_reached", False) or info.get("is_success", False) or info.get("success", False))
+            episode_rewards.append(float(current_rewards[env_idx]))
+            episode_lengths.append(int(current_lengths[env_idx]))
+            episode_successes.append(success)
+            current_rewards[env_idx] = 0.0
+            current_lengths[env_idx] = 0
+            episodes_completed += 1
+
+    def mean_or_none(key):
+        values = metric_values[key]
+        return float(np.mean(values)) if values else None
+
+    results_summary = {
+        "model_path": args_cli.model_path,
+        "test_episodes": int(num_episodes),
+        "episodes_completed": int(episodes_completed),
+        "total_env_steps": int(total_steps),
+        "success_rate": float(np.mean(episode_successes)) if episode_successes else 0.0,
+        "normalized_progress": mean_or_none("normalized_progress"),
+        "raw_mean_step_reward": mean_or_none("raw_step_reward"),
+        "normalized_mean_step_reward": mean_or_none("normalized_step_reward"),
+        "mean_s_c": mean_or_none("s_c"),
+        "mean_s_1": mean_or_none("s_1"),
+        "mean_s_2": mean_or_none("s_2"),
+        "mean_s_3": mean_or_none("s_3"),
+        "mean_s_o": mean_or_none("s_o"),
+        "roi_alignment_rate": mean_or_none("roi_aligned"),
+        "lumen_visible_ratio": mean_or_none("lumen_visible"),
+        "mean_episode_return": float(np.mean(episode_rewards)) if episode_rewards else 0.0,
+        "std_episode_return": float(np.std(episode_rewards)) if episode_rewards else 0.0,
+        "mean_episode_length": float(np.mean(episode_lengths)) if episode_lengths else 0.0,
+        "std_episode_length": float(np.std(episode_lengths)) if episode_lengths else 0.0,
+        "episode_returns": episode_rewards,
+        "episode_lengths": episode_lengths,
+        "episode_successes": episode_successes,
+        "reward_variant": reward_variant_label,
+        "constrained": bool(args_cli.clip_actions),
+        "colon_id": args_cli.colon_id,
+        "task_id": args_cli.task_id,
+        "seed": args_cli.seed,
+        "algorithm": args_cli.algo,
+    }
+    results_path = os.path.join(output_dir, "evaluation_metrics.json")
+    with open(results_path, "w") as f:
+        json.dump(results_summary, f, indent=2)
+    logging.info(f"Evaluation metrics saved to: {results_path}")
+    return results_summary
+
+# Select algorithm based on command line argument
+# For continual training, load the pre-trained model instead of creating a new one
+if args_cli.continual_training:
+    logging.info(f"Loading pre-trained model for continual training from: {args_cli.model_path}")
+    if args_cli.algo == "PPO":
+        model = PPO.load(args_cli.model_path, env=env, device=device, tensorboard_log=tensorboard_log)
+    elif args_cli.algo == "SAC":
+        model = SAC.load(args_cli.model_path, env=env, device=device, tensorboard_log=tensorboard_log)
+    elif args_cli.algo == "TD3":
+        model = TD3.load(args_cli.model_path, env=env, device=device, tensorboard_log=tensorboard_log)
+    elif args_cli.algo == "A2C":
+        model = A2C.load(args_cli.model_path, env=env, device=device, tensorboard_log=tensorboard_log)
+    elif args_cli.algo == "DDPG":
+        model = DDPG.load(args_cli.model_path, env=env, device=device, tensorboard_log=tensorboard_log)
+    else:
+        raise ValueError(f"Unknown algorithm: {args_cli.algo}")
+    logging.info("Pre-trained model loaded successfully. Ready for continual training.")
+elif args_cli.algo == "PPO":
     model = PPO(
         "MultiInputPolicy",
         env,
         verbose=1,
-        policy_kwargs={"normalize_images": True},
+        policy_kwargs={"normalize_images": False},
         tensorboard_log=tensorboard_log,
-        device="cuda",
+        device=device,
+        seed=args_cli.seed,
         learning_rate=learning_config["learning_rate"],
         batch_size=learning_config["batch_size"],
         n_steps=2048,
@@ -443,6 +812,83 @@ else:
         gamma=0.99,
         gae_lambda=0.95,
     )
+elif args_cli.algo == "SAC":
+    model = SAC(
+        "MultiInputPolicy",
+        env,
+        verbose=1,
+        policy_kwargs={"normalize_images": False},
+        tensorboard_log=tensorboard_log,
+        device=device,
+        seed=args_cli.seed,
+        ent_coef=0.5,
+        learning_starts=10000,
+        learning_rate=learning_config["learning_rate"],
+        buffer_size=10000,
+        batch_size=learning_config["batch_size"],
+        tau=0.005,
+        gamma=0.99,
+        train_freq=10,
+        gradient_steps=2,
+    )
+elif args_cli.algo == "TD3":
+    model = TD3(
+        "MultiInputPolicy",
+        env,
+        verbose=1,
+        policy_kwargs={"normalize_images": False},
+        tensorboard_log=tensorboard_log,
+        device=device,
+        seed=args_cli.seed,
+        learning_starts=5000,
+        learning_rate=learning_config["learning_rate"],
+        buffer_size=5000,
+        batch_size=learning_config["batch_size"],
+        tau=0.005,
+        gamma=0.99,
+        train_freq=10,
+        gradient_steps=2,
+        policy_delay=2,
+        target_policy_noise=0.2,
+        target_noise_clip=0.5,
+    )
+elif args_cli.algo == "A2C":
+    model = A2C(
+        "MultiInputPolicy",
+        env,
+        verbose=1,
+        policy_kwargs={"normalize_images": False},
+        tensorboard_log=tensorboard_log,
+        device=device,
+        seed=args_cli.seed,
+        learning_rate=learning_config["learning_rate"],
+        n_steps=5,
+        gamma=0.99,
+        gae_lambda=0.95,
+        ent_coef=0.01,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+    )
+elif args_cli.algo == "DDPG":
+    model = DDPG(
+        "MultiInputPolicy",
+        env,
+        verbose=1,
+        policy_kwargs={"normalize_images": False},
+        tensorboard_log=tensorboard_log,
+        device=device,
+        seed=args_cli.seed,
+        learning_starts=5000,
+        learning_rate=learning_config["learning_rate"],
+        buffer_size=5000,
+        batch_size=learning_config["batch_size"],
+        tau=0.005,
+        gamma=0.99,
+        train_freq=10,
+        gradient_steps=2,
+    )
+else:
+    raise ValueError(f"Unknown algorithm: {args_cli.algo}")
 
 # Print the policy network structure
 logging.debug("Policy architecture:")
@@ -468,36 +914,195 @@ elif hasattr(model.policy, 'action_net'):
 logging.debug("\nFeature extractor:")
 logging.debug(model.policy.features_extractor)
 
-if args_cli.train:
+continual_training_target_episodes = 1
+
+if args_cli.continual_training:
+    max_episode_steps = int(getattr(env.unwrapped, "max_episode_length", 0))
+    if max_episode_steps > 0:
+        min_steps_before_training = continual_training_target_episodes * max_episode_steps + 1
+        # Prevent any training update before every env has had time to finish the target episodes.
+        # On-policy algorithms train after each rollout of `n_steps` per env.
+        if hasattr(model, "n_steps") and hasattr(model, "rollout_buffer"):
+            desired_n_steps = max(int(model.n_steps), min_steps_before_training)
+            if desired_n_steps != int(model.n_steps):
+                logging.info(
+                    "continual_training: increasing rollout horizon from %s to %s so no training "
+                    "occurs before all envs can finish %s episodes",
+                    model.n_steps,
+                    desired_n_steps,
+                    continual_training_target_episodes,
+                )
+                model.n_steps = desired_n_steps
+                rollout_buffer_cls = model.rollout_buffer.__class__
+                model.rollout_buffer = rollout_buffer_cls(
+                    model.n_steps,
+                    model.observation_space,
+                    model.action_space,
+                    device=model.device,
+                    gamma=model.gamma,
+                    gae_lambda=model.gae_lambda,
+                    n_envs=model.n_envs,
+                )
+
+        # Off-policy algorithms begin gradient updates after `learning_starts` global timesteps.
+        if hasattr(model, "learning_starts"):
+            desired_learning_starts = max(
+                int(model.learning_starts),
+                min_steps_before_training * env.num_envs,
+            )
+            if desired_learning_starts != int(model.learning_starts):
+                logging.info(
+                    "continual_training: increasing learning_starts from %s to %s so no training "
+                    "occurs before all envs can finish %s episodes",
+                    model.learning_starts,
+                    desired_learning_starts,
+                    continual_training_target_episodes,
+                )
+                model.learning_starts = desired_learning_starts
+
+if args_cli.train or args_cli.continual_training:
     checkpoint_callback = CheckpointCallback(
         save_freq=10000, # Save every 10k steps
         save_path=model_save_path,
-        name_prefix=f"ppo_arc_checkpoint_{timestamp}"
+        name_prefix=f"{algo_name}_arc_checkpoint_{timestamp}"
     )
 
     log_callback = LogEveryNTimesteps(n_steps=500)
 
-    per_env_reward_callback = PerEnvRewardCallback(verbose=1)
+    per_env_reward_callback = PerEnvRewardCallback(
+        verbose=1,
+        plot_data_file=os.path.join(result_dir, "episode_rewards.npz"),
+    )
 
-    # Create trajectory data saver callback (saves every 10 episodes by default)
+    reward_ablation_callback = RewardAblationMetricsCallback(
+        save_dir=result_dir,
+        reward_variant=reward_variant_label,
+        constrained=bool(args_cli.clip_actions),
+        log_interval_steps=500,
+        verbose=1,
+    )
+
+    # Create trajectory data saver callback.
     trajectory_callback = TrajectoryDataSaver(
         save_dir=trajectory_save_path,
-        save_interval=10,  # Save every 10 episodes
+        save_interval=args_cli.trajectory_save_interval,
+        save_images=args_cli.save_trajectory_images,
         verbose=1
     )
 
-    # Create success rate data saver callback (saves to trajectory_data folder)
+    # Create success rate data saver callback (saves to trajectory_data folder).
     success_rate_callback = SuccessRateDataSaver(
         save_dir=trajectory_save_path,
-        save_interval_episodes=10,  # Save every 10 episodes
+        save_interval_episodes=1,  # Save every episode
         verbose=1
     )
 
-    model.learn(learning_config["total_timesteps"], callback=[checkpoint_callback, log_callback, per_env_reward_callback, trajectory_callback, success_rate_callback])
-    
-    final_model_path = os.path.join(model_save_path, f"ppo_arc_final_{timestamp}")
+    callbacks = [
+        checkpoint_callback,
+        log_callback,
+        per_env_reward_callback,
+        reward_ablation_callback,
+        trajectory_callback,
+        success_rate_callback,
+    ]
+    if args_cli.stop_after_episodes is not None:
+        callbacks.append(
+            StopAfterTotalEpisodesCallback(
+                target_episodes=args_cli.stop_after_episodes,
+                verbose=1,
+            )
+        )
+    if args_cli.continual_training:
+        callbacks.append(
+            FreezeLearningUntilAllEnvsNEpisodesCallback(
+                target_episodes=continual_training_target_episodes,
+                verbose=1,
+            )
+        )
+        callbacks.append(
+            StopAfterAllEnvsNEpisodesCallback(
+                target_episodes=continual_training_target_episodes,
+                verbose=1,
+            )
+        )
+    interrupted = False
+    training_error = None
+    learn_completed = False
+    try:
+        model.learn(learning_config["total_timesteps"], callback=callbacks)
+        learn_completed = True
+    except KeyboardInterrupt:
+        interrupted = True
+        logging.warning("Training interrupted by user. Saving current model and flushed metrics before exiting.")
+    except Exception as exc:
+        training_error = exc
+        logging.exception("Training failed. Saving current model and flushed metrics before re-raising.")
+    finally:
+        # SB3 does not guarantee callback finalizers run when learn() is interrupted.
+        # Call them explicitly so CSV summaries, success data, and episode reward
+        # arrays are written even after Ctrl+C.
+        if not learn_completed:
+            for callback in callbacks:
+                try:
+                    callback._on_training_end()
+                except Exception as exc:
+                    logging.warning(f"Callback finalization failed for {type(callback).__name__}: {exc}")
+
+    final_suffix = "failed" if training_error is not None else "interrupted" if interrupted else "final"
+    final_model_path = os.path.join(model_save_path, f"{algo_name}_arc_{final_suffix}_{timestamp}")
     model.save(final_model_path)
-    logging.info(f"Final model saved to: {final_model_path}")
+    logging.info(f"{final_suffix.capitalize()} model saved to: {final_model_path}")
+    run_status = {
+        "status": "failed" if training_error is not None else "interrupted" if interrupted else "completed",
+        "model_path": final_model_path,
+        "timesteps": int(getattr(model, "num_timesteps", 0)),
+        "error": repr(training_error) if training_error is not None else None,
+    }
+    with open(os.path.join(result_dir, "run_status.json"), "w") as f:
+        json.dump(run_status, f, indent=2)
+    args_cli.model_path = final_model_path
+    if args_cli.eval_after_train and training_error is None:
+        run_deterministic_evaluation(model, env, args_cli.test_episodes, result_dir)
+    if training_error is not None:
+        raise training_error
+elif args_cli.test:
+    # Test mode: Load a trained model and evaluate its performance
+    logging.info(f"Loading model from: {args_cli.model_path}")
+
+    # Determine the algorithm from the model path or use the --algo argument
+    if args_cli.algo == "PPO":
+        model = PPO.load(args_cli.model_path, env=env, device=device)
+    elif args_cli.algo == "SAC":
+        model = SAC.load(args_cli.model_path, env=env, device=device)
+    elif args_cli.algo == "TD3":
+        model = TD3.load(args_cli.model_path, env=env, device=device)
+    elif args_cli.algo == "A2C":
+        model = A2C.load(args_cli.model_path, env=env, device=device)
+    elif args_cli.algo == "DDPG":
+        model = DDPG.load(args_cli.model_path, env=env, device=device)
+
+    logging.info(f"Model loaded successfully. Running {args_cli.test_episodes} test episodes...")
+    run_deterministic_evaluation(model, env, args_cli.test_episodes, result_dir)
+elif args_cli.data_sampling:
+    logging.info("Starting data sampling mode...")
+    obs = env.reset()
+    zero_actions = np.zeros((env.num_envs,) + env.action_space.shape, dtype=np.float32)
+
+    try:
+        while simulation_app.is_running():
+            obs, reward, done, info = env.step(zero_actions)
+    except KeyboardInterrupt:
+        logging.info("\nCtrl+C detected. Exiting data sampling mode.")
 else:
     from arcgym.utils.teleop_mode import run_teleoperation_mode
     run_teleoperation_mode(env, simulation_app, device=device)
+
+try:
+    env.close()
+except Exception as exc:
+    logging.warning("Environment close failed: %s", exc)
+
+try:
+    simulation_app.close()
+except Exception as exc:
+    logging.warning("Simulation app close failed: %s", exc)

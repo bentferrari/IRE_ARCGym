@@ -414,6 +414,36 @@ class Sb3VecEnvWrapper(VecEnv):
                     for idx in range(self.num_envs):
                         infos[idx]["goal_reached"] = extras["goal_reached"]
 
+            reward_metric_keys = [
+                "center_alignment",
+                "reset_triggered",
+                "s_c",
+                "s_1",
+                "s_2",
+                "s_3",
+                "s_o",
+                "raw_step_reward",
+                "normalized_step_reward",
+                "normalized_progress",
+                "roi_aligned",
+                "lumen_visible",
+            ]
+            for key in reward_metric_keys:
+                if key not in extras or extras[key] is None:
+                    continue
+                value = extras[key]
+                if isinstance(value, torch.Tensor):
+                    value_np = value.detach().cpu().numpy()
+                    for idx in range(min(len(value_np), self.num_envs)):
+                        item = value_np[idx]
+                        if np.asarray(item).dtype == np.bool_:
+                            infos[idx][key] = bool(item)
+                        else:
+                            infos[idx][key] = float(item)
+                else:
+                    for idx in range(self.num_envs):
+                        infos[idx][key] = value
+
             for idx in reset_ids:
                 # fill-in episode monitoring info
                 infos[idx]["episode"] = {

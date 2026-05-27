@@ -40,7 +40,13 @@ class FPVKeyboard(DeviceBase):
 
     def __del__(self):
         """Release the keyboard interface."""
-        self._input.unsubscribe_from_keyboard_events(self._keyboard, self._keyboard_sub)
+        try:
+            if hasattr(self._input, 'unsubscribe_from_keyboard_events'):
+                self._input.unsubscribe_from_keyboard_events(self._keyboard, self._keyboard_sub)
+            elif hasattr(self._input, 'unsubscribe_to_keyboard_events'):
+                self._input.unsubscribe_to_keyboard_events(self._keyboard, self._keyboard_sub)
+        except Exception:
+            pass  # Ignore errors during cleanup
         self._keyboard_sub = None
 
     def __str__(self) -> str:
@@ -123,16 +129,15 @@ class FPVKeyboard(DeviceBase):
             # down command (negative)
             "E": np.asarray([0.0, -1.0, 0.0, 0.0, 0.0, 0.0]) * self.lin_sensitivity,
             # pitch command (positive)
-            "I": np.asarray([0.0, 0.0, 0.0, -1.0, 0.0, 0.0]) * self.rot_sensitivity,
+            "I": np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, -1.0]) * self.rot_sensitivity,
             # pitch command (negative)
-            "K": np.asarray([0.0, 0.0, 0.0, 1.0, 0.0, 0.0]) * self.rot_sensitivity,
+            "K": np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 1.0]) * self.rot_sensitivity,
             # yaw command (positive)
             "J": np.asarray([0.0, 0.0, 0.0, 0.0, -1.0, 0.0]) * self.rot_sensitivity,
             # yaw command (negative)
             "L": np.asarray([0.0, 0.0, 0.0, 0.0, 1.0, 0.0]) * self.rot_sensitivity,
             # roll command (positive)
-            "U": np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 1.0]) * self.rot_sensitivity,
+            "U": np.asarray([0.0, 0.0, 0.0, 1.0, 0.0, 0.0]) * self.rot_sensitivity,
             # roll command (negative)
-            "O": np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, -1.0]) * self.rot_sensitivity,
+            "O": np.asarray([0.0, 0.0, 0.0, -1.0, 0.0, 0.0]) * self.rot_sensitivity,
         }
-

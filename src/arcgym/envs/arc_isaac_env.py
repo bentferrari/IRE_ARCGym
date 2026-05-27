@@ -64,6 +64,8 @@ def make_isaac_env_cfg(config: dict, robot_factory) -> ARCIsaacEnvCfg:
         decimation = simulation_config["render_interval"]
         episode_length_s = env_config["episode_length_s"]
         action_scale = env_config["action_scale"]
+        translation_action_scale = env_config.get("translation_action_scale", env_config["action_scale"])
+        rotation_action_scale = env_config.get("rotation_action_scale", env_config["action_scale"])
         debug_vis = env_config["debug_vis"]
         num_envs: int = env_config["num_envs"]
         #pdb.set_trace()
@@ -150,10 +152,15 @@ class ARCIsaacEnv(DirectRLEnv):
 
         # Override CSV initialization if teleoperate mode is enabled
         if self.env_config.get("teleoperate_mode", False):
-            # Set start position CSV
-            teleop_start_csv = self.env_config.get("teleoperate_init_csv", "/home/guanglin/arcgym/saved_states/env1_c1t2_start.csv")
-            self.env_config["init_from_csv"] = teleop_start_csv
-            logging.info(f"Teleoperate mode enabled - using start CSV: {teleop_start_csv}")
+            # Set start position CSV only if teleop_start_csv is provided
+            # If teleop_start_csv is None, use hardcoded default position from colon_isaac.py
+            teleop_start_csv = self.env_config.get("teleoperate_init_csv", None)
+            if teleop_start_csv is not None:
+                self.env_config["init_from_csv"] = teleop_start_csv
+                logging.info(f"Teleoperate mode enabled - using start CSV: {teleop_start_csv}")
+            else:
+                # No CSV specified - will use hardcoded default entry position
+                logging.info(f"Teleoperate mode enabled - using hardcoded default entry position (no CSV)")
 
             # Optionally set end position CSV if provided
             teleop_end_csv = self.env_config.get("teleoperate_endpose_csv", None)
@@ -164,6 +171,8 @@ class ARCIsaacEnv(DirectRLEnv):
         super().__init__(cfg, self.render_mode, **kwargs)
 
         self.action_scale = self.cfg.action_scale
+        self.translation_action_scale = getattr(self.cfg, "translation_action_scale", self.action_scale)
+        self.rotation_action_scale = getattr(self.cfg, "rotation_action_scale", self.action_scale)
 
         self.observation_space = robot_factory.observation_space
         self.action_space = robot_factory.action_space
@@ -210,19 +219,30 @@ class ARCIsaacEnv(DirectRLEnv):
         self.previous_positions = None
         self.poor_alignment_counter = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
         self.backward_steps_remaining = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
-        self.stuck_threshold = 15  # Number of steps with poor alignment to consider stuck
-        self.backward_duration = 10  # Number of steps to move backward when stuck
-        self.alignment_threshold = 0.7  # Center alignment below this is considered poor
+        self.stuck_threshold = 1000  # Number of steps with poor alignment to consider stuck
+        self.backward_duration = 2  # Number of steps to move backward when stuck
+        self.alignment_threshold = 0.8  # Center alignment below this is considered poor
 
         # Lumen visibility tracking for backward motion
         self.lumen_visibility_negative_counter = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
         self.lumen_negative_threshold = 20  # Number of consecutive poor lumen visibility steps
-        self.lumen_visibility_threshold = -0.4  # Lumen visibility threshold for counter increment
-        # Calculate number of steps for 0.5 time units
-        # step_dt = decimation * physics_dt, so steps = 0.5 / step_dt
+        self.lumen_visibility_threshold = self.env_config.get("lumen_visibility_threshold", -0.4)
+        self.highlight_recover_coverage_threshold = self.env_config.get("highlight_recover_coverage_threshold", 0.5)
+        self.wall_recover_consecutive_threshold = self.env_config.get("wall_recover_consecutive_threshold", 3)
+        self.wall_recover_cooldown_steps = self.env_config.get("wall_recover_cooldown_steps", 20)
+        self.backward_increment = abs(self.env_config.get("backward_increment", 1.0 * self.translation_action_scale))
+        self.backward_rotation_scale = abs(self.env_config.get("backward_rotation_scale", 0.5 * self.rotation_action_scale))
+        self.reorient_steps = self.env_config.get("reorient_steps", 12)
+        self.reorient_rotation_scale = abs(self.env_config.get("reorient_rotation_scale", self.rotation_action_scale))
+        self.wall_hit_counter = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        self.wall_recover_cooldown_remaining = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        self.recover_from_wall = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # Calculate number of steps for the configured backward duration.
         step_dt = self.cfg.decimation * self.cfg.sim.dt
-        self.lumen_backward_steps = int(0.5 / step_dt)  # Steps to go backward for 0.5 time units
+        backward_duration_s = self.env_config.get("backward_duration_s", 1)
+        self.lumen_backward_steps = max(1, int(backward_duration_s / step_dt))
         self.lumen_backward_remaining = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        self.reorient_remaining = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
 
         # Bright region avoidance tracking
         self.bright_region_directions = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
@@ -233,11 +253,19 @@ class ARCIsaacEnv(DirectRLEnv):
     def _setup_scene(self):
         self.stage = stage_utils.get_current_stage()
         robot_type = self.robot_config.get("robot_type", None)
+        env_config = self.config.get("env_config", {})
+        colon_init_pos = tuple(env_config.get("colon_init_pos", (0.5, 0.5, 0.1)))
+        colon_init_rot = tuple(env_config.get("colon_init_rot", (1, 0.0, 0.0, 0.0)))
+        robot_init_pos = tuple(env_config.get("robot_init_pos", (5.6430, -1.3124, -2)))
+        # Backward compatibility: if robot_init_rot is not provided, preserve the old
+        # behavior where the robot inherits the colon's initial rotation.
+        robot_init_rot = tuple(env_config.get("robot_init_rot", colon_init_rot))
+
         if robot_type == "capsule":
-            init_rot = (1, 0, 0, 0)
+            robot_init_rot = tuple(env_config.get("robot_init_rot", (1, 0, 0, 0)))
         else:
             # Check if we should load rotation from CSV
-            csv_init_file = self.config.get("env_config", {}).get("init_from_csv", None)
+            csv_init_file = env_config.get("init_from_csv", None)
             if csv_init_file is not None and csv_init_file.endswith('.csv'):
                 import pandas as pd
                 import os
@@ -246,26 +274,37 @@ class ARCIsaacEnv(DirectRLEnv):
                     df = pd.read_csv(csv_init_file)
                     # Get the first row's quaternion values (w, x, y, z)
                     first_row = df.iloc[0]
-                    init_rot = (
+                    robot_init_rot = (
                         first_row['root_quat_w'],
                         first_row['root_quat_x'],
                         first_row['root_quat_y'],
                         first_row['root_quat_z']
                     )
-                    logging.info(f"Loaded initial rotation from CSV: {init_rot}")
+                    logging.info(f"Loaded robot initial rotation from CSV: {robot_init_rot}")
                 else:
-                    logging.warning(f"CSV file not found: {csv_init_file}, using default rotation")
-                    init_rot = (0, 1, 0, 1)
-            else:
-                init_rot = (0, 1, 0, 1)
+                    logging.warning(f"CSV file not found: {csv_init_file}, using configured robot_init_rot")
+        logging.info(
+            "Using initial pose: "
+            f"colon pos={colon_init_pos}, rot={colon_init_rot}, "
+            f"robot pos={robot_init_pos}, rot={robot_init_rot}"
+        )
+        self.robot_init_rot = robot_init_rot
+        self.robot_init_pos = robot_init_pos
+
         self.robot = self.robot_factory.build_robot(
             scene=self.scene,
-            init_pos=(0.22, 0.16, 0.4),
-            init_rot=init_rot,
+            init_pos=robot_init_pos,
+            init_rot=robot_init_rot,
             )
         # endoscope init position x=7.4029, y=0.5015, z=0.5500
-        self.colon = ColonModel(self.scene, cfg=self.cfg.colon_cfg, cfg1=self.config,  init_pos=(0.5,0.5,0.1), #init_rot=(0.707, 0.0, -0.707, 0.0), init_rot=(1.0, 0.0, 0.0, 0.0)
-        init_rot=(0.707, 0.0, -0.707, 0.0), is_rigid=False)
+        self.colon = ColonModel(
+            self.scene,
+            cfg=self.cfg.colon_cfg,
+            cfg1=self.config,
+            init_pos=colon_init_pos,
+            init_rot=colon_init_rot,
+            is_rigid=False,
+        )
 
         # Pass colon reference to robot for stress calculation
         if hasattr(self.robot, 'colon'):
@@ -291,7 +330,7 @@ class ARCIsaacEnv(DirectRLEnv):
 
     def _compute_movement_metrics(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Compute center alignment, lumen visibility, and escape directions from current depth images.
+        Compute center alignment, lumen visibility, escape directions, and bright-region coverage from current depth images.
         Returns:
             center_alignments: Tensor of shape (num_envs,) with values in [0, 1]
             lumen_visibilities: Tensor of shape (num_envs,) with visibility scores
@@ -302,6 +341,7 @@ class ARCIsaacEnv(DirectRLEnv):
         center_alignments = []
         lumen_visibilities = []
         escape_directions = []
+        bright_region_coverages = []
 
         for depth_img in depth_images:
             depth_img_np = depth_img[:, :, 0].cpu().numpy()
@@ -371,6 +411,7 @@ class ARCIsaacEnv(DirectRLEnv):
             # We want to move TOWARD these (to find open path)
             depth_threshold = np.percentile(depth_img_np, 75)  # Top 25% brightest pixels
             bright_mask = depth_img_np > depth_threshold
+            bright_region_coverages.append(float(np.mean(bright_mask)))
 
             if np.sum(bright_mask) > 0:
                 # Find centroid of bright pixels (open space)
@@ -393,22 +434,71 @@ class ARCIsaacEnv(DirectRLEnv):
 
             escape_directions.append([escape_y, escape_z])
 
+        self.bright_region_coverages = torch.tensor(bright_region_coverages, dtype=torch.float32, device=depth_images.device)
         return (torch.tensor(center_alignments, dtype=torch.float32, device=depth_images.device),
                 torch.tensor(lumen_visibilities, dtype=torch.float32, device=depth_images.device),
                 torch.tensor(escape_directions, dtype=torch.float32, device=depth_images.device))
 
+    def _compute_target_quadrants_from_depth(self, threshold_fraction: float = 0.7) -> list[str]:
+        """Compute target quadrants from the centroid of pixels with depth >= threshold_fraction * max_depth."""
+        current_states = self.get_states()
+        depth_images = current_states["depth"]
+        quadrants = []
+
+        def get_quadrant(row: float, col: float, center_row: float, center_col: float) -> str:
+            if abs(row - center_row) < 1e-6 and abs(col - center_col) < 1e-6:
+                return "center"
+            if row < center_row and col < center_col:
+                return "upper-left"
+            if row < center_row and col >= center_col:
+                return "upper-right"
+            if row >= center_row and col < center_col:
+                return "lower-left"
+            return "lower-right"
+
+        for depth_img in depth_images:
+            depth_img_np = depth_img[:, :, 0].cpu().numpy()
+            img_height, img_width = depth_img_np.shape
+            img_center_row, img_center_col = img_height / 2, img_width / 2
+            max_depth = np.max(depth_img_np)
+            high_region_mask = depth_img_np >= (threshold_fraction * max_depth)
+            high_region_coords = np.argwhere(high_region_mask)
+
+            if len(high_region_coords) > 0:
+                centroid_row = np.mean(high_region_coords[:, 0])
+                centroid_col = np.mean(high_region_coords[:, 1])
+            else:
+                centroid_row, centroid_col = np.unravel_index(np.argmax(depth_img_np), depth_img_np.shape)
+
+            quadrants.append(get_quadrant(centroid_row, centroid_col, img_center_row, img_center_col))
+
+        return quadrants
+
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        # Apply different scaling for translation vs orientation
-        # Actions: [0-2] translation (left/right, up/down, forward/back)
-        #          [3-5] orientation (pitch, yaw, roll)
+        # Apply scaling based on robot type
+        # For 6-DOF robots: Actions [0-2] displacement increments, [3-5] angle increments
+        # For 4-DOF proximal_actuated: Actions [0] translate, [1] twist, [2] yaw, [3] pitch
+        if self.env_config.get("data_sampling_mode", False):
+            actions = 2.0 * torch.rand_like(actions) - 1.0
+
         scaled_actions = actions.clone()
 
-        # Scale translation actions (indices 0, 1, 2)
-        scaled_actions[:, :3] = scaled_actions[:, :3] * self.action_scale
+        robot_type = self.robot_config.get("robot_type", "magnetic_endoscope")
 
-        # Scale orientation actions (indices 3, 4, 5) with higher scale
-        orientation_scale = self.action_scale * 1 # 3x higher for orientation
-        scaled_actions[:, 3:] = scaled_actions[:, 3:] * orientation_scale
+        if robot_type == "proximal_actuated":
+            # 4-DOF robot: [translate, twist, yaw, pitch]
+            # translate (index 0) - linear motion along robot axis
+            scaled_actions[:, 0] = scaled_actions[:, 0] * self.translation_action_scale
+
+            # twist, yaw, pitch (indices 1, 2, 3) - angular motions
+            scaled_actions[:, 1:] = scaled_actions[:, 1:] * self.rotation_action_scale
+        else:
+            # 6-DOF robots: [left/right, up/down, forward/back, roll, yaw, pitch]
+            # Scale translation actions (indices 0, 1, 2)
+            scaled_actions[:, :3] = scaled_actions[:, :3] * self.translation_action_scale
+
+            # Scale angle increment actions (indices 3, 4, 5)
+            scaled_actions[:, 3:] = scaled_actions[:, 3:] * self.rotation_action_scale
 
         # Store the scaled actions BEFORE clipping for reward computation
         # This ensures PPO trains on the actions it actually outputs
@@ -426,19 +516,52 @@ class ARCIsaacEnv(DirectRLEnv):
         if hasattr(self.robot, 'get_depth'):
             try:
                 _, lumen_visibilities, _ = self._compute_movement_metrics()
+                depth_images = self.robot.get_depth()
+                bright_region_coverages = getattr(
+                    self,
+                    "bright_region_coverages",
+                    torch.zeros(self.num_envs, dtype=torch.float32, device=self.device),
+                )
 
                 # Update counters for each environment
                 for env_id in range(self.num_envs):
                     lumen_vis = lumen_visibilities[env_id].item()
+                    bright_coverage = bright_region_coverages[env_id].item()
 
-                    # Check if lumen visibility is below threshold (-0.4)
-                    if lumen_vis < self.lumen_visibility_threshold:
+                    if self.wall_recover_cooldown_remaining[env_id] > 0:
+                        self.wall_recover_cooldown_remaining[env_id] -= 1
+
+                    # Debounced recovery trigger based only on highlight/bright region coverage.
+                    wall_like_view = bright_coverage > self.highlight_recover_coverage_threshold
+                    if wall_like_view:
+                        self.wall_hit_counter[env_id] += 1
+                        if (
+                            self.wall_hit_counter[env_id] >= self.wall_recover_consecutive_threshold
+                            and self.lumen_backward_remaining[env_id] == 0
+                            and self.wall_recover_cooldown_remaining[env_id] == 0
+                        ):
+                            self.lumen_backward_remaining[env_id] = self.lumen_backward_steps
+                            self.recover_from_wall[env_id] = True
+                            self.wall_recover_cooldown_remaining[env_id] = self.wall_recover_cooldown_steps
+                            print(
+                                f"Env {env_id} - Recovery triggered (bright_coverage={bright_coverage:.3f}). "
+                                f"Triggering backward motion for {self.lumen_backward_steps} steps."
+                            )
+                            self.wall_hit_counter[env_id] = 0
+                        self.lumen_visibility_negative_counter[env_id] = 0
+                        continue
+                    else:
+                        self.wall_hit_counter[env_id] = 0
+
+                    # Check if lumen visibility is below threshold.
+                    if lumen_vis <= self.lumen_visibility_threshold:
                         self.lumen_visibility_negative_counter[env_id] += 1
 
                         # Trigger backward motion if threshold is reached
                         if self.lumen_visibility_negative_counter[env_id] >= self.lumen_negative_threshold:
                             if self.lumen_backward_remaining[env_id] == 0:  # Only trigger if not already going backward
                                 self.lumen_backward_remaining[env_id] = self.lumen_backward_steps
+                                self.recover_from_wall[env_id] = False
                                 # print(f"Env {env_id} - Lumen visibility < {self.lumen_visibility_threshold} for {self.lumen_negative_threshold} steps. "
                                 #       f"Triggering backward motion for {self.lumen_backward_steps} steps (0.5 time units).")
                             # Reset counter after triggering
@@ -453,7 +576,7 @@ class ARCIsaacEnv(DirectRLEnv):
     def _apply_backward_motion(self, actions: torch.Tensor) -> torch.Tensor:
         """
         Override actions with backward motion for environments that need to go backward.
-        Backward motion: negative forward velocity (action[2] < 0), zero lateral/vertical movement and rotation.
+        Backward motion: negative forward displacement increment (action[2] < 0), zero lateral/vertical movement and rotation.
 
         Args:
             actions: Action tensor of shape (num_envs, 6)
@@ -468,14 +591,24 @@ class ARCIsaacEnv(DirectRLEnv):
         backward_mask = self.lumen_backward_remaining > 0
 
         if backward_mask.any():
-            # Set backward motion: move backward (negative forward velocity)
-            # Action indices: [0] left/right, [1] up/down, [2] forward/back, [3-5] orientation
-            modified_actions[backward_mask, 0] = 0.0  # No left/right movement
-            modified_actions[backward_mask, 1] = 0.0  # No up/down movement
-            modified_actions[backward_mask, 2] = -0.1  # Move backward (negative forward velocity)
-            modified_actions[backward_mask, 3] = 0.0  # No pitch rotation
-            modified_actions[backward_mask, 4] = 0.0  # No yaw rotation
-            modified_actions[backward_mask, 5] = 0.0  # No roll rotation
+            _, _, escape_directions = self._compute_movement_metrics()
+
+            # Set backward motion with rotation away from the highlight/bright region.
+            modified_actions[backward_mask, 0] = 0.0
+            modified_actions[backward_mask, 1] = 0.0
+            modified_actions[backward_mask, 2] = -self.backward_increment
+            modified_actions[backward_mask, 3:] = 0.0
+
+            backward_env_ids = torch.where(backward_mask)[0]
+            for env_id in backward_env_ids.tolist():
+                # `escape_directions` points toward the highlight/bright region.
+                # During backward recovery, rotate in the opposite direction.
+                away_yaw = -escape_directions[env_id, 0].item()
+                away_pitch = -escape_directions[env_id, 1].item()
+                yaw_mag = torch.rand(1, device=self.device).item() * self.backward_rotation_scale * abs(away_yaw)
+                pitch_mag = torch.rand(1, device=self.device).item() * self.backward_rotation_scale * abs(away_pitch)
+                modified_actions[env_id, 4] = np.sign(away_yaw) * yaw_mag
+                modified_actions[env_id, 5] = np.sign(away_pitch) * pitch_mag
 
             # Decrement remaining backward steps
             self.lumen_backward_remaining[backward_mask] -= 1
@@ -484,8 +617,58 @@ class ARCIsaacEnv(DirectRLEnv):
             completed_mask = (self.lumen_backward_remaining == 0) & backward_mask
             if completed_mask.any():
                 completed_env_ids = torch.where(completed_mask)[0]
+                self.reorient_remaining[completed_env_ids] = self.reorient_steps
                 for env_id in completed_env_ids:
                     print(f"Env {env_id} - Backward motion completed.")
+
+        return modified_actions
+
+    def _apply_reorientation_motion(self, actions: torch.Tensor) -> torch.Tensor:
+        """Apply a short no-insertion reorientation phase after backing out from a wall."""
+        modified_actions = actions.clone()
+        reorient_mask = self.reorient_remaining > 0
+
+        if reorient_mask.any():
+            _, _, escape_directions = self._compute_movement_metrics()
+            threshold_fraction = self.env_config.get("target_depth_region_fraction", 0.7)
+            quadrants = self._compute_target_quadrants_from_depth(threshold_fraction=threshold_fraction)
+            reorient_env_ids = torch.where(reorient_mask)[0]
+
+            modified_actions[reorient_mask, :3] = 0.0
+            modified_actions[reorient_mask, 3] = 0.0
+            modified_actions[reorient_mask, 4] = 0.0
+            modified_actions[reorient_mask, 5] = 0.0
+
+            for env_id in reorient_env_ids.tolist():
+                if self.recover_from_wall[env_id]:
+                    away_yaw = -escape_directions[env_id, 0].item()
+                    away_pitch = -escape_directions[env_id, 1].item()
+                    yaw_mag = torch.rand(1, device=self.device).item() * self.reorient_rotation_scale * abs(away_yaw)
+                    pitch_mag = torch.rand(1, device=self.device).item() * self.reorient_rotation_scale * abs(away_pitch)
+                    modified_actions[env_id, 4] = np.sign(away_yaw) * yaw_mag
+                    modified_actions[env_id, 5] = np.sign(away_pitch) * pitch_mag
+                else:
+                    quadrant = quadrants[env_id] if env_id < len(quadrants) else "center"
+                    random_yaw = torch.rand(1, device=self.device).item() * self.reorient_rotation_scale
+                    random_pitch = torch.rand(1, device=self.device).item() * self.reorient_rotation_scale
+
+                    if quadrant == "upper-left":
+                        modified_actions[env_id, 4] = -random_yaw
+                        modified_actions[env_id, 5] = -random_pitch
+                    elif quadrant == "upper-right":
+                        modified_actions[env_id, 4] = random_yaw
+                        modified_actions[env_id, 5] = -random_pitch
+                    elif quadrant == "lower-left":
+                        modified_actions[env_id, 4] = -random_yaw
+                        modified_actions[env_id, 5] = random_pitch
+                    elif quadrant == "lower-right":
+                        modified_actions[env_id, 4] = random_yaw
+                        modified_actions[env_id, 5] = random_pitch
+
+            self.reorient_remaining[reorient_mask] -= 1
+            completed_mask = self.reorient_remaining == 0
+            if completed_mask.any():
+                self.recover_from_wall[completed_mask] = False
 
         return modified_actions
 
@@ -493,21 +676,21 @@ class ARCIsaacEnv(DirectRLEnv):
         """
         Apply movement constraints based on quadrant of lumen centroid.
 
-        When lumen visibility is poor (< -0.30), backs out and scans using the escape
-        direction; otherwise, uses the threshold_high centroid from the reward function.
+        For 6-DOF robots with action order
+        [left/right, up/down, forward/back, roll, yaw, pitch]:
+        ALWAYS forces a positive forward displacement increment and clips the lateral,
+        vertical, yaw, and pitch increments based on quadrant:
+        - upper-left: go up and left (delta_left_right ≤ 0, delta_up_down ≤ 0, delta_pitch ≤ 0, delta_yaw ≤ 0)
+        - upper-right: go up and right (delta_left_right ≥ 0, delta_up_down ≤ 0, delta_pitch ≤ 0, delta_yaw ≥ 0)
+        - lower-left: go down and left (delta_left_right ≤ 0, delta_up_down ≥ 0, delta_pitch ≥ 0, delta_yaw ≤ 0)
+        - lower-right: go down and right (delta_left_right ≥ 0, delta_up_down ≥ 0, delta_pitch ≥ 0, delta_yaw ≥ 0)
 
-        ALWAYS forces forward motion (v_forward_back = 0.1) and clips other actions based on quadrant:
-        - upper-left: clip to go up and left (v_left_right ≤ 0, v_up_down ≤ 0, ω_pitch ≤ 0, ω_yaw ≤ 0)
-        - upper-right: clip to go up and right (v_left_right ≥ 0, v_up_down ≤ 0, ω_pitch ≤ 0, ω_yaw ≥ 0)
-        - lower-left: clip to go down and left (v_left_right ≤ 0, v_up_down ≥ 0, ω_pitch ≥ 0, ω_yaw ≤ 0)
-        - lower-right: clip to go down and right (v_left_right ≥ 0, v_up_down ≥ 0, ω_pitch ≥ 0, ω_yaw ≥ 0)
-
-        Constraints are only applied after 10,000 steps to allow initial exploration.
+        For 4-DOF proximal_actuated robots:
+        Actions: [0] translate, [1] twist, [2] yaw, [3] pitch
+        Clips yaw and pitch based on quadrant to steer toward lumen center.
 
         Args:
-            actions: Action tensor of shape (num_envs, 6)
-                    [0] v_left_right, [1] v_up_down, [2] v_forward_back (OVERRIDDEN to 0.1),
-                    [3] ω_pitch, [4] ω_yaw, [5] ω_roll
+            actions: Action tensor of shape (num_envs, 6) for 6-DOF or (num_envs, 4) for 4-DOF
 
         Returns:
             Modified actions with constraints applied
@@ -516,9 +699,8 @@ class ARCIsaacEnv(DirectRLEnv):
         if self.env_config.get("disable_movement_constraints", False):
             return actions
 
-        # Only apply constraints after 10,000 steps
-        if self.common_step_counter < 100:
-            return actions
+        robot_type = self.robot_config.get("robot_type", "magnetic_endoscope")
+        forward_increment = self.env_config.get("forward_increment", self.translation_action_scale)
 
         # Clone to avoid modifying input
         constrained_actions = actions.clone()
@@ -535,103 +717,79 @@ class ARCIsaacEnv(DirectRLEnv):
             lumen_visibilities = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
             escape_directions = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
 
-        # Get quadrant information from reward function (using threshold_high centroid)
-        if hasattr(self.reward_function, 'high_quadrants_per_env') and self.reward_function.high_quadrants_per_env:
+        if self.env_config.get("data_sampling_mode", False):
+            quadrants = self._compute_target_quadrants_from_depth(
+                threshold_fraction=self.env_config.get("target_depth_region_fraction", 0.7)
+            )
+        elif hasattr(self.reward_function, 'high_quadrants_per_env') and self.reward_function.high_quadrants_per_env:
             quadrants = self.reward_function.high_quadrants_per_env
+        else:
+            quadrants = []
 
+        if quadrants:
             for env_id, quadrant in enumerate(quadrants):
-                # Store original actions for printing
-                original_action = actions[env_id].clone()
-
-                # Override quadrant with deepest point position if lumen visibility is poor
                 quadrant_source = "threshold_high"
-                if lumen_visibilities[env_id] < 0.20:
-                    # Poor visibility: compute quadrant from deepest point
-                    try:
-                        depth_images = self.robot.get_depth()
-                        depth_img = depth_images[env_id]
-                        depth_img_np = depth_img[:, :, 0].cpu().numpy()
-
-                        img_height, img_width = depth_img_np.shape
-                        img_center_row, img_center_col = img_height / 2, img_width / 2
-
-                        # Find deepest point (maximum depth value)
-                        max_depth_idx = np.unravel_index(np.argmax(depth_img_np), depth_img_np.shape)
-                        max_depth_row, max_depth_col = max_depth_idx
-
-                        # Determine quadrant based on deepest point
-                        if max_depth_row < img_center_row and max_depth_col < img_center_col:
-                            quadrant = "upper-left"
-                        elif max_depth_row < img_center_row and max_depth_col >= img_center_col:
-                            quadrant = "upper-right"
-                        elif max_depth_row >= img_center_row and max_depth_col < img_center_col:
-                            quadrant = "lower-left"
-                        else:
-                            quadrant = "lower-right"
-
-                        quadrant_source = "deepest_point"
-                    except Exception as e:
-                        logging.warning(f"Failed to compute deepest point quadrant: {e}")
-
-                    # Back out and scan when lumen is poor
-                    constrained_actions[env_id, 0] = 0.0  # no left/right translation
-                    constrained_actions[env_id, 1] = 0.0  # no up/down translation
-                    constrained_actions[env_id, 2] = -0.02  # back out slowly
-                    constrained_actions[env_id, 5] = 0.0  # no roll
-
-                    scan_yaw = torch.clamp(escape_directions[env_id, 0], -0.4, 0.4)
-                    scan_pitch = torch.clamp(escape_directions[env_id, 1], -0.4, 0.4)
-                    if torch.abs(scan_yaw) < 1e-3 and torch.abs(scan_pitch) < 1e-3:
-                        scan_yaw = torch.clamp(constrained_actions[env_id, 4], -0.2, 0.2)
-                        scan_pitch = torch.clamp(constrained_actions[env_id, 3], -0.2, 0.2)
-
-                    constrained_actions[env_id, 4] = scan_yaw
-                    constrained_actions[env_id, 3] = scan_pitch
-
-                    # Print quadrant and actions for each environment
-                    clipped_action = constrained_actions[env_id]
-                    lumen_vis = lumen_visibilities[env_id].item()
-                    #print(f"Env {env_id} - Quadrant: {quadrant:12s} (backout_scan) | LumenVis: {lumen_vis:6.3f}")
-                    continue
-
-                # Clip forward/back motion to range [0.01, 0.05]
-                constrained_actions[env_id, 2] = torch.clamp(constrained_actions[env_id, 2], min=0.01, max=0.05)
-
-                # Always disable roll (set to 0)
-                constrained_actions[env_id, 5] = 0.0    
-
-                if quadrant == "upper-left":
-                    # Clip to go up and left: translation left/up, yaw left, pitch up
-                    constrained_actions[env_id, 0] = torch.clamp(constrained_actions[env_id, 0], max=0)  # v_left_right <= 0 (left)
-                    constrained_actions[env_id, 1] = torch.clamp(constrained_actions[env_id, 1], max=0)  # v_up_down <= 0 (up)
-                    constrained_actions[env_id, 3] = torch.clamp(constrained_actions[env_id, 3], max=0)  # ω_pitch <= 0 (up)
-                    constrained_actions[env_id, 4] = torch.clamp(constrained_actions[env_id, 4], max=0)  # ω_yaw <= 0 (left)
-
-                elif quadrant == "upper-right":
-                    # Clip to go up and right: translation right/up, yaw right, pitch up
-                    constrained_actions[env_id, 0] = torch.clamp(constrained_actions[env_id, 0], min=0)  # v_left_right >= 0 (right)
-                    constrained_actions[env_id, 1] = torch.clamp(constrained_actions[env_id, 1], max=0)  # v_up_down <= 0 (up)
-                    constrained_actions[env_id, 3] = torch.clamp(constrained_actions[env_id, 3], max=0)  # ω_pitch <= 0 (up)
-                    constrained_actions[env_id, 4] = torch.clamp(constrained_actions[env_id, 4], min=0)  # ω_yaw >= 0 (right)
-
-                elif quadrant == "lower-left":
-                    # Clip to go down and left: translation left/down, yaw left, pitch down
-                    constrained_actions[env_id, 0] = torch.clamp(constrained_actions[env_id, 0], max=0)  # v_left_right <= 0 (left)
-                    constrained_actions[env_id, 1] = torch.clamp(constrained_actions[env_id, 1], min=0)  # v_up_down >= 0 (down)
-                    constrained_actions[env_id, 3] = torch.clamp(constrained_actions[env_id, 3], min=0)  # ω_pitch >= 0 (down)
-                    constrained_actions[env_id, 4] = torch.clamp(constrained_actions[env_id, 4], max=0)  # ω_yaw <= 0 (left)
-
-                elif quadrant == "lower-right":
-                    # Clip to go down and right: translation right/down, yaw right, pitch down
-                    constrained_actions[env_id, 0] = torch.clamp(constrained_actions[env_id, 0], min=0)  # v_left_right >= 0 (right)
-                    constrained_actions[env_id, 1] = torch.clamp(constrained_actions[env_id, 1], min=0)  # v_up_down >= 0 (down)
-                    constrained_actions[env_id, 3] = torch.clamp(constrained_actions[env_id, 3], min=0)  # ω_pitch >= 0 (down)
-                    constrained_actions[env_id, 4] = torch.clamp(constrained_actions[env_id, 4], min=0)  # ω_yaw >= 0 (right)
-
-                # Print quadrant and actions for each environment
-                clipped_action = constrained_actions[env_id]
+                if self.env_config.get("data_sampling_mode", False):
+                    quadrant_source = f"depth_fraction_{self.env_config.get('target_depth_region_fraction', 0.7):.2f}"
                 lumen_vis = lumen_visibilities[env_id].item()
-                print(f"Env {env_id} - Quadrant: {quadrant:12s} ({quadrant_source}) | LumenVis: {lumen_vis:6.3f}")
+
+                if robot_type == "proximal_actuated":
+                    # 4-DOF robot: [translate, twist, yaw, pitch]
+                    # Keep the configured forward increment in non-teleop mode.
+                    if self.env_config.get("teleoperate_mode", False):
+                        constrained_actions[env_id, 0] = torch.clamp(constrained_actions[env_id, 0], min=-0.2, max=0.2)
+                    else:
+                        constrained_actions[env_id, 0] = forward_increment
+
+                    # Constrain yaw/pitch direction only; do not inject a minimum step size.
+                    if quadrant == "upper-left":
+                        constrained_actions[env_id, 2] = torch.clamp(constrained_actions[env_id, 2], max=0.0)  # yaw <= 0 (left)
+                        constrained_actions[env_id, 3] = torch.clamp(constrained_actions[env_id, 3], max=0.0)  # pitch <= 0 (up)
+                    elif quadrant == "upper-right":
+                        constrained_actions[env_id, 2] = torch.clamp(constrained_actions[env_id, 2], min=0.0)  # yaw >= 0 (right)
+                        constrained_actions[env_id, 3] = torch.clamp(constrained_actions[env_id, 3], max=0.0)  # pitch <= 0 (up)
+                    elif quadrant == "lower-left":
+                        constrained_actions[env_id, 2] = torch.clamp(constrained_actions[env_id, 2], max=0.0)  # yaw <= 0 (left)
+                        constrained_actions[env_id, 3] = torch.clamp(constrained_actions[env_id, 3], min=0.0)  # pitch >= 0 (down)
+                    elif quadrant == "lower-right":
+                        constrained_actions[env_id, 2] = torch.clamp(constrained_actions[env_id, 2], min=0.0)  # yaw >= 0 (right)
+                        constrained_actions[env_id, 3] = torch.clamp(constrained_actions[env_id, 3], min=0.0)  # pitch >= 0 (down)
+
+                    print(f"Env {env_id} - Quadrant: {quadrant:12s} ({quadrant_source}) | LumenVis: {lumen_vis:6.3f}")
+
+                else:
+                    # 6-DOF robot: [left/right, up/down, forward/back, roll, yaw, pitch]
+                    # Keep the configured forward increment in non-teleop mode.
+                    if self.env_config.get("teleoperate_mode", False):
+                        constrained_actions[env_id, 2] = torch.clamp(constrained_actions[env_id, 2], min=-0.2, max=0.2)
+                    else:
+                        constrained_actions[env_id, 2] = forward_increment
+
+                    # Always disable roll (set to 0)
+                    constrained_actions[env_id, 3] = 0.0
+
+                    if quadrant == "upper-left":
+                        constrained_actions[env_id, 0] = torch.clamp(constrained_actions[env_id, 0], max=0.0)  # v_left_right <= 0 (left)
+                        constrained_actions[env_id, 1] = torch.clamp(constrained_actions[env_id, 1], max=0.0)  # v_up_down <= 0 (up)
+                        constrained_actions[env_id, 5] = torch.clamp(constrained_actions[env_id, 5], max=0.0)  # delta_pitch <= 0 (up)
+                        constrained_actions[env_id, 4] = torch.clamp(constrained_actions[env_id, 4], max=0.0)  # delta_yaw <= 0 (left)
+                    elif quadrant == "upper-right":
+                        constrained_actions[env_id, 0] = torch.clamp(constrained_actions[env_id, 0], min=0.0)  # v_left_right >= 0 (right)
+                        constrained_actions[env_id, 1] = torch.clamp(constrained_actions[env_id, 1], max=0.0)  # v_up_down <= 0 (up)
+                        constrained_actions[env_id, 5] = torch.clamp(constrained_actions[env_id, 5], max=0.0)  # delta_pitch <= 0 (up)
+                        constrained_actions[env_id, 4] = torch.clamp(constrained_actions[env_id, 4], min=0.0)  # delta_yaw >= 0 (right)
+                    elif quadrant == "lower-left":
+                        constrained_actions[env_id, 0] = torch.clamp(constrained_actions[env_id, 0], max=0.0)  # v_left_right <= 0 (left)
+                        constrained_actions[env_id, 1] = torch.clamp(constrained_actions[env_id, 1], min=0.0)  # v_up_down >= 0 (down)
+                        constrained_actions[env_id, 5] = torch.clamp(constrained_actions[env_id, 5], min=0.0)  # delta_pitch >= 0 (down)
+                        constrained_actions[env_id, 4] = torch.clamp(constrained_actions[env_id, 4], max=0.0)  # delta_yaw <= 0 (left)
+                    elif quadrant == "lower-right":
+                        constrained_actions[env_id, 0] = torch.clamp(constrained_actions[env_id, 0], min=0.0)  # v_left_right >= 0 (right)
+                        constrained_actions[env_id, 1] = torch.clamp(constrained_actions[env_id, 1], min=0.0)  # v_up_down >= 0 (down)
+                        constrained_actions[env_id, 5] = torch.clamp(constrained_actions[env_id, 5], min=0.0)  # delta_pitch >= 0 (down)
+                        constrained_actions[env_id, 4] = torch.clamp(constrained_actions[env_id, 4], min=0.0)  # delta_yaw >= 0 (right)
+
+                    print(f"Env {env_id} - Quadrant: {quadrant:12s} ({quadrant_source}) | LumenVis: {lumen_vis:6.3f}")
 
         return constrained_actions
 
@@ -652,14 +810,26 @@ class ARCIsaacEnv(DirectRLEnv):
         # Apply conditional logic to actions BEFORE passing to robot
 
         actions_to_apply = self.actions.clone()
+        robot_type = self.robot_config.get("robot_type", "magnetic_endoscope")
+
+        # Determine forward/translate action index based on robot type
+        # 4-DOF: [translate, twist, yaw, pitch] - translate is index 0
+        # 6-DOF: [left/right, up/down, forward/back, roll, yaw, pitch] - forward/back is index 2
+        forward_action_idx = 0 if robot_type == "proximal_actuated" else 2
+
         if self.env_config.get("clip_actions", True):
             # Apply movement constraints
             actions_to_apply = self._apply_movement_constraints(actions_to_apply)
             print("Applied movement constraints to actions.")
             # Override actions with backward motion if in backward motion mode
             actions_to_apply = self._apply_backward_motion(actions_to_apply)
+            actions_to_apply = self._apply_reorientation_motion(actions_to_apply)
+        elif self.env_config.get("teleoperate_mode", False):
+            # In teleoperate mode, clamp forward/backward action to [-0.2, 0.2]
+            actions_to_apply[:, forward_action_idx] = torch.clamp(actions_to_apply[:, forward_action_idx], min=-0.2, max=0.2)
         else:
-            actions_to_apply[:, 2] = torch.clamp(actions_to_apply[:, 2], min=0.01, max=0.05)
+            forward_increment = self.env_config.get("forward_increment", self.translation_action_scale)
+            actions_to_apply[:, forward_action_idx] = forward_increment
 
         # CRITICAL: Update self.actions to the executed version for reward computation
         # This ensures PPO learns about the actions that were actually executed
@@ -675,7 +845,8 @@ class ARCIsaacEnv(DirectRLEnv):
         """
         if self.colon.is_rigid:
             # For rigid colons, check if the body has moved too far from initial position
-            current_pos = self.colon.colon_body.data.body_state_w[:, :3]
+            # body_state_w shape: (num_envs, num_bodies, 13), use index 0 for the single body
+            current_pos = self.colon.colon_body.data.body_state_w[:, 0, :3]
             # Use the initial colon position stored in init_pos
             initial_pos = torch.tensor(self.colon.init_pos, device=self.device).unsqueeze(0).expand(self.num_envs, -1)
             displacement = torch.norm(current_pos - initial_pos, dim=1)
@@ -750,9 +921,12 @@ class ARCIsaacEnv(DirectRLEnv):
         else:
             # Normal mode: apply all reset conditions
             # Check if any environment should reset due to consecutive negative rewards
+            # This reset can be disabled via disable_lumen_visibility_reset config (e.g., for test mode)
             should_reset = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-            if hasattr(self.reward_function, 'should_reset_env') and self.reward_function.should_reset_env is not None:
-                should_reset = self.reward_function.should_reset_env.clone()
+            disable_lumen_reset = self.env_config.get("disable_lumen_visibility_reset", False)
+            if not disable_lumen_reset:
+                if hasattr(self.reward_function, 'should_reset_env') and self.reward_function.should_reset_env is not None:
+                    should_reset = self.reward_function.should_reset_env.clone()
 
             time_out = self.episode_length_buf >= self.max_episode_length - 1
             truncated = time_out | self.truncate_now | self.colon_invalid | should_reset
@@ -787,6 +961,12 @@ class ARCIsaacEnv(DirectRLEnv):
         # Save reset trigger status for logging
         if hasattr(self.reward_function, 'should_reset_env') and self.reward_function.should_reset_env is not None:
             self.extras["reset_triggered"] = self.reward_function.should_reset_env.clone()
+
+        # Reward-ablation diagnostics. These are per-step, per-env values used for
+        # normalized reward comparisons across partial and full reward designs.
+        if hasattr(self.reward_function, 'latest_reward_metrics') and self.reward_function.latest_reward_metrics:
+            for metric_name, metric_value in self.reward_function.latest_reward_metrics.items():
+                self.extras[metric_name] = metric_value.clone()
 
         self.previous_states = current_states
         self.latest_rewards = rewards
@@ -823,7 +1003,7 @@ class ARCIsaacEnv(DirectRLEnv):
             obs = None
         #pdb.set_trace()
         pose=self.robot.get_pose()
-        #print("robot_pose",pose)
+        print("robot_pose",pose)
 
         robot_positions = self.robot.get_pose()[:, :3]
         depth_data = self.robot.get_depth()
@@ -840,7 +1020,7 @@ class ARCIsaacEnv(DirectRLEnv):
         }
         return states
 
-    def reset(self, seed=42, env_ids: torch.Tensor = None, options = None):
+    def reset(self, seed=np.random, env_ids: torch.Tensor = None, options = None):
         self.goal_reached = torch.tensor([False]*self.num_envs, device=self.device)
         self.hit_wall = torch.tensor([False]*self.num_envs, device=self.device)
         self.truncate_now = torch.tensor([False]*self.num_envs, device=self.device)
@@ -856,6 +1036,10 @@ class ARCIsaacEnv(DirectRLEnv):
         # Reset lumen visibility tracking
         self.lumen_visibility_negative_counter = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
         self.lumen_backward_remaining = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        self.reorient_remaining = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        self.wall_hit_counter = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        self.wall_recover_cooldown_remaining = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        self.recover_from_wall = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         # Reset bright region tracking
         self.bright_region_directions = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
@@ -895,7 +1079,7 @@ class ARCIsaacEnv(DirectRLEnv):
             # use the position from the CSV file instead of colon entry positions
         else:
             # Set robot positions based on colon entry points (only when NOT loading from CSV)
-            self.robot.set_pos(self.entry_positions)
+            self.robot.set_pos(self.entry_positions, init_rot=self.robot_init_rot)
 
             # CRITICAL: Write data to sim and forward kinematics
             self.scene.write_data_to_sim()
@@ -985,7 +1169,11 @@ class ARCIsaacEnv(DirectRLEnv):
             self.robot.reset(env_ids, joint_positions=csv_init_file)
         else:
             # Set robot position based on colon entry point (only when NOT loading from CSV)
-            self.robot.set_pos(self.entry_positions)
+            # Use only the positions for the envs being reset. Passing the full
+            # self.entry_positions tensor during a partial reset makes robot.reset()
+            # fall back to its default root pose because the batch shape no longer
+            # matches len(env_ids), which can place the robot outside the colon.
+            self.robot.set_pos(entry_positions_for_reset, init_rot=self.robot_init_rot)
 
             # Write and forward to update sim buffers
             self.scene.write_data_to_sim()

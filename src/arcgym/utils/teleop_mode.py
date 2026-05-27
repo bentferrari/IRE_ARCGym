@@ -9,7 +9,13 @@ import torch
 from arcgym.utils.keyboard import FPVKeyboard
 
 def run_teleoperation_mode(env, simulation_app, device="cuda"):
-    """Run the environment in teleoperation mode."""
+    """Run the environment in teleoperation mode.
+
+    Args:
+        env: The environment to run teleoperation on.
+        simulation_app: The Isaac Sim simulation application.
+        device: Device to run on (default: "cuda").
+    """
     logging.info("Starting teleoperation mode...")
     logging.info("Use keyboard to control the robot. Press 'C' to reset, 'G' to save state.")
 
@@ -103,51 +109,45 @@ def run_teleoperation_mode(env, simulation_app, device="cuda"):
     teleop_interface.add_callback("G", save_robot_state)
 
     env_id = 0
-    
+
     # Reset environment and teleop interface
     env.reset()
     teleop_interface.reset()
-    
-    # Main teleoperation loop
-    while simulation_app.is_running():
-        # Run in inference mode for performance
-        with torch.inference_mode():
-            # Get keyboard input
-            teleop_data = teleop_interface.advance()
 
-            # Apply teleop commands when active
-            if teleoperation_active:
-                # Convert teleop data to actions
-                teleop_actions = pre_process_actions(teleop_data, device)
-                actions = teleop_actions.repeat(env.num_envs, 1)
+    # Main teleoperation loop with Ctrl+C handling
+    try:
+        while simulation_app.is_running():
+            # Run in inference mode for performance
+            with torch.inference_mode():
+                # Get keyboard input
+                teleop_data = teleop_interface.advance()
 
-                # Debug: Log non-zero actions
-                if torch.any(torch.abs(teleop_actions) > 0.01):
-                    logging.info(f"Teleop actions: {teleop_actions}")
+                # Apply teleop commands when active
+                if teleoperation_active:
+                    # Convert teleop data to actions
+                    teleop_actions = pre_process_actions(teleop_data, device)
+                    actions = teleop_actions.repeat(env.num_envs, 1)
 
-                # Apply actions to environment
-                obs, reward, done, info = env.step(actions)
-                #from PIL import Image
-                #imsave = lambda path, i: Image.fromarray(np.clip((obs[i*3:(i+1)*3]*255), 0, 255).astype(np.uint8).transpose(1,2,0)).save(f"debug_image_{i:02}.png")
-                #import IPython
-                #IPython.embed()
-                # if len(obs) == 12:
-                #     imsave(obs, 0)
-                #     imsave(obs, 1)
-                #     imsave(obs, 2)
-                #     imsave(obs, 3)
-                #goal_reached = info[env_id]["goal_reached"]
-                #l2_norm = info[env_id]["l2_norm"]
-                logging.info(f"{reward[env_id].item():.03f}, {done[env_id]}")#, goal_reached, f"{l2_norm:.03f}")
-            
-            # Always render in teleop mode
-            #env.render()
+                    # Debug: Log non-zero actions
+                    if torch.any(torch.abs(teleop_actions) > 0.01):
+                        logging.info(f"Teleop actions: {teleop_actions}")
 
-            # Handle reset requests
-            if should_reset_recording_instance:
-                env.reset()
-                should_reset_recording_instance = False
-                logging.info("Environment reset completed.")
+                    # Apply actions to environment
+                    obs, reward, done, info = env.step(actions)
+
+                    logging.info(f"{reward[env_id].item():.03f}, {done[env_id]}")
+
+                # Always render in teleop mode
+                #env.render()
+
+                # Handle reset requests
+                if should_reset_recording_instance:
+                    env.reset()
+                    should_reset_recording_instance = False
+                    logging.info("Environment reset completed.")
+
+    except KeyboardInterrupt:
+        logging.info("\nCtrl+C detected. Exiting teleoperation mode.")
 
 def pre_process_actions(
     teleop_data: tuple[np.ndarray, bool] | list[tuple[np.ndarray, np.ndarray, np.ndarray]],

@@ -330,10 +330,22 @@ class DepthDistanceReward(RewardFunction):
         return torch.stack(rewards)
 
 class FinalReward(RewardFunction):
-    def __init__(self, eps, reward_scale, center_weight=0.4, goal_weight=0.4, obstruction_weight=0.2,
-                 alignment_threshold=0.85, consecutive_negative_threshold=200, reset_penalty=-100.0,
-                 episode_length_s=30.0, decimation=2, dt=1.0/240.0,
-                 success_alignment_ratio=0.90, **kwargs):
+    ABLATION_VARIANTS = {
+        "center_only",
+        "depth_existence",
+        "deep_area",
+        "lumen_evidence",
+        "full_reward",
+    }
+
+    def __init__(self, eps, reward_scale, center_weight=0.5, goal_weight=0.0, obstruction_weight=0.5,
+                 alignment_threshold=0.8, consecutive_negative_threshold=200, reset_penalty=-100.0,
+                 episode_length_s=20.0, decimation=2, dt=1.0/240.0,
+                 success_alignment_ratio=0.8, success_distance_threshold=0.1,
+                 reward_variant=None, reward_wc=None, reward_wo=None, reward_lambda_o=1.0,
+                 reward_beta=0.6, train_with_normalized_reward=False,
+                 reset_on_low_lumen_visibility=False, low_lumen_visibility_threshold=-0.4,
+                 low_lumen_reset_penalty=-1.0, **kwargs):
         """
         Final reward function combining multiple penalty components.
 
@@ -350,16 +362,30 @@ class FinalReward(RewardFunction):
             decimation: Number of physics steps per environment step (default 2)
             dt: Physics time step in seconds (default 1/240)
             success_alignment_ratio: Required ratio of steps with high alignment for success (default 0.90)
+            success_distance_threshold: Distance threshold to target for success (default 0.05 meters)
         """
         self.reward_scale = reward_scale
         self.eps = eps
         self.center_weight = center_weight
         self.goal_weight = goal_weight
         self.obstruction_weight = obstruction_weight
+        self.reward_variant = reward_variant
+        self.reward_wc = center_weight if reward_wc is None else reward_wc
+        self.reward_wo = obstruction_weight if reward_wo is None else reward_wo
+        self.reward_lambda_o = reward_lambda_o
+        self.reward_beta = reward_beta
+        self.train_with_normalized_reward = train_with_normalized_reward
+        self.reset_on_low_lumen_visibility = reset_on_low_lumen_visibility
+        self.low_lumen_visibility_threshold = low_lumen_visibility_threshold
+        self.low_lumen_reset_penalty = low_lumen_reset_penalty
+        self.ablation_enabled = reward_variant is not None
+        if self.ablation_enabled and reward_variant not in self.ABLATION_VARIANTS:
+            raise ValueError(f"Unknown reward_variant: {reward_variant}")
         self.alignment_threshold = alignment_threshold
         self.consecutive_negative_threshold = consecutive_negative_threshold
         self.reset_penalty = reset_penalty
         self.success_alignment_ratio = success_alignment_ratio
+        self.success_distance_threshold = success_distance_threshold
         # Calculate max_episode_length from episode_length_s, decimation, and dt
         # Formula: max_episode_length = episode_length_s / (decimation * dt)
         self.max_episode_length = int(episode_length_s / (decimation * dt))
@@ -370,6 +396,56 @@ class FinalReward(RewardFunction):
         self.should_reset_env = None  # Flag to indicate which environments should reset
         # Track high-alignment steps for percentage-based success
         self.high_alignment_step_counter = None  # Steps with center_alignment > 0.95
+        self.latest_reward_metrics = {}
+
+    def _reward_range(self, variant):
+        """Return the theoretical raw-reward range for normalized logging.
+
+        Ablation variants share one common range so normalized_mean_step_reward
+        has the same absolute scale across center_only, partial rewards, and
+        full_reward. With default coefficients this common range is [-0.5, 2.0].
+        """
+        if variant in self.ABLATION_VARIANTS:
+            ranges = [
+                (0.0, 1.0),  # center_only: s_c
+                (0.0, 1.0 + float(self.reward_lambda_o)),  # partial cue variants
+                (-float(self.reward_wo), float(self.reward_wc) + float(self.reward_wo)),  # full_reward
+            ]
+            return min(r[0] for r in ranges), max(r[1] for r in ranges)
+        # Legacy reward is already clipped to [-1, 1] and is not part of the ablation scale.
+        return -1.0, 1.0
+
+    def _normalize_reward(self, raw_reward, variant):
+        reward_min, reward_max = self._reward_range(variant)
+        denom = max(reward_max - reward_min, 1e-6)
+        normalized = 2.0 * (raw_reward - reward_min) / denom - 1.0
+        return float(np.clip(normalized, -1.0, 1.0))
+
+    def _compute_ablation_reward(self, s_c, s_1, s_2, s_3, s_o):
+        """
+        Compute the selected ablation reward.
+
+        s_c is the center-alignment score.
+        s_1 is the depth-existence cue.
+        s_2 is the deep-region area cue.
+        s_3 is the depth-contrast / geometric-confidence cue.
+        s_o is the full lumen-visibility score.
+
+        The ablation compares partial reward designs and the full reward.
+        """
+        variant = self.reward_variant
+        if variant == "center_only":
+            return s_c
+        if variant == "depth_existence":
+            return s_c + self.reward_lambda_o * s_1
+        if variant == "deep_area":
+            return s_c + self.reward_lambda_o * s_2
+        if variant == "lumen_evidence":
+            evidence = self.reward_beta * s_1 + (1.0 - self.reward_beta) * s_2
+            return s_c + self.reward_lambda_o * evidence
+        if variant == "full_reward":
+            return self.reward_wc * s_c + self.reward_wo * s_o
+        raise ValueError(f"Unknown reward_variant: {variant}")
 
     def reset(self, initial_positions, goals, env_ids=None):
         """
@@ -438,6 +514,18 @@ class FinalReward(RewardFunction):
         goals = self.goals
         entry_poss = self.initial_positions
         rewards = []
+        metric_accumulators = {
+            "s_c": [],
+            "s_1": [],
+            "s_2": [],
+            "s_3": [],
+            "s_o": [],
+            "raw_step_reward": [],
+            "normalized_step_reward": [],
+            "normalized_progress": [],
+            "roi_aligned": [],
+            "lumen_visible": [],
+        }
 
         # Reset goal_reached status for this step
         if self.goal_reached_per_env is None:
@@ -481,7 +569,7 @@ class FinalReward(RewardFunction):
             depth_threshold_low = 0.6 * max_depth
             depth_threshold_high = 0.7 * max_depth
             #print(f"using thresholds 0.6 and 0.7")
-            if min_depth < 0.06 and max_depth <0.9 and max_depth >0.2:
+            if min_depth < 0.02 and max_depth <0.9 and max_depth >0.2:
                 depth_threshold_low = 0.0 * max_depth
                 depth_threshold_high = 0.2 * max_depth
 
@@ -569,27 +657,29 @@ class FinalReward(RewardFunction):
             reward_components['center_alignment'] = center_alignment
             self.center_alignment_per_env[i] = center_alignment
 
-            # 2. Lumen visibility quality: normalized lumen score in [-1, 1]
-            # Good lumen view requires BOTH deep point AND wide open view
+            # 2. Lumen visibility quality. The ablation components are:
+            # s_1: depth-existence cue, large when max depth indicates open lumen.
+            # s_2: deep-region area cue, large when enough pixels belong to the far-depth region.
+            # s_3: depth-contrast / geometric-confidence cue, large when the image has useful depth range.
+            # s_o: full lumen-visibility score in [-1, 1].
             LUMEN_MIN_DEPTH = 0.20  # Minimum max depth for good lumen
             WALL_MAX_DEPTH = 0.05   # Maximum depth indicating wall
             MIN_HIGH_DEPTH_RATIO = 0.20  # Minimum ratio of far-depth pixels for quality view
             DEPTH_RANGE_MIN = 0.04  # Minimum depth range to consider lumen present
             DEPTH_RANGE_GOOD = 0.12  # Depth range considered strong lumen
 
+            depth_span = max(LUMEN_MIN_DEPTH - WALL_MAX_DEPTH, 1e-6)
+            s_1 = np.clip((max_depth - WALL_MAX_DEPTH) / depth_span, 0.0, 1.0)
+            s_2 = np.clip((high_depth_ratio - MIN_HIGH_DEPTH_RATIO) / (1.0 - MIN_HIGH_DEPTH_RATIO), 0.0, 1.0)
+            s_3 = np.clip((depth_range - DEPTH_RANGE_MIN) / max(DEPTH_RANGE_GOOD - DEPTH_RANGE_MIN, 1e-6), 0.0, 1.0)
+            s_o = 2.0 * (self.reward_beta * s_1 + (1.0 - self.reward_beta) * s_2) * s_3 - 1.0
+
             if max_depth < WALL_MAX_DEPTH or depth_range < DEPTH_RANGE_MIN or shallow_ratio > 0.6:
                 lumen_reward = -1.0
-                reward_components['center_alignment'] = -1.0  # Override center alignment
+                if not self.ablation_enabled:
+                    reward_components['center_alignment'] = -1.0  # Preserve legacy behavior.
             else:
-                depth_span = max(LUMEN_MIN_DEPTH - WALL_MAX_DEPTH, 1e-6)
-                depth_score = (max_depth - WALL_MAX_DEPTH) / depth_span
-                depth_score = np.clip(depth_score, 0.0, 1.0)
-
-                ratio_score = np.clip((high_depth_ratio - MIN_HIGH_DEPTH_RATIO) / (1.0 - MIN_HIGH_DEPTH_RATIO), 0.0, 1.0)
-                range_score = np.clip((depth_range - DEPTH_RANGE_MIN) / max(DEPTH_RANGE_GOOD - DEPTH_RANGE_MIN, 1e-6), 0.0, 1.0)
-
-                lumen_score = (0.6 * depth_score + 0.4 * ratio_score) * range_score
-                lumen_reward = 2.0 * lumen_score - 1.0
+                lumen_reward = s_o
 
             reward_components['lumen_visibility'] = lumen_reward
 
@@ -599,10 +689,17 @@ class FinalReward(RewardFunction):
             # 3. Penalty for deviation from robot position to goal position
             reward_components['goal_progress'] = 1.0 - (d2target / d_max).item()
 
-            # Combine reward components with weights
-            total_reward = (self.center_weight * reward_components['center_alignment'] +
-                          #self.goal_weight * reward_components['goal_progress'] +
-                          self.obstruction_weight * reward_components['lumen_visibility'])
+            # Combine reward components with weights. If no ablation variant is selected,
+            # preserve the legacy full reward exactly as the default behavior.
+            if self.ablation_enabled:
+                raw_reward = self._compute_ablation_reward(center_alignment, s_1, s_2, s_3, s_o)
+                normalized_reward = self._normalize_reward(raw_reward, self.reward_variant)
+                total_reward = normalized_reward if self.train_with_normalized_reward else raw_reward
+            else:
+                total_reward = (self.center_weight * reward_components['center_alignment'] +
+                              #self.goal_weight * reward_components['goal_progress'] +
+                              self.obstruction_weight * reward_components['lumen_visibility'])
+                raw_reward = total_reward
 
             # Poor center alignment penalty - penalize when not well-aligned with lumen center
             # if center_alignment < 0.8:
@@ -613,26 +710,47 @@ class FinalReward(RewardFunction):
             #     total_reward = -1.0
 
             # Hitting wall - severe penalty (very close collision)
-            if min_depth < 0.01:
+            if not self.ablation_enabled and min_depth < 0.01:
                 total_reward = -1.0
+                raw_reward = total_reward
 
             # Normalize the reward to be in range [-1, 1]
             # The weighted combination naturally stays in this range for normal operation
             # Special conditions are already normalized
-            total_reward = np.clip(total_reward, -1.0, 1.0)
+            if not self.ablation_enabled:
+                total_reward = np.clip(total_reward, -1.0, 1.0)
+                raw_reward = total_reward
+                normalized_reward = total_reward
+
+            # Vanilla PPO ablation safety rule: when action clipping is disabled,
+            # a low lumen-visibility score means the robot has lost a useful lumen
+            # view. Reset that env on the next done check and assign an immediate
+            # bounded penalty to the agent.
+            if self.reset_on_low_lumen_visibility and lumen_reward <= self.low_lumen_visibility_threshold:
+                total_reward = self.low_lumen_reset_penalty
+                raw_reward = self.low_lumen_reset_penalty
+                normalized_reward = -1.0
+                self.should_reset_env[i] = True
+                self.consecutive_negative_counter[i] = 0
+                print(
+                    f"Env {i} - Low lumen visibility reset triggered "
+                    f"(s_o={s_o:.3f}, lumen_reward={lumen_reward:.3f}, "
+                    f"threshold={self.low_lumen_visibility_threshold:.3f})."
+                )
 
             # Track consecutive -1 rewards and trigger reset if threshold is reached
             if abs(total_reward - (-1.0)) < 1e-6:  # Check if reward is -1
                 self.consecutive_negative_counter[i] += 1
                 #print(f"Env {i} - Consecutive -1 rewards: {self.consecutive_negative_counter[i].item()}/{self.consecutive_negative_threshold}")
 
-                # if self.consecutive_negative_counter[i] >= self.consecutive_negative_threshold:
-                #     # Apply reset penalty
-                #     total_reward = self.reset_penalty
-                #     self.should_reset_env[i] = True
-                #     # Reset the counter for this environment
-                #     self.consecutive_negative_counter[i] = 0
-                #     print(f"Env {i} - Reset triggered! Applied penalty of {self.reset_penalty}")
+                if self.consecutive_negative_counter[i] >= self.consecutive_negative_threshold:
+                    # Apply reset penalty
+                    total_reward = self.reset_penalty
+                    raw_reward = total_reward
+                    self.should_reset_env[i] = True
+                    # Reset the counter for this environment
+                    self.consecutive_negative_counter[i] = 0
+                    print(f"Env {i} - Reset triggered! Applied penalty of {self.reset_penalty}")
             else:
                 # Reset counter if reward is not -1
                 self.consecutive_negative_counter[i] = 0
@@ -641,7 +759,7 @@ class FinalReward(RewardFunction):
             # Condition 1: center_alignment > 0.85
             # Condition 2: center_alignment > 0.7 AND lumen_visibility > 0
             # STRICT RULE: Never increment when total_reward = -1.0 (severe penalty)
-            condition_1 = center_alignment > self.alignment_threshold
+            condition_1 = center_alignment > self.alignment_threshold and lumen_reward > -0.15
             condition_2 = center_alignment > 0.7 and lumen_reward > -0.15
             not_severe_penalty = abs(total_reward - (-1.0)) > 1e-6
 
@@ -655,19 +773,24 @@ class FinalReward(RewardFunction):
             #     self.high_alignment_step_counter[i] += 1
             #     print("High alignment step counted", self.high_alignment_step_counter[i].item())
 
-            # Calculate alignment percentage for this episode
-            alignment_percentage = self.high_alignment_step_counter[i].float() / self.max_episode_length
-            #print(f"Env {i} - Alignment Percentage: {alignment_percentage.item()*100:.2f}%")
+            # Distance-based success criterion: check if robot tip is within threshold of target position
+            # The target position is extracted from init_endpose_from_csv
+            distance_to_target = d2target.item()
+            distance_success = distance_to_target < self.success_distance_threshold
 
-            percentage_success = (alignment_percentage >= self.success_alignment_ratio)
-
-            if percentage_success:
-                total_reward = 1.0
+            if distance_success:
+                if not self.ablation_enabled:
+                    total_reward = 1.0
+                    raw_reward = total_reward
+                    normalized_reward = total_reward
                 self.goal_reached_per_env[i] = True
-                print(f"Goal reached in environment {i}! Center alignment > 0.95 for {alignment_percentage.item()*100:.1f}% of {self.max_episode_length} steps (required: {self.success_alignment_ratio*100:.0f}%).")
+                print(f"Goal reached in environment {i}! Robot tip within {self.success_distance_threshold}m of target position (distance: {distance_to_target:.4f}m).")
 
             # Final clamp after reset/goal overrides for normalized rewards
-            total_reward = np.clip(total_reward, -1.0, 1.0)
+            if not self.ablation_enabled:
+                total_reward = np.clip(total_reward, -1.0, 1.0)
+                raw_reward = total_reward
+                normalized_reward = total_reward
 
             # Print reward components and total reward
             print(f"Env {i} - Reward - Center: {reward_components['center_alignment']:.3f}, "
@@ -675,13 +798,29 @@ class FinalReward(RewardFunction):
                   f"Lumen_Visibility: {reward_components['lumen_visibility']:.3f}, "
                   f"Total: {total_reward:.3f}")
 
+            metric_accumulators["s_c"].append(float(center_alignment))
+            metric_accumulators["s_1"].append(float(s_1))
+            metric_accumulators["s_2"].append(float(s_2))
+            metric_accumulators["s_3"].append(float(s_3))
+            metric_accumulators["s_o"].append(float(s_o))
+            metric_accumulators["raw_step_reward"].append(float(raw_reward))
+            metric_accumulators["normalized_step_reward"].append(float(normalized_reward))
+            metric_accumulators["normalized_progress"].append(float(np.clip(reward_components['goal_progress'], 0.0, 1.0)))
+            metric_accumulators["roi_aligned"].append(1.0 if center_alignment > self.alignment_threshold else 0.0)
+            metric_accumulators["lumen_visible"].append(1.0 if s_o > -0.15 else 0.0)
+
             rewards.append(torch.tensor(total_reward,
                                        dtype=torch.float32,
-                                       device='cuda' if torch.cuda.is_available() else 'cpu'))
+                                       device=robot_positions.device))
 
         # Store quadrant information for action clipping (accessible via current_states)
         # We'll store the quadrant for each environment to be used by the environment
         if not hasattr(self, 'low_quadrants'):
             self.low_quadrants = []
 
-        return torch.stack(rewards) * self.reward_scale
+        reward_tensor = torch.stack(rewards) * self.reward_scale
+        self.latest_reward_metrics = {
+            key: torch.tensor(values, dtype=torch.float32, device=robot_positions.device)
+            for key, values in metric_accumulators.items()
+        }
+        return reward_tensor

@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import os
 import json
+import csv
 from pathlib import Path
 from PIL import Image
 
@@ -287,7 +288,6 @@ class PerEnvRewardCallback(BaseCallback):
 
         # Save episode rewards for plotting
         if self.save_plot_data and self.all_episode_rewards:
-            import numpy as np
             # Convert to arrays for easy plotting
             data = {
                 'episodes': np.array([d['global_episode'] for d in self.all_episode_rewards]),
@@ -298,6 +298,171 @@ class PerEnvRewardCallback(BaseCallback):
             np.savez(self.plot_data_file, **data)
             if self.verbose > 0:
                 print(f"\nSaved episode reward data to {self.plot_data_file} for plotting")
+
+
+class RewardAblationMetricsCallback(BaseCallback):
+    """
+    Log reward-ablation components and normalized mean step reward.
+
+    The ablation metrics are emitted by FinalReward through the info dict:
+    s_c is the center-alignment score, s_1 the depth-existence cue, s_2 the
+    deep-region area cue, s_3 the depth-contrast/geometric-confidence cue, and
+    s_o the full lumen-visibility score. This callback records both partial
+    reward designs and the full reward in one reproducible CSV stream.
+    """
+
+    METRIC_KEYS = [
+        "raw_step_reward",
+        "normalized_step_reward",
+        "s_c",
+        "s_1",
+        "s_2",
+        "s_3",
+        "s_o",
+        "normalized_progress",
+        "roi_aligned",
+        "lumen_visible",
+    ]
+
+    def __init__(self, save_dir, reward_variant, constrained, log_interval_steps=500, verbose=0):
+        super().__init__(verbose)
+        self.save_dir = Path(save_dir)
+        self.reward_variant = reward_variant
+        self.constrained = constrained
+        self.log_interval_steps = max(1, int(log_interval_steps))
+        self.csv_path = self.save_dir / "training_log.csv"
+        self.summary_path = self.save_dir / "training_metrics_summary.json"
+        self.rows = []
+        self.total_episodes = 0
+        self.total_successes = 0
+        self._csv_file = None
+        self._writer = None
+        self._latest_row = None
+        self._last_written_timestep = None
+
+    def _on_training_start(self) -> None:
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        fieldnames = [
+            "timestep",
+            "reward_variant",
+            "constrained",
+            "train_reward_mean",
+            "raw_mean_step_reward",
+            "normalized_mean_step_reward",
+            "mean_s_c",
+            "mean_s_1",
+            "mean_s_2",
+            "mean_s_3",
+            "mean_s_o",
+            "normalized_progress",
+            "roi_alignment_rate",
+            "lumen_visible_ratio",
+            "success_rate",
+            "episodes",
+        ]
+        self._csv_file = open(self.csv_path, "w", newline="")
+        self._writer = csv.DictWriter(self._csv_file, fieldnames=fieldnames)
+        self._writer.writeheader()
+        self._csv_file.flush()
+
+    def _extract_metric(self, infos, key):
+        values = []
+        for info in infos:
+            if key not in info or info[key] is None:
+                continue
+            try:
+                value = info[key]
+                if hasattr(value, "item"):
+                    value = value.item()
+                values.append(float(value))
+            except Exception:
+                continue
+        return values
+
+    def _build_row(self, rewards, metric_values):
+        success_rate = self.total_successes / self.total_episodes if self.total_episodes else 0.0
+        return {
+            "timestep": int(self.num_timesteps),
+            "reward_variant": self.reward_variant,
+            "constrained": bool(self.constrained),
+            "train_reward_mean": float(np.mean(rewards)) if rewards is not None else None,
+            "raw_mean_step_reward": float(np.mean(metric_values["raw_step_reward"])) if metric_values["raw_step_reward"] else None,
+            "normalized_mean_step_reward": float(np.mean(metric_values["normalized_step_reward"])) if metric_values["normalized_step_reward"] else None,
+            "mean_s_c": float(np.mean(metric_values["s_c"])) if metric_values["s_c"] else None,
+            "mean_s_1": float(np.mean(metric_values["s_1"])) if metric_values["s_1"] else None,
+            "mean_s_2": float(np.mean(metric_values["s_2"])) if metric_values["s_2"] else None,
+            "mean_s_3": float(np.mean(metric_values["s_3"])) if metric_values["s_3"] else None,
+            "mean_s_o": float(np.mean(metric_values["s_o"])) if metric_values["s_o"] else None,
+            "normalized_progress": float(np.mean(metric_values["normalized_progress"])) if metric_values["normalized_progress"] else None,
+            "roi_alignment_rate": float(np.mean(metric_values["roi_aligned"])) if metric_values["roi_aligned"] else None,
+            "lumen_visible_ratio": float(np.mean(metric_values["lumen_visible"])) if metric_values["lumen_visible"] else None,
+            "success_rate": success_rate,
+            "episodes": int(self.total_episodes),
+        }
+
+    def _write_row(self, row):
+        if row is None:
+            return
+        self.rows.append(row)
+        self._last_written_timestep = row["timestep"]
+        if self._writer is not None:
+            self._writer.writerow(row)
+            self._csv_file.flush()
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", [])
+        rewards = self.locals.get("rewards", None)
+        dones = self.locals.get("dones", [])
+
+        for done, info in zip(dones, infos):
+            if done and isinstance(info, dict) and "episode" in info:
+                self.total_episodes += 1
+                is_success = bool(info.get("goal_reached", False))
+                if is_success:
+                    self.total_successes += 1
+
+        metric_values = {key: self._extract_metric(infos, key) for key in self.METRIC_KEYS}
+
+        for key, values in metric_values.items():
+            if not values:
+                continue
+            mean_value = float(np.mean(values))
+            self.logger.record(f"reward_ablation/{key}_mean", mean_value)
+            for env_idx, value in enumerate(values):
+                self.logger.record(f"reward_ablation_per_env/env_{env_idx}_{key}", value)
+
+        if rewards is not None:
+            self.logger.record("reward_ablation/train_reward_mean", float(np.mean(rewards)))
+
+        self._latest_row = self._build_row(rewards, metric_values)
+        should_write = self.n_calls == 1 or self.num_timesteps % self.log_interval_steps == 0
+        if should_write:
+            self._write_row(self._latest_row)
+        return True
+
+    def _on_training_end(self) -> None:
+        if (
+            self._latest_row is not None
+            and self._latest_row["timestep"] != self._last_written_timestep
+        ):
+            self._write_row(self._latest_row)
+
+        if self._csv_file is not None:
+            self._csv_file.close()
+            self._csv_file = None
+
+        summary = {
+            "reward_variant": self.reward_variant,
+            "constrained": bool(self.constrained),
+            "total_episodes": int(self.total_episodes),
+            "total_successes": int(self.total_successes),
+            "success_rate": self.total_successes / self.total_episodes if self.total_episodes else 0.0,
+        }
+        if self.rows:
+            final_row = self.rows[-1]
+            summary.update({f"final_{key}": value for key, value in final_row.items()})
+        with open(self.summary_path, "w") as f:
+            json.dump(summary, f, indent=2)
 
 
 class SuccessRateDataSaver(BaseCallback):
@@ -568,6 +733,337 @@ class TrainingMetricsCallback(BaseCallback):
             print("Rollout ended, training metrics should be logged")
 
 
+class FreezeLearningUntilFirstEpisodeCallback(BaseCallback):
+    """
+    Temporarily freeze optimizer learning rates until the first completed episode.
+
+    This prevents parameter updates during the first episode while still allowing
+    data collection, replay-buffer population, and callback-based recording.
+    """
+
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+        self._optimizer_states = []
+        self._restored = False
+        self._frozen = False
+
+    def _iter_model_optimizers(self):
+        """Collect known optimizers from SB3 on-policy and off-policy models."""
+        candidates = []
+
+        for attr_name in ("policy", "actor", "critic"):
+            obj = getattr(self.model, attr_name, None)
+            if obj is not None and hasattr(obj, "optimizer"):
+                candidates.append(getattr(obj, "optimizer"))
+
+        for attr_name in ("ent_coef_optimizer",):
+            opt = getattr(self.model, attr_name, None)
+            if opt is not None:
+                candidates.append(opt)
+
+        # Some models may expose extra optimizers in lists/tuples.
+        for attr_name in ("optimizers",):
+            maybe_opts = getattr(self.model, attr_name, None)
+            if isinstance(maybe_opts, (list, tuple)):
+                candidates.extend(maybe_opts)
+
+        seen = set()
+        optimizers = []
+        for opt in candidates:
+            if opt is None or not hasattr(opt, "param_groups"):
+                continue
+            if id(opt) in seen:
+                continue
+            seen.add(id(opt))
+            optimizers.append(opt)
+        return optimizers
+
+    def _freeze_optimizers(self):
+        if self._frozen:
+            return
+
+        self._optimizer_states = []
+        for opt in self._iter_model_optimizers():
+            original_lrs = [group.get("lr", 0.0) for group in opt.param_groups]
+            self._optimizer_states.append((opt, original_lrs))
+            for group in opt.param_groups:
+                group["lr"] = 0.0
+
+        self._frozen = True
+        if self.verbose > 0:
+            print(
+                "FreezeLearningUntilFirstEpisodeCallback: froze "
+                f"{len(self._optimizer_states)} optimizer(s) until first episode completes"
+            )
+
+    def _restore_optimizers(self):
+        if self._restored:
+            return
+
+        for opt, original_lrs in self._optimizer_states:
+            for group, lr in zip(opt.param_groups, original_lrs):
+                group["lr"] = lr
+
+        self._restored = True
+        if self.verbose > 0:
+            print("FreezeLearningUntilFirstEpisodeCallback: restored optimizer learning rates")
+
+    def _on_training_start(self) -> None:
+        self._freeze_optimizers()
+
+    def _on_step(self) -> bool:
+        if self._restored:
+            return True
+
+        if 'dones' not in self.locals or 'infos' not in self.locals:
+            return True
+
+        dones = self.locals['dones']
+        infos = self.locals['infos']
+
+        for done, info in zip(dones, infos):
+            if done and 'episode' in info:
+                self._restore_optimizers()
+                break
+
+        return True
+
+    def _on_training_end(self) -> None:
+        # Ensure we don't leak zero LRs if training stops early.
+        self._restore_optimizers()
+
+
+class FreezeLearningUntilAllEnvsNEpisodesCallback(BaseCallback):
+    """
+    Freeze optimizer learning rates until every env completes the target episode count.
+
+    This is a guardrail on top of rollout/learning-start thresholds so continual_training
+    cannot update parameters during the initial data-collection window.
+    """
+
+    def __init__(self, target_episodes=1, verbose=0):
+        super().__init__(verbose)
+        self.target_episodes = int(target_episodes)
+        self.completed_counts = {}
+        self._optimizer_states = []
+        self._restored = False
+        self._frozen = False
+
+    def _iter_model_optimizers(self):
+        candidates = []
+
+        for attr_name in ("policy", "actor", "critic"):
+            obj = getattr(self.model, attr_name, None)
+            if obj is not None and hasattr(obj, "optimizer"):
+                candidates.append(getattr(obj, "optimizer"))
+
+        for attr_name in ("ent_coef_optimizer",):
+            opt = getattr(self.model, attr_name, None)
+            if opt is not None:
+                candidates.append(opt)
+
+        for attr_name in ("optimizers",):
+            maybe_opts = getattr(self.model, attr_name, None)
+            if isinstance(maybe_opts, (list, tuple)):
+                candidates.extend(maybe_opts)
+
+        seen = set()
+        optimizers = []
+        for opt in candidates:
+            if opt is None or not hasattr(opt, "param_groups"):
+                continue
+            if id(opt) in seen:
+                continue
+            seen.add(id(opt))
+            optimizers.append(opt)
+        return optimizers
+
+    def _freeze_optimizers(self):
+        if self._frozen:
+            return
+
+        self._optimizer_states = []
+        for opt in self._iter_model_optimizers():
+            original_lrs = [group.get("lr", 0.0) for group in opt.param_groups]
+            self._optimizer_states.append((opt, original_lrs))
+            for group in opt.param_groups:
+                group["lr"] = 0.0
+
+        self._frozen = True
+        if self.verbose > 0:
+            print(
+                "FreezeLearningUntilAllEnvsNEpisodesCallback: froze "
+                f"{len(self._optimizer_states)} optimizer(s) until all envs complete "
+                f"{self.target_episodes} episodes"
+            )
+
+    def _restore_optimizers(self):
+        if self._restored:
+            return
+
+        for opt, original_lrs in self._optimizer_states:
+            for group, lr in zip(opt.param_groups, original_lrs):
+                group["lr"] = lr
+
+        self._restored = True
+        if self.verbose > 0:
+            print("FreezeLearningUntilAllEnvsNEpisodesCallback: restored optimizer learning rates")
+
+    def _on_training_start(self) -> None:
+        self._freeze_optimizers()
+
+    def _on_step(self) -> bool:
+        if self._restored:
+            return True
+
+        if 'dones' not in self.locals or 'infos' not in self.locals:
+            return True
+
+        dones = self.locals['dones']
+        infos = self.locals['infos']
+        num_envs = getattr(self.training_env, "num_envs", len(dones))
+
+        for env_idx, (done, info) in enumerate(zip(dones, infos)):
+            if done and 'episode' in info:
+                self.completed_counts[env_idx] = self.completed_counts.get(env_idx, 0) + 1
+
+        if all(self.completed_counts.get(env_idx, 0) >= self.target_episodes for env_idx in range(num_envs)):
+            self._restore_optimizers()
+
+        return True
+
+    def _on_training_end(self) -> None:
+        self._restore_optimizers()
+
+
+class StopAfterFirstEpisodeCallback(BaseCallback):
+    """
+    Stop training after the first completed episode from any parallel environment.
+
+    This is useful when trajectory/success callbacks are configured with save interval 1
+    and we want a single recorded episode before terminating.
+    """
+
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+        self.stopped_on_env_idx = None
+        self.stopped_on_timestep = None
+
+    def _on_step(self) -> bool:
+        if 'dones' not in self.locals or 'infos' not in self.locals:
+            return True
+
+        dones = self.locals['dones']
+        infos = self.locals['infos']
+
+        for env_idx, (done, info) in enumerate(zip(dones, infos)):
+            if done and 'episode' in info:
+                self.stopped_on_env_idx = env_idx
+                self.stopped_on_timestep = self.num_timesteps
+                if self.verbose > 0:
+                    ep = info.get('episode', {})
+                    print(
+                        "StopAfterFirstEpisodeCallback: stopping training after first completed "
+                        f"episode (env={env_idx}, reward={ep.get('r')}, length={ep.get('l')}, "
+                        f"timesteps={self.num_timesteps})"
+                    )
+                return False
+
+        return True
+
+
+class StopAfterAllEnvsNEpisodesCallback(BaseCallback):
+    """
+    Stop training after every parallel environment has completed a target number of episodes.
+
+    Place this callback after data-recording callbacks so episode data is saved
+    before training terminates.
+    """
+
+    def __init__(self, target_episodes=1, verbose=0):
+        super().__init__(verbose)
+        self.target_episodes = int(target_episodes)
+        self.completed_counts = {}
+
+    def _on_step(self) -> bool:
+        if 'dones' not in self.locals or 'infos' not in self.locals:
+            return True
+
+        dones = self.locals['dones']
+        infos = self.locals['infos']
+        num_envs = getattr(self.training_env, "num_envs", len(dones))
+
+        for env_idx, (done, info) in enumerate(zip(dones, infos)):
+            if not done or 'episode' not in info:
+                continue
+
+            self.completed_counts[env_idx] = self.completed_counts.get(env_idx, 0) + 1
+            if self.verbose > 0:
+                ep = info.get('episode', {})
+                print(
+                    "StopAfterAllEnvsNEpisodesCallback: env completed episode "
+                    f"{self.completed_counts[env_idx]}/{self.target_episodes} "
+                    f"(env={env_idx}, reward={ep.get('r')}, length={ep.get('l')})"
+                )
+
+        if all(self.completed_counts.get(env_idx, 0) >= self.target_episodes for env_idx in range(num_envs)):
+            if self.verbose > 0:
+                print(
+                    "StopAfterAllEnvsNEpisodesCallback: stopping training after "
+                    f"all {num_envs} envs completed {self.target_episodes} episodes "
+                    f"at timesteps={self.num_timesteps}"
+                )
+            return False
+
+        return True
+
+
+class StopAfterTotalEpisodesCallback(BaseCallback):
+    """
+    Stop training after a total number of completed episodes across all parallel environments.
+
+    This is used by reward-ablation launchers so each reward design is trained
+    for the same number of completed episodes before switching to the next one.
+    Place this callback after logging/data-saving callbacks so the final episode
+    data is recorded before training terminates.
+    """
+
+    def __init__(self, target_episodes=300, verbose=0):
+        super().__init__(verbose)
+        self.target_episodes = int(target_episodes)
+        self.total_episodes = 0
+
+    def _on_step(self) -> bool:
+        if 'dones' not in self.locals or 'infos' not in self.locals:
+            return True
+
+        dones = self.locals['dones']
+        infos = self.locals['infos']
+
+        for env_idx, (done, info) in enumerate(zip(dones, infos)):
+            if not done or 'episode' not in info:
+                continue
+
+            self.total_episodes += 1
+            if self.verbose > 0:
+                ep = info.get('episode', {})
+                print(
+                    "StopAfterTotalEpisodesCallback: completed episode "
+                    f"{self.total_episodes}/{self.target_episodes} "
+                    f"(env={env_idx}, reward={ep.get('r')}, length={ep.get('l')})"
+                )
+
+        if self.total_episodes >= self.target_episodes:
+            if self.verbose > 0:
+                print(
+                    "StopAfterTotalEpisodesCallback: stopping training after "
+                    f"{self.total_episodes} completed episodes at timesteps={self.num_timesteps}"
+                )
+            return False
+
+        return True
+
+
 class TrajectoryDataSaver(BaseCallback):
     """
     Callback for saving trajectory data (root_state) and corresponding images every N episodes.
@@ -593,7 +1089,7 @@ class TrajectoryDataSaver(BaseCallback):
                 ...
     """
 
-    def __init__(self, save_dir="trajectory_data", save_interval=10, verbose=0):
+    def __init__(self, save_dir="trajectory_data", save_interval=10, save_images=True, verbose=0):
         """
         Initialize the trajectory data saver callback.
 
@@ -605,6 +1101,7 @@ class TrajectoryDataSaver(BaseCallback):
         super().__init__(verbose)
         self.save_dir = Path(save_dir)
         self.save_interval = save_interval
+        self.save_images = save_images
 
         # Track current episode data for each environment
         # Format: {env_idx: {'root_states': [], 'images': [], 'episode_num': int}}
@@ -648,7 +1145,7 @@ class TrajectoryDataSaver(BaseCallback):
 
                 # Get RGB images for all environments
                 rgb_images = None
-                if hasattr(env, '_camera_data') and env._camera_data is not None:
+                if self.save_images and hasattr(env, '_camera_data') and env._camera_data is not None:
                     rgb_images = env._camera_data  # Should be (num_envs, C, H, W)
 
                 # Process each environment
