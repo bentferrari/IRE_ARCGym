@@ -1,5 +1,6 @@
 import os
 import logging
+import copy
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import DeformableObjectCfg, RigidObjectCfg, DeformableObject, RigidObject
@@ -20,8 +21,8 @@ model_folder = os.path.dirname(__file__)
 # Rotation to lay colon horizontally
 FLAT_ROTATION_Y = (0.7071068, 0, 0.7071068, 0)  # 90° rotation around Y-axis
 
-obj_model_full_path = os.path.join(model_folder, "outputconv_shell_hole_0000.obj") #colon1
-#obj_model_full_path = os.path.join(model_folder, "conv_shell_hole_0000_IJK_1000_600_600_3mmthick_hole2.obj") #colon2
+#obj_model_full_path = os.path.join(model_folder, "outputconv_shell_hole_0000.obj") #colon1
+obj_model_full_path = os.path.join(model_folder, "conv_shell_hole_0000_IJK_1000_600_600_3mmthick_hole2.obj") #colon2
 #obj_model_full_path = os.path.join(model_folder, "conv_shell_hole_0002_IJK_1000_600_600_3mmthick_hole2.obj") #colon3
 #obj_model_full_path = os.path.join(model_folder, "conv_shell_hole_0003_IJK_1000_600_600_3mmthick_hole2.obj") #colon4
 #obj_model_full_path = os.path.join(model_folder, "conv_shell_hole_0006_IJK_1000_600_600_3mmthick_hole2.obj") #colon5
@@ -219,11 +220,74 @@ class ColonModel:
         self.init_rot = init_rot
         self._env_translation = None
         self._base_default_nodal_state_w = None
+        self.youngs_modulus_pa = cfg1.get("env_config", {}).get("youngs_modulus_pa", None)
+        self.poisson_ratio = cfg1.get("env_config", {}).get("poisson_ratio", None)
+        self.anchor_setting = cfg1.get("env_config", {}).get("anchor_setting", "default")
+        self.num_anchors = None
 
         # Get attachment configuration from env_config
         self.use_txt_files_for_attachments = cfg1.get("env_config", {}).get("use_txt_files_for_attachments", True)
 
         self._setup()
+
+    def _with_parameter_sensitivity_material(self, colon_cfg):
+        """Return a colon cfg with optional deformable material parameter overrides."""
+        if self.youngs_modulus_pa is None and self.poisson_ratio is None:
+            return colon_cfg
+
+        cfg = copy.deepcopy(colon_cfg)
+        material = getattr(getattr(cfg, "spawn", None), "physics_material", None)
+        if material is None:
+            return cfg
+
+        if self.youngs_modulus_pa is not None:
+            material.youngs_modulus = float(self.youngs_modulus_pa)
+        if self.poisson_ratio is not None:
+            material.poissons_ratio = float(self.poisson_ratio)
+
+        logging.info(
+            "Colon deformable material override: youngs_modulus=%s Pa, poissons_ratio=%s",
+            getattr(material, "youngs_modulus", None),
+            getattr(material, "poissons_ratio", None),
+        )
+        return cfg
+
+    def _select_anchor_indices(self, all_attach_idx: torch.Tensor, nodal_positions: torch.Tensor) -> torch.Tensor:
+        """Select sparse/default/dense colon fixation nodes for anchor sensitivity tests."""
+        anchor_idx = torch.unique(all_attach_idx.to(device=nodal_positions.device, dtype=torch.long))
+        if self.anchor_setting == "default":
+            return anchor_idx
+
+        if self.anchor_setting == "sparse":
+            target_count = max(1, int(round(anchor_idx.numel() * 0.5)))
+            sorted_idx = torch.sort(anchor_idx).values
+            keep_positions = torch.linspace(
+                0,
+                sorted_idx.numel() - 1,
+                steps=target_count,
+                device=sorted_idx.device,
+            ).round().long()
+            return sorted_idx[keep_positions]
+
+        if self.anchor_setting == "dense":
+            target_count = min(
+                nodal_positions.shape[0],
+                max(anchor_idx.numel() + 1, int(round(anchor_idx.numel() * 1.75))),
+            )
+            k = 2
+            dense_idx = anchor_idx
+            while dense_idx.numel() < target_count and k <= min(8, nodal_positions.shape[0]):
+                distances = torch.cdist(nodal_positions[anchor_idx], nodal_positions)
+                nearest = torch.topk(distances, k=k, largest=False, dim=1).indices.reshape(-1)
+                dense_idx = torch.unique(torch.cat([anchor_idx, nearest]))
+                k += 1
+            if dense_idx.numel() > target_count:
+                extras = torch.sort(dense_idx[~torch.isin(dense_idx, anchor_idx)]).values
+                extra_count = max(0, target_count - anchor_idx.numel())
+                dense_idx = torch.unique(torch.cat([anchor_idx, extras[:extra_count]]))
+            return dense_idx
+
+        raise ValueError(f"Unknown anchor_setting: {self.anchor_setting}")
 
     def _quat_to_rot_matrix(self, quat, device):
         """Convert a (w, x, y, z) quaternion to a 3x3 rotation matrix."""
@@ -259,12 +323,14 @@ class ColonModel:
                 self.scene.rigid_objects['colon'] = self.colon_body
             else:
                 if robot_type == "capsule":
-                    self.colon_body = DeformableObject(cfg=self.cfg.colon_body_cfg.replace(
+                    colon_cfg = self._with_parameter_sensitivity_material(self.cfg.colon_body_cfg)
+                    self.colon_body = DeformableObject(cfg=colon_cfg.replace(
                         init_state=DeformableObjectCfg.InitialStateCfg(pos=self.init_pos, rot=self.init_rot)
                     ))
                     self.scene.deformable_objects['colon'] = self.colon_body
                 else:
-                    self.colon_body = DeformableObject(cfg=self.cfg.colon_body_cfg_endoscope.replace(
+                    colon_cfg = self._with_parameter_sensitivity_material(self.cfg.colon_body_cfg_endoscope)
+                    self.colon_body = DeformableObject(cfg=colon_cfg.replace(
                         init_state=DeformableObjectCfg.InitialStateCfg(pos=self.init_pos, rot=self.init_rot)
                     ))
                     self.scene.deformable_objects['colon'] = self.colon_body
@@ -357,6 +423,14 @@ class ColonModel:
 
             # Combine anatomical attachments with bottom vertex attachments
             all_attach_idx = torch.cat([attaching_nodal_idx, bottom_nodal_idx])
+
+        all_attach_idx = self._select_anchor_indices(all_attach_idx, nodal_state[0, :, :3])
+        self.num_anchors = int(all_attach_idx.numel())
+        logging.info(
+            "Colon anchor setting '%s' uses %s simulation anchor nodes",
+            self.anchor_setting,
+            self.num_anchors,
+        )
 
         # Apply attachments only to specified environments
         # print("nodal to attach", all_attach_idx)

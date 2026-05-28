@@ -4,6 +4,7 @@ import logging
 import os
 import pdb
 import json
+import csv
 import random
 import subprocess
 import sys
@@ -23,6 +24,89 @@ ABLATION_REWARD_RUNS = [
     ("full_reward", False),
     ("full_reward", True),
 ]
+PARAMETER_SENSITIVITY_SETTINGS = [
+    (0.5, 0.45),
+    (0.5, 0.49),
+    (5.0, 0.45),
+    (5.0, 0.49),
+    (10.0, 0.45),
+    (10.0, 0.49),
+]
+PARAMETER_SENSITIVITY_TASKS = ["t1", "t2", "t3", "t4"]
+ANCHOR_SENSITIVITY_SETTINGS = ["sparse", "default", "dense"]
+ANCHOR_SENSITIVITY_TASKS = ["t1", "t2", "t3", "t4"]
+
+
+def _format_parameter_value(value):
+    return f"{float(value):g}".replace(".", "p")
+
+
+def _write_parameter_sensitivity_summary(rows, csv_path, json_path):
+    fieldnames = [
+        "youngs_modulus_mpa",
+        "poisson_ratio",
+        "task_id",
+        "result_dir",
+        "status",
+        "total_episodes",
+        "success_rate",
+        "raw_mean_step_reward",
+        "normalized_mean_step_reward",
+        "mean_s_c",
+        "mean_s_1",
+        "mean_s_2",
+        "mean_s_3",
+        "mean_s_o",
+        "normalized_progress",
+        "roi_alignment_rate",
+        "lumen_visible_ratio",
+    ]
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    with open(json_path, "w") as f:
+        json.dump(rows, f, indent=2)
+
+
+def _write_anchor_sensitivity_summary(rows, csv_path, json_path):
+    fieldnames = [
+        "anchor_setting",
+        "task_id",
+        "result_dir",
+        "status",
+        "total_episodes",
+        "success_rate",
+        "raw_mean_step_reward",
+        "normalized_mean_step_reward",
+        "mean_s_c",
+        "mean_s_1",
+        "mean_s_2",
+        "mean_s_3",
+        "mean_s_o",
+        "normalized_progress",
+        "roi_alignment_rate",
+        "lumen_visible_ratio",
+    ]
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    with open(json_path, "w") as f:
+        json.dump(rows, f, indent=2)
+
+
+def _load_json_if_exists(path):
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception as exc:
+        logging.warning("Failed to load %s: %s", path, exc)
+        return {}
 
 
 def _strip_controlled_cli_args(argv, value_options, flag_options):
@@ -144,7 +228,284 @@ def _run_reward_ablation_launcher_if_requested():
     sys.exit(0)
 
 
+def _run_parameter_sensitivity_launcher_if_requested():
+    """
+    Launch parameter sensitivity runs before importing Isaac/Kit.
+
+    Each child process loads the same checkpoint with --continual_training and
+    applies one colon material setting to all vectorized environments. The
+    sequence is setting 1 task 1-4, then setting 2 task 1-4, and so on.
+    """
+    early_parser = argparse.ArgumentParser(add_help=False)
+    early_parser.add_argument("--parameter_sensitivity_test", action="store_true")
+    early_parser.add_argument("--model_path", type=str, default=None)
+    early_parser.add_argument("--seed", type=int, default=0)
+    early_parser.add_argument("--num_envs", type=int, default=2)
+    early_parser.add_argument("--parameter_sensitivity_episodes", type=int, default=300)
+    early_parser.add_argument("--parameter_sensitivity_results_dir", type=str, default=None)
+    early_args, _ = early_parser.parse_known_args()
+
+    if not early_args.parameter_sensitivity_test:
+        return
+    if early_args.model_path is None:
+        raise SystemExit("--model_path is required for --parameter_sensitivity_test")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_root = early_args.parameter_sensitivity_results_dir or os.path.join(
+        "parameter_sensitivity_results",
+        f"parameter_sensitivity_colon-c1_seed-{early_args.seed}_{timestamp}",
+    )
+    os.makedirs(results_root, exist_ok=True)
+
+    value_options = {
+        "--parameter_sensitivity_episodes",
+        "--parameter_sensitivity_results_dir",
+        "--model_path",
+        "--youngs_modulus",
+        "--poisson_ratio",
+        "--result_dir",
+        "--colon_id",
+        "--task_id",
+        "--stop_after_episodes",
+        "--continual_training_target_episodes",
+    }
+    flag_options = {
+        "--parameter_sensitivity_test",
+        "--train",
+        "--test",
+        "--continual_training",
+        "--data_sampling",
+    }
+    base_child_args = _strip_controlled_cli_args(sys.argv[1:], value_options, flag_options)
+    summary_rows = []
+    summary_csv = os.path.join(results_root, "parameter_sensitivity_summary.csv")
+    summary_json = os.path.join(results_root, "parameter_sensitivity_summary.json")
+    per_env_target_episodes = max(
+        1,
+        int(np.ceil(early_args.parameter_sensitivity_episodes / max(1, early_args.num_envs))),
+    )
+
+    for setting_index, (youngs_modulus_mpa, poisson_ratio) in enumerate(PARAMETER_SENSITIVITY_SETTINGS, start=1):
+        material_name = (
+            f"E_{_format_parameter_value(youngs_modulus_mpa)}MPa_"
+            f"nu_{_format_parameter_value(poisson_ratio)}"
+        )
+        for task_index, task_id in enumerate(PARAMETER_SENSITIVITY_TASKS, start=1):
+            child_result_dir = os.path.join(results_root, material_name, f"task-{task_id}")
+            child_cmd = [
+                sys.executable,
+                os.path.abspath(__file__),
+                *base_child_args,
+                "--continual_training",
+                "--model_path",
+                early_args.model_path,
+                "--colon_id",
+                "c1",
+                "--task_id",
+                task_id,
+                "--youngs_modulus",
+                str(youngs_modulus_mpa),
+                "--poisson_ratio",
+                str(poisson_ratio),
+                "--result_dir",
+                child_result_dir,
+                "--stop_after_episodes",
+                str(early_args.parameter_sensitivity_episodes),
+                "--continual_training_target_episodes",
+                str(per_env_target_episodes),
+            ]
+
+            logging.info(
+                "Parameter sensitivity setting %s/%s task %s/%s: E=%s MPa, nu=%s, task=%s",
+                setting_index,
+                len(PARAMETER_SENSITIVITY_SETTINGS),
+                task_index,
+                len(PARAMETER_SENSITIVITY_TASKS),
+                youngs_modulus_mpa,
+                poisson_ratio,
+                task_id,
+            )
+            logging.info("Command: %s", " ".join(child_cmd))
+            completed = subprocess.run(child_cmd)
+
+            run_status = _load_json_if_exists(os.path.join(child_result_dir, "run_status.json"))
+            metrics = _load_json_if_exists(os.path.join(child_result_dir, "training_metrics_summary.json"))
+            final_metrics = {
+                key.removeprefix("final_"): value
+                for key, value in metrics.items()
+                if key.startswith("final_")
+            }
+            row = {
+                "youngs_modulus_mpa": youngs_modulus_mpa,
+                "poisson_ratio": poisson_ratio,
+                "task_id": task_id,
+                "result_dir": child_result_dir,
+                "status": run_status.get("status", "failed" if completed.returncode else "unknown"),
+                "total_episodes": metrics.get("total_episodes"),
+                "success_rate": metrics.get("success_rate"),
+                "raw_mean_step_reward": final_metrics.get("raw_mean_step_reward"),
+                "normalized_mean_step_reward": final_metrics.get("normalized_mean_step_reward"),
+                "mean_s_c": final_metrics.get("mean_s_c"),
+                "mean_s_1": final_metrics.get("mean_s_1"),
+                "mean_s_2": final_metrics.get("mean_s_2"),
+                "mean_s_3": final_metrics.get("mean_s_3"),
+                "mean_s_o": final_metrics.get("mean_s_o"),
+                "normalized_progress": final_metrics.get("normalized_progress"),
+                "roi_alignment_rate": final_metrics.get("roi_alignment_rate"),
+                "lumen_visible_ratio": final_metrics.get("lumen_visible_ratio"),
+            }
+            summary_rows.append(row)
+            _write_parameter_sensitivity_summary(summary_rows, summary_csv, summary_json)
+
+            if completed.returncode != 0:
+                logging.error(
+                    "Parameter sensitivity run failed for task=%s E=%s MPa nu=%s with exit code %s",
+                    task_id,
+                    youngs_modulus_mpa,
+                    poisson_ratio,
+                    completed.returncode,
+                )
+                sys.exit(completed.returncode)
+
+    logging.info("Parameter sensitivity summary saved to: %s", summary_csv)
+    sys.exit(0)
+
+
+def _run_anchor_sensitivity_launcher_if_requested():
+    """
+    Launch anchor sensitivity runs before importing Isaac/Kit.
+
+    Each child process loads the same checkpoint with --continual_training and
+    applies one anchor setting to all vectorized environments. The sequence is
+    sparse task 1-4, default task 1-4, then dense task 1-4.
+    """
+    early_parser = argparse.ArgumentParser(add_help=False)
+    early_parser.add_argument("--anchor_sensitivity_test", action="store_true")
+    early_parser.add_argument("--model_path", type=str, default=None)
+    early_parser.add_argument("--seed", type=int, default=0)
+    early_parser.add_argument("--num_envs", type=int, default=2)
+    early_parser.add_argument("--test_episodes", type=int, default=1)
+    early_parser.add_argument("--anchor_sensitivity_results_dir", type=str, default=None)
+    early_args, _ = early_parser.parse_known_args()
+
+    if not early_args.anchor_sensitivity_test:
+        return
+    if early_args.model_path is None:
+        raise SystemExit("--model_path is required for --anchor_sensitivity_test")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_root = early_args.anchor_sensitivity_results_dir or os.path.join(
+        "anchor_sensitivity_results",
+        f"anchor_sensitivity_colon-c1_seed-{early_args.seed}_{timestamp}",
+    )
+    os.makedirs(results_root, exist_ok=True)
+
+    value_options = {
+        "--anchor_sensitivity_results_dir",
+        "--model_path",
+        "--anchor_setting",
+        "--result_dir",
+        "--colon_id",
+        "--task_id",
+        "--stop_after_episodes",
+        "--continual_training_target_episodes",
+    }
+    flag_options = {
+        "--anchor_sensitivity_test",
+        "--train",
+        "--test",
+        "--continual_training",
+        "--data_sampling",
+    }
+    base_child_args = _strip_controlled_cli_args(sys.argv[1:], value_options, flag_options)
+    summary_rows = []
+    summary_csv = os.path.join(results_root, "anchor_sensitivity_summary.csv")
+    summary_json = os.path.join(results_root, "anchor_sensitivity_summary.json")
+    per_env_target_episodes = max(
+        1,
+        int(np.ceil(early_args.test_episodes / max(1, early_args.num_envs))),
+    )
+
+    for setting_index, anchor_setting in enumerate(ANCHOR_SENSITIVITY_SETTINGS, start=1):
+        for task_index, task_id in enumerate(ANCHOR_SENSITIVITY_TASKS, start=1):
+            child_result_dir = os.path.join(results_root, anchor_setting, f"task-{task_id}")
+            child_cmd = [
+                sys.executable,
+                os.path.abspath(__file__),
+                *base_child_args,
+                "--continual_training",
+                "--model_path",
+                early_args.model_path,
+                "--colon_id",
+                "c1",
+                "--task_id",
+                task_id,
+                "--anchor_setting",
+                anchor_setting,
+                "--result_dir",
+                child_result_dir,
+                "--stop_after_episodes",
+                str(early_args.test_episodes),
+                "--continual_training_target_episodes",
+                str(per_env_target_episodes),
+            ]
+
+            logging.info(
+                "Anchor sensitivity setting %s/%s task %s/%s: anchors=%s, task=%s",
+                setting_index,
+                len(ANCHOR_SENSITIVITY_SETTINGS),
+                task_index,
+                len(ANCHOR_SENSITIVITY_TASKS),
+                anchor_setting,
+                task_id,
+            )
+            logging.info("Command: %s", " ".join(child_cmd))
+            completed = subprocess.run(child_cmd)
+
+            run_status = _load_json_if_exists(os.path.join(child_result_dir, "run_status.json"))
+            metrics = _load_json_if_exists(os.path.join(child_result_dir, "training_metrics_summary.json"))
+            final_metrics = {
+                key.removeprefix("final_"): value
+                for key, value in metrics.items()
+                if key.startswith("final_")
+            }
+            row = {
+                "anchor_setting": anchor_setting,
+                "task_id": task_id,
+                "result_dir": child_result_dir,
+                "status": run_status.get("status", "failed" if completed.returncode else "unknown"),
+                "total_episodes": metrics.get("total_episodes"),
+                "success_rate": metrics.get("success_rate"),
+                "raw_mean_step_reward": final_metrics.get("raw_mean_step_reward"),
+                "normalized_mean_step_reward": final_metrics.get("normalized_mean_step_reward"),
+                "mean_s_c": final_metrics.get("mean_s_c"),
+                "mean_s_1": final_metrics.get("mean_s_1"),
+                "mean_s_2": final_metrics.get("mean_s_2"),
+                "mean_s_3": final_metrics.get("mean_s_3"),
+                "mean_s_o": final_metrics.get("mean_s_o"),
+                "normalized_progress": final_metrics.get("normalized_progress"),
+                "roi_alignment_rate": final_metrics.get("roi_alignment_rate"),
+                "lumen_visible_ratio": final_metrics.get("lumen_visible_ratio"),
+            }
+            summary_rows.append(row)
+            _write_anchor_sensitivity_summary(summary_rows, summary_csv, summary_json)
+
+            if completed.returncode != 0:
+                logging.error(
+                    "Anchor sensitivity run failed for task=%s anchor_setting=%s with exit code %s",
+                    task_id,
+                    anchor_setting,
+                    completed.returncode,
+                )
+                sys.exit(completed.returncode)
+
+    logging.info("Anchor sensitivity summary saved to: %s", summary_csv)
+    sys.exit(0)
+
+
 _run_reward_ablation_launcher_if_requested()
+_run_parameter_sensitivity_launcher_if_requested()
+_run_anchor_sensitivity_launcher_if_requested()
 
 from isaaclab.app import AppLauncher
 
@@ -198,6 +559,26 @@ parser.add_argument("--ablation_episodes", type=int, default=300,
                     help="Number of completed episodes to train each reward variant in --ablation_t* mode")
 parser.add_argument("--stop_after_episodes", type=int, default=None,
                     help="Stop a training run after this many completed episodes across all environments")
+parser.add_argument("--continual_training_target_episodes", type=int, default=1,
+                    help="Number of completed episodes per environment before continual-training child runs stop")
+parser.add_argument("--parameter_sensitivity_test", action="store_true",
+                    help="Run colon material parameter sensitivity over 6 settings and tasks t1-t4 using colon c1")
+parser.add_argument("--parameter_sensitivity_episodes", type=int, default=300,
+                    help="Total completed episodes for each parameter sensitivity child run")
+parser.add_argument("--parameter_sensitivity_results_dir", type=str, default=None,
+                    help="Output root for --parameter_sensitivity_test")
+parser.add_argument("--anchor_sensitivity_test", action="store_true",
+                    help="Run colon anchor sensitivity over sparse/default/dense anchor settings and tasks t1-t4 using colon c1")
+parser.add_argument("--anchor_sensitivity_results_dir", type=str, default=None,
+                    help="Output root for --anchor_sensitivity_test")
+parser.add_argument("--anchor_setting", type=str, default="default", choices=["sparse", "default", "dense"],
+                    help="Colon anchor-point setting: sparse, default, or dense")
+parser.add_argument("--youngs_modulus", type=float, default=None,
+                    help="Optional colon deformable Young's modulus override in MPa")
+parser.add_argument("--poisson_ratio", type=float, default=None,
+                    help="Optional colon deformable Poisson ratio override")
+parser.add_argument("--result_dir", type=str, default=None,
+                    help="Override the automatically generated result directory")
 parser.add_argument("--disable_video", action="store_true",
                     help="Disable RecordVideo output during training/evaluation")
 parser.add_argument("--trajectory_save_interval", type=int, default=1,
@@ -236,7 +617,7 @@ run_name = (
     f"{algo_name}_{reward_variant_label}_{constraint_label}_"
     f"colon-{args_cli.colon_id}_task-{args_cli.task_id}_seed-{args_cli.seed}_{timestamp}"
 )
-result_dir = os.path.join("./reward_ablation_results", run_name)
+result_dir = args_cli.result_dir or os.path.join("./reward_ablation_results", run_name)
 log_dir = os.path.join(result_dir, "logs")
 tensorboard_log = os.path.join(result_dir, "tensorboard")
 model_save_path = os.path.join(result_dir, "checkpoints")
@@ -259,6 +640,10 @@ with open(os.path.join(result_dir, "prelaunch_status.json"), "w") as f:
             "constrained": bool(args_cli.clip_actions),
             "seed": args_cli.seed,
             "timestamp": timestamp,
+            "youngs_modulus_mpa": args_cli.youngs_modulus,
+            "youngs_modulus_pa": args_cli.youngs_modulus * 1e6 if args_cli.youngs_modulus is not None else None,
+            "poisson_ratio": args_cli.poisson_ratio,
+            "anchor_setting": args_cli.anchor_setting,
         },
         f,
         indent=2,
@@ -344,7 +729,7 @@ robot_config = {
     # Soft endoscope specific parameters (from original soft_endoscope.py)
     "num_passive_links" : 25,
     "num_active_links" : 5,
-    "num_links_total" : 1,
+    "num_links_total" : 20,
     "link_radius" : 0.01,
     "link_height" : 0.02,
     "passive_stiffness" : 1,
@@ -411,6 +796,7 @@ env_config = {
     "clip_actions": args_cli.clip_actions,
     "disable_movement_constraints": not args_cli.clip_actions,  # Back-compat: tie movement constraints to clip_actions
     "use_txt_files_for_attachments": True,  # Use txt files to load precise vertex indices for colon attachments
+    "anchor_setting": args_cli.anchor_setting,
     "disable_lumen_visibility_reset": args_cli.test,  # Disable lumen visibility counter reset in test mode
     "teleoperate_mode": not args_cli.train and not args_cli.test and not args_cli.continual_training and not args_cli.data_sampling,
     "data_sampling_mode": args_cli.data_sampling,
@@ -419,6 +805,11 @@ env_config = {
     "robot_init_rot": (0.0, 0.7071, 0.0, 0.7071),
     "robot_init_pos": (5.6430, -1.3124, -2),
 }
+if args_cli.youngs_modulus is not None:
+    env_config["youngs_modulus_mpa"] = args_cli.youngs_modulus
+    env_config["youngs_modulus_pa"] = args_cli.youngs_modulus * 1e6
+if args_cli.poisson_ratio is not None:
+    env_config["poisson_ratio"] = args_cli.poisson_ratio
 
 reward_config = {
     "reward_type" : "final_reward", #"test_reward_action",#"depth_goal",#"default",#,"final_reward"
@@ -621,6 +1012,13 @@ config = {
         "disable_video": bool(args_cli.disable_video),
         "trajectory_save_interval": args_cli.trajectory_save_interval,
         "save_trajectory_images": bool(args_cli.save_trajectory_images),
+        "youngs_modulus_mpa": args_cli.youngs_modulus,
+        "youngs_modulus_pa": args_cli.youngs_modulus * 1e6 if args_cli.youngs_modulus is not None else None,
+        "poisson_ratio": args_cli.poisson_ratio,
+        "parameter_sensitivity_test": bool(args_cli.parameter_sensitivity_test),
+        "parameter_sensitivity_episodes": args_cli.parameter_sensitivity_episodes,
+        "anchor_setting": args_cli.anchor_setting,
+        "anchor_sensitivity_test": bool(args_cli.anchor_sensitivity_test),
     },
 }
 with open(os.path.join(result_dir, "config.json"), "w") as f:
@@ -914,7 +1312,7 @@ elif hasattr(model.policy, 'action_net'):
 logging.debug("\nFeature extractor:")
 logging.debug(model.policy.features_extractor)
 
-continual_training_target_episodes = 1
+continual_training_target_episodes = max(1, int(args_cli.continual_training_target_episodes))
 
 if args_cli.continual_training:
     max_episode_steps = int(getattr(env.unwrapped, "max_episode_length", 0))
