@@ -35,6 +35,27 @@ PARAMETER_SENSITIVITY_SETTINGS = [
 PARAMETER_SENSITIVITY_TASKS = ["t1", "t2", "t3", "t4"]
 ANCHOR_SENSITIVITY_SETTINGS = ["sparse", "default", "dense"]
 ANCHOR_SENSITIVITY_TASKS = ["t1", "t2", "t3", "t4"]
+CROSS_COLON2_TASKS = ["t1", "t2", "t3", "t4"]
+CROSS_COLON2_TRIALS = 2
+CROSS_COLON_IDS = ["c2", "c3", "c4", "c5"]
+CROSS_COLON_TASKS = ["t1", "t2", "t3", "t4"]
+
+
+def _resolve_model_path(model_path):
+    """Resolve a checkpoint path and accept either with or without .zip."""
+    expanded_path = os.path.expanduser(model_path)
+    candidates = [expanded_path]
+    if expanded_path.endswith(".zip"):
+        candidates.append(expanded_path[:-4])
+    else:
+        candidates.append(f"{expanded_path}.zip")
+
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+
+    checked = ", ".join(candidates)
+    raise FileNotFoundError(f"Model checkpoint not found. Checked: {checked}")
 
 
 def _format_parameter_value(value):
@@ -98,6 +119,35 @@ def _write_anchor_sensitivity_summary(rows, csv_path, json_path):
         json.dump(rows, f, indent=2)
 
 
+def _write_cross_colon_summary(rows, csv_path, json_path):
+    fieldnames = [
+        "colon_id",
+        "task_id",
+        "trial_id",
+        "result_dir",
+        "status",
+        "total_episodes",
+        "success_rate",
+        "raw_mean_step_reward",
+        "normalized_mean_step_reward",
+        "mean_s_c",
+        "mean_s_1",
+        "mean_s_2",
+        "mean_s_3",
+        "mean_s_o",
+        "normalized_progress",
+        "roi_alignment_rate",
+        "lumen_visible_ratio",
+    ]
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    with open(json_path, "w") as f:
+        json.dump(rows, f, indent=2)
+
+
 def _load_json_if_exists(path):
     if not os.path.exists(path):
         return {}
@@ -134,7 +184,7 @@ def _run_reward_ablation_launcher_if_requested():
     Keeping the parent process free of Isaac native modules avoids brittle
     repeated Kit initialization when the launcher starts six child trainings.
     """
-    early_parser = argparse.ArgumentParser(add_help=False)
+    early_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     early_parser.add_argument("--ablation_t1", action="store_true")
     early_parser.add_argument("--ablation_t2", action="store_true")
     early_parser.add_argument("--ablation_t3", action="store_true")
@@ -236,7 +286,7 @@ def _run_parameter_sensitivity_launcher_if_requested():
     applies one colon material setting to all vectorized environments. The
     sequence is setting 1 task 1-4, then setting 2 task 1-4, and so on.
     """
-    early_parser = argparse.ArgumentParser(add_help=False)
+    early_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     early_parser.add_argument("--parameter_sensitivity_test", action="store_true")
     early_parser.add_argument("--model_path", type=str, default=None)
     early_parser.add_argument("--seed", type=int, default=0)
@@ -249,6 +299,10 @@ def _run_parameter_sensitivity_launcher_if_requested():
         return
     if early_args.model_path is None:
         raise SystemExit("--model_path is required for --parameter_sensitivity_test")
+    try:
+        early_args.model_path = _resolve_model_path(early_args.model_path)
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc)) from exc
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     results_root = early_args.parameter_sensitivity_results_dir or os.path.join(
@@ -379,7 +433,7 @@ def _run_anchor_sensitivity_launcher_if_requested():
     applies one anchor setting to all vectorized environments. The sequence is
     sparse task 1-4, default task 1-4, then dense task 1-4.
     """
-    early_parser = argparse.ArgumentParser(add_help=False)
+    early_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     early_parser.add_argument("--anchor_sensitivity_test", action="store_true")
     early_parser.add_argument("--model_path", type=str, default=None)
     early_parser.add_argument("--seed", type=int, default=0)
@@ -392,6 +446,10 @@ def _run_anchor_sensitivity_launcher_if_requested():
         return
     if early_args.model_path is None:
         raise SystemExit("--model_path is required for --anchor_sensitivity_test")
+    try:
+        early_args.model_path = _resolve_model_path(early_args.model_path)
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc)) from exc
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     results_root = early_args.anchor_sensitivity_results_dir or os.path.join(
@@ -503,9 +561,278 @@ def _run_anchor_sensitivity_launcher_if_requested():
     sys.exit(0)
 
 
+def _run_cross_colon2_launcher_if_requested():
+    """
+    Launch a cross-colon transfer sequence on Colon 2 before importing Isaac/Kit.
+
+    The same continual-training checkpoint is loaded for each child run. The
+    sequence is c2t1 twice, c2t2 twice, c2t3 twice, and c2t4 twice, each with
+    five parallel environments.
+    """
+    early_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    early_parser.add_argument("--cross_colon2", action="store_true")
+    early_parser.add_argument("--model_path", type=str, default=None)
+    early_parser.add_argument("--seed", type=int, default=0)
+    early_parser.add_argument("--cross_colon_trials", type=int, default=CROSS_COLON2_TRIALS)
+    early_parser.add_argument("--cross_colon_results_dir", type=str, default=None)
+    early_args, _ = early_parser.parse_known_args()
+
+    if not early_args.cross_colon2:
+        return
+    if early_args.model_path is None:
+        raise SystemExit("--model_path is required for --cross_colon2")
+    try:
+        early_args.model_path = _resolve_model_path(early_args.model_path)
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_root = early_args.cross_colon_results_dir or os.path.join(
+        "cross_colon_transfer_results",
+        f"cross_colon2_seed-{early_args.seed}_{timestamp}",
+    )
+    os.makedirs(results_root, exist_ok=True)
+
+    value_options = {
+        "--cross_colon_trials",
+        "--cross_colon_results_dir",
+        "--model_path",
+        "--result_dir",
+        "--colon_id",
+        "--task_id",
+        "--num_envs",
+    }
+    flag_options = {
+        "--cross_colon2",
+        "--train",
+        "--test",
+        "--continual_training",
+        "--continual_learning",
+        "--data_sampling",
+    }
+    base_child_args = _strip_controlled_cli_args(sys.argv[1:], value_options, flag_options)
+    summary_rows = []
+    summary_csv = os.path.join(results_root, "cross_colon2_summary.csv")
+    summary_json = os.path.join(results_root, "cross_colon2_summary.json")
+
+    for task_id in CROSS_COLON2_TASKS:
+        for trial_id in range(1, int(early_args.cross_colon_trials) + 1):
+            child_result_dir = os.path.join(results_root, f"task-{task_id}", f"trial-{trial_id}")
+            child_cmd = [
+                sys.executable,
+                os.path.abspath(__file__),
+                *base_child_args,
+                "--continual_training",
+                "--model_path",
+                early_args.model_path,
+                "--num_envs",
+                "5",
+                "--colon_id",
+                "c2",
+                "--task_id",
+                task_id,
+                "--result_dir",
+                child_result_dir,
+            ]
+
+            logging.info(
+                "Cross-colon2 transfer: task=%s trial=%s/%s num_envs=5",
+                task_id,
+                trial_id,
+                early_args.cross_colon_trials,
+            )
+            logging.info("Command: %s", " ".join(child_cmd))
+            completed = subprocess.run(child_cmd)
+
+            run_status = _load_json_if_exists(os.path.join(child_result_dir, "run_status.json"))
+            metrics = _load_json_if_exists(os.path.join(child_result_dir, "training_metrics_summary.json"))
+            final_metrics = {
+                key.removeprefix("final_"): value
+                for key, value in metrics.items()
+                if key.startswith("final_")
+            }
+            row = {
+                "colon_id": "c2",
+                "task_id": task_id,
+                "trial_id": trial_id,
+                "result_dir": child_result_dir,
+                "status": run_status.get("status", "failed" if completed.returncode else "unknown"),
+                "total_episodes": metrics.get("total_episodes"),
+                "success_rate": metrics.get("success_rate"),
+                "raw_mean_step_reward": final_metrics.get("raw_mean_step_reward"),
+                "normalized_mean_step_reward": final_metrics.get("normalized_mean_step_reward"),
+                "mean_s_c": final_metrics.get("mean_s_c"),
+                "mean_s_1": final_metrics.get("mean_s_1"),
+                "mean_s_2": final_metrics.get("mean_s_2"),
+                "mean_s_3": final_metrics.get("mean_s_3"),
+                "mean_s_o": final_metrics.get("mean_s_o"),
+                "normalized_progress": final_metrics.get("normalized_progress"),
+                "roi_alignment_rate": final_metrics.get("roi_alignment_rate"),
+                "lumen_visible_ratio": final_metrics.get("lumen_visible_ratio"),
+            }
+            summary_rows.append(row)
+            _write_cross_colon_summary(summary_rows, summary_csv, summary_json)
+
+            if completed.returncode != 0:
+                logging.error(
+                    "Cross-colon2 transfer run failed for task=%s trial=%s with exit code %s",
+                    task_id,
+                    trial_id,
+                    completed.returncode,
+                )
+                sys.exit(completed.returncode)
+
+    logging.info("Cross-colon2 transfer summary saved to: %s", summary_csv)
+    sys.exit(0)
+
+
+def _run_cross_colon_launcher_if_requested():
+    """
+    Launch cross-colon transfer evaluations before importing Isaac/Kit.
+
+    Each child process loads the same checkpoint through --continual_training
+    with constrained actions and stops after a fixed number of completed
+    episodes, matching the sensitivity-test launchers.
+    """
+    early_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    early_parser.add_argument("--cross_colon", action="store_true")
+    early_parser.add_argument("--model_path", type=str, default=None)
+    early_parser.add_argument("--seed", type=int, default=0)
+    early_parser.add_argument("--cross_colon_episodes", type=int, default=2)
+    early_parser.add_argument("--cross_colon_results_dir", type=str, default=None)
+    early_args, _ = early_parser.parse_known_args()
+
+    if not early_args.cross_colon:
+        return
+    if early_args.model_path is None:
+        raise SystemExit("--model_path is required for --cross_colon")
+    try:
+        early_args.model_path = _resolve_model_path(early_args.model_path)
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_root = early_args.cross_colon_results_dir or os.path.join(
+        "cross_colon_transfer_results",
+        f"cross_colon_seed-{early_args.seed}_{timestamp}",
+    )
+    os.makedirs(results_root, exist_ok=True)
+
+    value_options = {
+        "--cross_colon_episodes",
+        "--cross_colon_trials",
+        "--cross_colon_results_dir",
+        "--model_path",
+        "--result_dir",
+        "--colon_id",
+        "--task_id",
+        "--num_envs",
+        "--test_episodes",
+        "--stop_after_episodes",
+        "--continual_training_target_episodes",
+    }
+    flag_options = {
+        "--cross_colon",
+        "--cross_colon_eval_only",
+        "--clip_actions",
+        "--no-clip_actions",
+        "--train",
+        "--test",
+        "--continual_training",
+        "--continual_learning",
+        "--data_sampling",
+    }
+    base_child_args = _strip_controlled_cli_args(sys.argv[1:], value_options, flag_options)
+    summary_rows = []
+    summary_csv = os.path.join(results_root, "cross_colon_summary.csv")
+    summary_json = os.path.join(results_root, "cross_colon_summary.json")
+    launched_num_envs = 5
+    per_env_target_episodes = max(
+        1,
+        int(np.ceil(early_args.cross_colon_episodes / launched_num_envs)),
+    )
+
+    for colon_id in CROSS_COLON_IDS:
+        for task_id in CROSS_COLON_TASKS:
+            child_result_dir = os.path.join(results_root, f"colon-{colon_id}", f"task-{task_id}")
+            child_cmd = [
+                sys.executable,
+                os.path.abspath(__file__),
+                *base_child_args,
+                "--continual_training",
+                "--clip_actions",
+                "--model_path",
+                early_args.model_path,
+                "--num_envs",
+                str(launched_num_envs),
+                "--colon_id",
+                colon_id,
+                "--task_id",
+                task_id,
+                "--result_dir",
+                child_result_dir,
+                "--stop_after_episodes",
+                str(early_args.cross_colon_episodes),
+                "--continual_training_target_episodes",
+                str(per_env_target_episodes),
+            ]
+
+            logging.info(
+                "Cross-colon transfer: colon=%s task=%s episodes=%s num_envs=5 constrained=True",
+                colon_id,
+                task_id,
+                early_args.cross_colon_episodes,
+            )
+            logging.info("Command: %s", " ".join(child_cmd))
+            completed = subprocess.run(child_cmd)
+
+            run_status = _load_json_if_exists(os.path.join(child_result_dir, "run_status.json"))
+            metrics = _load_json_if_exists(os.path.join(child_result_dir, "training_metrics_summary.json"))
+            final_metrics = {
+                key.removeprefix("final_"): value
+                for key, value in metrics.items()
+                if key.startswith("final_")
+            }
+            row = {
+                "colon_id": colon_id,
+                "task_id": task_id,
+                "trial_id": 1,
+                "result_dir": child_result_dir,
+                "status": run_status.get("status", "failed" if completed.returncode else "unknown"),
+                "total_episodes": metrics.get("total_episodes"),
+                "success_rate": metrics.get("success_rate"),
+                "raw_mean_step_reward": final_metrics.get("raw_mean_step_reward"),
+                "normalized_mean_step_reward": final_metrics.get("normalized_mean_step_reward"),
+                "mean_s_c": final_metrics.get("mean_s_c"),
+                "mean_s_1": final_metrics.get("mean_s_1"),
+                "mean_s_2": final_metrics.get("mean_s_2"),
+                "mean_s_3": final_metrics.get("mean_s_3"),
+                "mean_s_o": final_metrics.get("mean_s_o"),
+                "normalized_progress": final_metrics.get("normalized_progress"),
+                "roi_alignment_rate": final_metrics.get("roi_alignment_rate"),
+                "lumen_visible_ratio": final_metrics.get("lumen_visible_ratio"),
+            }
+            summary_rows.append(row)
+            _write_cross_colon_summary(summary_rows, summary_csv, summary_json)
+
+            if completed.returncode != 0:
+                logging.error(
+                    "Cross-colon transfer run failed for colon=%s task=%s with exit code %s",
+                    colon_id,
+                    task_id,
+                    completed.returncode,
+                )
+                sys.exit(completed.returncode)
+
+    logging.info("Cross-colon transfer summary saved to: %s", summary_csv)
+    sys.exit(0)
+
+
 _run_reward_ablation_launcher_if_requested()
 _run_parameter_sensitivity_launcher_if_requested()
 _run_anchor_sensitivity_launcher_if_requested()
+_run_cross_colon2_launcher_if_requested()
+_run_cross_colon_launcher_if_requested()
 
 from isaaclab.app import AppLauncher
 
@@ -514,6 +841,8 @@ parser.add_argument("--train", action="store_true", help="Run in training mode")
 parser.add_argument("--test", action="store_true", help="Run in test mode (load and evaluate a trained model)")
 parser.add_argument("--continual_training", action="store_true",
                     help="Continue training from a pre-trained model (for transfer learning to other colons)")
+parser.add_argument("--continual_learning", action="store_true",
+                    help="Alias for --continual_training")
 parser.add_argument("--data_sampling", action="store_true",
                     help="Run autonomous data-sampling mode with random actions projected into the constrained action space")
 parser.add_argument("--model_path", type=str, default=None,
@@ -540,7 +869,7 @@ parser.add_argument("--train_with_normalized_reward", action="store_true",
                     help="Use normalized reward for policy training instead of only logging it")
 parser.add_argument("--seed", type=int, default=0, help="Random seed recorded with the run")
 parser.add_argument("--colon_id", type=str, default="c1",
-                    help="Colon id metadata. Also selects saved_states/{colon_id}{task_id}_start.csv and _end.csv when present.")
+                    help="Colon id. Selects the colon mesh and saved_states/{colon_id}{task_id}_start.csv/_end.csv when present.")
 parser.add_argument("--task_id", type=str, default="t1",
                     help="Task id metadata. Also selects saved_states/{colon_id}{task_id}_start.csv and _end.csv when present.")
 parser.add_argument("--eval_after_train", action="store_true",
@@ -573,6 +902,18 @@ parser.add_argument("--anchor_sensitivity_results_dir", type=str, default=None,
                     help="Output root for --anchor_sensitivity_test")
 parser.add_argument("--anchor_setting", type=str, default="default", choices=["sparse", "default", "dense"],
                     help="Colon anchor-point setting: sparse, default, or dense")
+parser.add_argument("--cross_colon2", action="store_true",
+                    help="Run cross-colon transfer on Colon 2: tasks t1-t4, two trials each, with 5 parallel envs")
+parser.add_argument("--cross_colon", action="store_true",
+                    help="Run cross-colon transfer evaluation on Colons 2-5 and Tasks t1-t4 with 5 parallel envs")
+parser.add_argument("--cross_colon_eval_only", action="store_true",
+                    help=argparse.SUPPRESS)
+parser.add_argument("--cross_colon_episodes", type=int, default=2,
+                    help="Completed episodes per colon/task child run for --cross_colon")
+parser.add_argument("--cross_colon_trials", type=int, default=CROSS_COLON2_TRIALS,
+                    help="Number of repeated child runs per task for cross-colon transfer")
+parser.add_argument("--cross_colon_results_dir", type=str, default=None,
+                    help="Output root for cross-colon transfer launchers")
 parser.add_argument("--youngs_modulus", type=float, default=None,
                     help="Optional colon deformable Young's modulus override in MPa")
 parser.add_argument("--poisson_ratio", type=float, default=None,
@@ -591,6 +932,8 @@ AppLauncher.add_app_launcher_args(parser)
 
 # Parse the arguments
 args_cli = parser.parse_args()
+if args_cli.continual_learning:
+    args_cli.continual_training = True
 if args_cli.clip_actions is None:
     args_cli.clip_actions = args_cli.train or args_cli.test or args_cli.continual_training or args_cli.data_sampling
 
@@ -605,6 +948,11 @@ if args_cli.test and args_cli.model_path is None:
 # Validate continual training mode arguments
 if args_cli.continual_training and args_cli.model_path is None:
     parser.error("--model_path is required when using --continual_training mode")
+if args_cli.model_path is not None:
+    try:
+        args_cli.model_path = _resolve_model_path(args_cli.model_path)
+    except FileNotFoundError as exc:
+        parser.error(str(exc))
 
 random.seed(args_cli.seed)
 np.random.seed(args_cli.seed)
@@ -727,9 +1075,9 @@ robot_config = {
     "collision_contact_offset" : 0.0001,
     "collision_rest_offset" : 0.0,
     # Soft endoscope specific parameters (from original soft_endoscope.py)
-    "num_passive_links" : 25,
+    "num_passive_links" : 20,
     "num_active_links" : 5,
-    "num_links_total" : 20,
+    "num_links_total" : 2,
     "link_radius" : 0.01,
     "link_height" : 0.02,
     "passive_stiffness" : 1,
@@ -760,21 +1108,35 @@ if robot_config["robot_type"] == "capsule":
 else:
     env_spacing = 5
 
-task_startpose_csv = f"./saved_states/{args_cli.colon_id}{args_cli.task_id}_start.csv"
-if not os.path.exists(task_startpose_csv):
-    logging.warning(
-        "Requested colon/task start-pose CSV does not exist: %s. Falling back to ./saved_states/c1t1_start.csv",
-        task_startpose_csv,
-    )
-    task_startpose_csv = "./saved_states/c1t1_start.csv"
+def _select_task_pose_csv(colon_id, task_id, suffix, num_envs):
+    if int(num_envs) == 1:
+        single_env_csv = f"./saved_states/env1_{colon_id}{task_id}_{suffix}.csv"
+        if os.path.exists(single_env_csv):
+            logging.info("Using single-env %s-pose CSV: %s", suffix, single_env_csv)
+            return single_env_csv
+        logging.warning(
+            "Single-env %s-pose CSV does not exist: %s. Falling back to standard colon/task CSV.",
+            suffix,
+            single_env_csv,
+        )
 
-task_endpose_csv = f"./saved_states/{args_cli.colon_id}{args_cli.task_id}_end.csv"
-if not os.path.exists(task_endpose_csv):
+    task_pose_csv = f"./saved_states/{colon_id}{task_id}_{suffix}.csv"
+    if os.path.exists(task_pose_csv):
+        logging.info("Using %s-pose CSV: %s", suffix, task_pose_csv)
+        return task_pose_csv
+
+    fallback_csv = f"./saved_states/c1t1_{suffix}.csv"
     logging.warning(
-        "Requested colon/task end-pose CSV does not exist: %s. Falling back to ./saved_states/c1t1_end.csv",
-        task_endpose_csv,
+        "Requested colon/task %s-pose CSV does not exist: %s. Falling back to %s",
+        suffix,
+        task_pose_csv,
+        fallback_csv,
     )
-    task_endpose_csv = "./saved_states/c1t1_end.csv"
+    return fallback_csv
+
+
+task_startpose_csv = _select_task_pose_csv(args_cli.colon_id, args_cli.task_id, "start", args_cli.num_envs)
+task_endpose_csv = _select_task_pose_csv(args_cli.colon_id, args_cli.task_id, "end", args_cli.num_envs)
 
 env_config = {
     "discrete_action_space" : False, # currently unsupported TODO: Figure out if this is something we want to be determinable from the outside, or if it is a property of the robot implementation.
@@ -783,6 +1145,7 @@ env_config = {
     "render_mode" : "rgb_array",
     "env_spacing" : env_spacing,
     "num_envs" : args_cli.num_envs,
+    "colon_id": args_cli.colon_id,
     "replicate_physics" : False,
     "action_scale" : 0.001,
     "translation_action_scale" : 0.001,
@@ -1019,6 +1382,11 @@ config = {
         "parameter_sensitivity_episodes": args_cli.parameter_sensitivity_episodes,
         "anchor_setting": args_cli.anchor_setting,
         "anchor_sensitivity_test": bool(args_cli.anchor_sensitivity_test),
+        "cross_colon2": bool(args_cli.cross_colon2),
+        "cross_colon": bool(args_cli.cross_colon),
+        "cross_colon_eval_only": bool(args_cli.cross_colon_eval_only),
+        "cross_colon_episodes": args_cli.cross_colon_episodes,
+        "cross_colon_trials": args_cli.cross_colon_trials,
     },
 }
 with open(os.path.join(result_dir, "config.json"), "w") as f:
@@ -1358,7 +1726,28 @@ if args_cli.continual_training:
                 )
                 model.learning_starts = desired_learning_starts
 
-if args_cli.train or args_cli.continual_training:
+if args_cli.continual_training and args_cli.cross_colon_eval_only:
+    logging.info(
+        "Running cross-colon evaluation only: colon=%s task=%s episodes=%s. No training updates.",
+        args_cli.colon_id,
+        args_cli.task_id,
+        args_cli.test_episodes,
+    )
+    run_deterministic_evaluation(model, env, args_cli.test_episodes, result_dir)
+    with open(os.path.join(result_dir, "run_status.json"), "w") as f:
+        json.dump(
+            {
+                "status": "evaluated",
+                "model_path": args_cli.model_path,
+                "timesteps": int(getattr(model, "num_timesteps", 0)),
+                "cross_colon_eval_only": True,
+                "colon_id": args_cli.colon_id,
+                "task_id": args_cli.task_id,
+            },
+            f,
+            indent=2,
+        )
+elif args_cli.train or args_cli.continual_training:
     checkpoint_callback = CheckpointCallback(
         save_freq=10000, # Save every 10k steps
         save_path=model_save_path,

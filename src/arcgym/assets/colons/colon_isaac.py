@@ -21,11 +21,14 @@ model_folder = os.path.dirname(__file__)
 # Rotation to lay colon horizontally
 FLAT_ROTATION_Y = (0.7071068, 0, 0.7071068, 0)  # 90° rotation around Y-axis
 
-#obj_model_full_path = os.path.join(model_folder, "outputconv_shell_hole_0000.obj") #colon1
-obj_model_full_path = os.path.join(model_folder, "conv_shell_hole_0000_IJK_1000_600_600_3mmthick_hole2.obj") #colon2
-#obj_model_full_path = os.path.join(model_folder, "conv_shell_hole_0002_IJK_1000_600_600_3mmthick_hole2.obj") #colon3
-#obj_model_full_path = os.path.join(model_folder, "conv_shell_hole_0003_IJK_1000_600_600_3mmthick_hole2.obj") #colon4
-#obj_model_full_path = os.path.join(model_folder, "conv_shell_hole_0006_IJK_1000_600_600_3mmthick_hole2.obj") #colon5
+COLON_MESH_PATHS = {
+    "c1": os.path.join(model_folder, "outputconv_shell_hole_0000.obj"),
+    "c2": os.path.join(model_folder, "conv_shell_hole_0000_IJK_1000_600_600_3mmthick_hole2.obj"),
+    "c3": os.path.join(model_folder, "conv_shell_hole_0002_IJK_1000_600_600_3mmthick_hole2.obj"),
+    "c4": os.path.join(model_folder, "conv_shell_hole_0003_IJK_1000_600_600_3mmthick_hole2.obj"),
+    "c5": os.path.join(model_folder, "conv_shell_hole_0006_IJK_1000_600_600_3mmthick_hole2.obj"),
+}
+obj_model_full_path = COLON_MESH_PATHS["c1"]
 #shader_full_path = os.path.join(model_folder, "materials/colon_surface_material_realistic.usd")  # Use realistic material
 shader_full_path = os.path.join(model_folder, "materials/colon_surface_material.usd")  # Original material
 
@@ -224,18 +227,20 @@ class ColonModel:
         self.poisson_ratio = cfg1.get("env_config", {}).get("poisson_ratio", None)
         self.anchor_setting = cfg1.get("env_config", {}).get("anchor_setting", "default")
         self.num_anchors = None
+        self.colon_id = cfg1.get("env_config", {}).get("colon_id", "c1")
+        self.obj_model_full_path = COLON_MESH_PATHS.get(self.colon_id, obj_model_full_path)
 
         # Get attachment configuration from env_config
         self.use_txt_files_for_attachments = cfg1.get("env_config", {}).get("use_txt_files_for_attachments", True)
 
         self._setup()
 
-    def _with_parameter_sensitivity_material(self, colon_cfg):
-        """Return a colon cfg with optional deformable material parameter overrides."""
-        if self.youngs_modulus_pa is None and self.poisson_ratio is None:
-            return colon_cfg
-
+    def _with_colon_overrides(self, colon_cfg):
+        """Return a colon cfg with optional mesh and deformable material overrides."""
         cfg = copy.deepcopy(colon_cfg)
+        if getattr(cfg, "spawn", None) is not None:
+            cfg.spawn.file_path = self.obj_model_full_path
+
         material = getattr(getattr(cfg, "spawn", None), "physics_material", None)
         if material is None:
             return cfg
@@ -323,13 +328,13 @@ class ColonModel:
                 self.scene.rigid_objects['colon'] = self.colon_body
             else:
                 if robot_type == "capsule":
-                    colon_cfg = self._with_parameter_sensitivity_material(self.cfg.colon_body_cfg)
+                    colon_cfg = self._with_colon_overrides(self.cfg.colon_body_cfg)
                     self.colon_body = DeformableObject(cfg=colon_cfg.replace(
                         init_state=DeformableObjectCfg.InitialStateCfg(pos=self.init_pos, rot=self.init_rot)
                     ))
                     self.scene.deformable_objects['colon'] = self.colon_body
                 else:
-                    colon_cfg = self._with_parameter_sensitivity_material(self.cfg.colon_body_cfg_endoscope)
+                    colon_cfg = self._with_colon_overrides(self.cfg.colon_body_cfg_endoscope)
                     self.colon_body = DeformableObject(cfg=colon_cfg.replace(
                         init_state=DeformableObjectCfg.InitialStateCfg(pos=self.init_pos, rot=self.init_rot)
                     ))
@@ -401,7 +406,7 @@ class ColonModel:
             # Map visual mesh vertex indices to simulation mesh node indices
             # The txt files reference the high-res visual mesh, but we need simulation node indices
             all_attach_idx = colon_utils.map_visual_to_simulation_nodes(
-                visual_mesh_path=obj_model_full_path,
+                visual_mesh_path=self.obj_model_full_path,
                 visual_vertex_indices=visual_vertex_indices,
                 simulation_nodal_positions=nodal_state[0, :, :3]  # Use first env's nodal positions
             )
@@ -591,7 +596,7 @@ class ColonModel:
                                         [-1.0, 0.0, 0.0]
                                         ]).to(device)
         else:
-            entry_pos = torch.tensor([5.6204, -1.3774, -1.8750]).to(device)
+            entry_pos = torch.tensor([-0.1629, -0.8524, -1.8750]).to(device)
             delta_trans = torch.tensor([[0.0, 0.0, 0.0],
                                         [0.0, 5, 0.0],
                                         [-5, 0.0, 0.0],
