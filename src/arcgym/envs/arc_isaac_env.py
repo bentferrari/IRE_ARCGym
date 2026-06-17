@@ -221,11 +221,11 @@ class ARCIsaacEnv(DirectRLEnv):
         self.backward_steps_remaining = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
         self.stuck_threshold = 1000  # Number of steps with poor alignment to consider stuck
         self.backward_duration = 2  # Number of steps to move backward when stuck
-        self.alignment_threshold = 0.8  # Center alignment below this is considered poor
+        self.alignment_threshold = 0.7  # Center alignment below this is considered poor
 
         # Lumen visibility tracking for backward motion
         self.lumen_visibility_negative_counter = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
-        self.lumen_negative_threshold = 20  # Number of consecutive poor lumen visibility steps
+        self.lumen_negative_threshold = self.env_config.get("lumen_negative_threshold", 20)  # Number of consecutive poor lumen visibility steps
         self.lumen_visibility_threshold = self.env_config.get("lumen_visibility_threshold", -0.4)
         self.highlight_recover_coverage_threshold = self.env_config.get("highlight_recover_coverage_threshold", 0.5)
         self.wall_recover_consecutive_threshold = self.env_config.get("wall_recover_consecutive_threshold", 3)
@@ -237,12 +237,16 @@ class ARCIsaacEnv(DirectRLEnv):
         self.wall_hit_counter = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
         self.wall_recover_cooldown_remaining = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
         self.recover_from_wall = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.wall_like_view = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         # Calculate number of steps for the configured backward duration.
         step_dt = self.cfg.decimation * self.cfg.sim.dt
         backward_duration_s = self.env_config.get("backward_duration_s", 1)
         self.lumen_backward_steps = max(1, int(backward_duration_s / step_dt))
+        max_wall_recovery_s = self.env_config.get("max_wall_recovery_s", backward_duration_s)
+        self.max_wall_recovery_steps = max(1, int(max_wall_recovery_s / step_dt))
         self.lumen_backward_remaining = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
         self.reorient_remaining = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        self.wall_recovery_step_counter = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
 
         # Bright region avoidance tracking
         self.bright_region_directions = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
@@ -338,12 +342,22 @@ class ARCIsaacEnv(DirectRLEnv):
         """
         current_states = self.get_states()
         depth_images = current_states["depth"]
+        rgb_images = None
+        if (
+            self.env_config.get("data_sampling_mode", False)
+            and not self.env_config.get("use_continual_training_action_logic", False)
+        ):
+            try:
+                camera_output = getattr(self.robot.egocamera.data, "output", {})
+                rgb_images = camera_output.get("rgb", None)
+            except Exception:
+                rgb_images = None
         center_alignments = []
         lumen_visibilities = []
         escape_directions = []
         bright_region_coverages = []
 
-        for depth_img in depth_images:
+        for env_idx, depth_img in enumerate(depth_images):
             depth_img_np = depth_img[:, :, 0].cpu().numpy()
             img_height, img_width = depth_img_np.shape
             img_center_row, img_center_col = img_height / 2, img_width / 2
@@ -411,7 +425,16 @@ class ARCIsaacEnv(DirectRLEnv):
             # We want to move TOWARD these (to find open path)
             depth_threshold = np.percentile(depth_img_np, 75)  # Top 25% brightest pixels
             bright_mask = depth_img_np > depth_threshold
-            bright_region_coverages.append(float(np.mean(bright_mask)))
+            if rgb_images is not None:
+                rgb_img_np = rgb_images[env_idx].detach().cpu().numpy()
+                rgb_channels = rgb_img_np[..., :3]
+                brightness = np.mean(rgb_channels, axis=-1)
+                brightness_threshold = self.env_config.get("wall_recovery_brightness_threshold", 0.85)
+                if brightness.max() > 1.0:
+                    brightness_threshold *= 255.0
+                bright_region_coverages.append(float(np.mean(brightness >= brightness_threshold)))
+            else:
+                bright_region_coverages.append(float(np.mean(bright_mask)))
 
             if np.sum(bright_mask) > 0:
                 # Find centroid of bright pixels (open space)
@@ -439,7 +462,7 @@ class ARCIsaacEnv(DirectRLEnv):
                 torch.tensor(lumen_visibilities, dtype=torch.float32, device=depth_images.device),
                 torch.tensor(escape_directions, dtype=torch.float32, device=depth_images.device))
 
-    def _compute_target_quadrants_from_depth(self, threshold_fraction: float = 0.7) -> list[str]:
+    def _compute_target_quadrants_from_depth(self, threshold_fraction: float = 0.9) -> list[str]:
         """Compute target quadrants from the centroid of pixels with depth >= threshold_fraction * max_depth."""
         current_states = self.get_states()
         depth_images = current_states["depth"]
@@ -478,7 +501,7 @@ class ARCIsaacEnv(DirectRLEnv):
         # Apply scaling based on robot type
         # For 6-DOF robots: Actions [0-2] displacement increments, [3-5] angle increments
         # For 4-DOF proximal_actuated: Actions [0] translate, [1] twist, [2] yaw, [3] pitch
-        if self.env_config.get("data_sampling_mode", False):
+        if self.env_config.get("data_sampling_random_actions", self.env_config.get("data_sampling_mode", False)):
             actions = 2.0 * torch.rand_like(actions) - 1.0
 
         scaled_actions = actions.clone()
@@ -510,8 +533,20 @@ class ARCIsaacEnv(DirectRLEnv):
     def _update_lumen_visibility_tracking(self) -> None:
         """
         Track consecutive steps where lumen_visibility < -0.4.
-        When the counter reaches the threshold (20 steps), trigger backward motion for 0.5 time units.
+        Low-lumen recovery uses a timed backward window. Wall recovery backs up
+        until the wall-like view clears.
         """
+        if self.env_config.get("disable_recovery_mode", False):
+            self.lumen_visibility_negative_counter.zero_()
+            self.lumen_backward_remaining.zero_()
+            self.reorient_remaining.zero_()
+            self.wall_hit_counter.zero_()
+            self.wall_recover_cooldown_remaining.zero_()
+            self.recover_from_wall.zero_()
+            self.wall_like_view.zero_()
+            self.wall_recovery_step_counter.zero_()
+            return
+
         # Compute lumen visibility for all environments
         if hasattr(self.robot, 'get_depth'):
             try:
@@ -533,6 +568,7 @@ class ARCIsaacEnv(DirectRLEnv):
 
                     # Debounced recovery trigger based only on highlight/bright region coverage.
                     wall_like_view = bright_coverage > self.highlight_recover_coverage_threshold
+                    self.wall_like_view[env_id] = wall_like_view
                     if wall_like_view:
                         self.wall_hit_counter[env_id] += 1
                         if (
@@ -540,12 +576,13 @@ class ARCIsaacEnv(DirectRLEnv):
                             and self.lumen_backward_remaining[env_id] == 0
                             and self.wall_recover_cooldown_remaining[env_id] == 0
                         ):
-                            self.lumen_backward_remaining[env_id] = self.lumen_backward_steps
+                            self.lumen_backward_remaining[env_id] = 1
                             self.recover_from_wall[env_id] = True
+                            self.wall_recovery_step_counter[env_id] = 0
                             self.wall_recover_cooldown_remaining[env_id] = self.wall_recover_cooldown_steps
                             print(
                                 f"Env {env_id} - Recovery triggered (bright_coverage={bright_coverage:.3f}). "
-                                f"Triggering backward motion for {self.lumen_backward_steps} steps."
+                                "Backing up until wall-like view clears."
                             )
                             self.wall_hit_counter[env_id] = 0
                         self.lumen_visibility_negative_counter[env_id] = 0
@@ -610,14 +647,24 @@ class ARCIsaacEnv(DirectRLEnv):
                 modified_actions[env_id, 4] = np.sign(away_yaw) * yaw_mag
                 modified_actions[env_id, 5] = np.sign(away_pitch) * pitch_mag
 
-            # Decrement remaining backward steps
-            self.lumen_backward_remaining[backward_mask] -= 1
+            # For wall recovery, keep backing up until the wall-like view clears,
+            # but cap it so a persistent bright wall view cannot trap recovery forever.
+            wall_recovery_mask = backward_mask & self.recover_from_wall
+            self.wall_recovery_step_counter[wall_recovery_mask] += 1
+            wall_recovery_still_needed = (
+                wall_recovery_mask
+                & self.wall_like_view
+                & (self.wall_recovery_step_counter < self.max_wall_recovery_steps)
+            )
+            decrement_mask = backward_mask & ~wall_recovery_still_needed
+            self.lumen_backward_remaining[decrement_mask] -= 1
 
             # Log when backward motion completes
-            completed_mask = (self.lumen_backward_remaining == 0) & backward_mask
+            completed_mask = (self.lumen_backward_remaining == 0) & decrement_mask
             if completed_mask.any():
                 completed_env_ids = torch.where(completed_mask)[0]
                 self.reorient_remaining[completed_env_ids] = self.reorient_steps
+                self.wall_recovery_step_counter[completed_env_ids] = 0
                 for env_id in completed_env_ids:
                     print(f"Env {env_id} - Backward motion completed.")
 
@@ -717,7 +764,11 @@ class ARCIsaacEnv(DirectRLEnv):
             lumen_visibilities = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
             escape_directions = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
 
-        if self.env_config.get("data_sampling_mode", False):
+        use_sampling_quadrants = (
+            self.env_config.get("data_sampling_mode", False)
+            and not self.env_config.get("use_continual_training_action_logic", False)
+        )
+        if use_sampling_quadrants:
             quadrants = self._compute_target_quadrants_from_depth(
                 threshold_fraction=self.env_config.get("target_depth_region_fraction", 0.7)
             )
@@ -729,7 +780,7 @@ class ARCIsaacEnv(DirectRLEnv):
         if quadrants:
             for env_id, quadrant in enumerate(quadrants):
                 quadrant_source = "threshold_high"
-                if self.env_config.get("data_sampling_mode", False):
+                if use_sampling_quadrants:
                     quadrant_source = f"depth_fraction_{self.env_config.get('target_depth_region_fraction', 0.7):.2f}"
                 lumen_vis = lumen_visibilities[env_id].item()
 
@@ -821,9 +872,10 @@ class ARCIsaacEnv(DirectRLEnv):
             # Apply movement constraints
             actions_to_apply = self._apply_movement_constraints(actions_to_apply)
             print("Applied movement constraints to actions.")
-            # Override actions with backward motion if in backward motion mode
-            actions_to_apply = self._apply_backward_motion(actions_to_apply)
-            actions_to_apply = self._apply_reorientation_motion(actions_to_apply)
+            if not self.env_config.get("disable_recovery_mode", False):
+                # Override actions with backward motion if in backward motion mode
+                actions_to_apply = self._apply_backward_motion(actions_to_apply)
+                actions_to_apply = self._apply_reorientation_motion(actions_to_apply)
         elif self.env_config.get("teleoperate_mode", False):
             # In teleoperate mode, clamp forward/backward action to [-0.2, 0.2]
             actions_to_apply[:, forward_action_idx] = torch.clamp(actions_to_apply[:, forward_action_idx], min=-0.2, max=0.2)
@@ -910,12 +962,13 @@ class ARCIsaacEnv(DirectRLEnv):
                 if not hasattr(self, 'center_alignment'):
                     self.center_alignment = torch.ones(self.num_envs, dtype=torch.float32, device=self.device)
 
-        # Check if teleoperate mode is enabled - if so, disable ALL automatic resets
+        # Check if teleoperate/non-episodic sampling mode is enabled - if so,
+        # disable ALL automatic resets.
         is_teleop_mode = self.env_config.get("teleoperate_mode", False)
+        disable_automatic_resets = self.env_config.get("disable_automatic_resets", False)
 
-        if is_teleop_mode:
-            # In teleoperate mode, disable all automatic resets
-            # User maintains full control - no termination or truncation
+        if is_teleop_mode or disable_automatic_resets:
+            # User/non-episodic sampling keeps control of when the run ends.
             terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             truncated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         else:
@@ -1040,6 +1093,8 @@ class ARCIsaacEnv(DirectRLEnv):
         self.wall_hit_counter = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
         self.wall_recover_cooldown_remaining = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
         self.recover_from_wall = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.wall_like_view = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.wall_recovery_step_counter = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
 
         # Reset bright region tracking
         self.bright_region_directions = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
@@ -1202,6 +1257,12 @@ class ARCIsaacEnv(DirectRLEnv):
             # Reset lumen visibility tracking for these environments
             self.lumen_visibility_negative_counter[env_ids] = 0
             self.lumen_backward_remaining[env_ids] = 0
+            self.reorient_remaining[env_ids] = 0
+            self.wall_hit_counter[env_ids] = 0
+            self.wall_recover_cooldown_remaining[env_ids] = 0
+            self.recover_from_wall[env_ids] = False
+            self.wall_like_view[env_ids] = False
+            self.wall_recovery_step_counter[env_ids] = 0
 
             # Reset bright region tracking for these environments
             self.bright_region_directions[env_ids] = 0.0

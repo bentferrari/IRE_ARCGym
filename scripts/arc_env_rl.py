@@ -10,6 +10,7 @@ import subprocess
 import sys
 import faulthandler
 import numpy as np
+from PIL import Image
 
 from sane_rich_logging import setup_logging
 
@@ -39,6 +40,28 @@ CROSS_COLON2_TASKS = ["t1", "t2", "t3", "t4"]
 CROSS_COLON2_TRIALS = 2
 CROSS_COLON_IDS = ["c2", "c3", "c4", "c5"]
 CROSS_COLON_TASKS = ["t1", "t2", "t3", "t4"]
+DATA_SAMPLING_SEQUENCE_COLONS = ["c1", "c3", "c4", "c5"]
+DATA_SAMPLING_SEQUENCE_REPEATS = 2
+DEFAULT_MEDICAL_DATA_DIR = "/home/guanglin/data_arcgym1/sim4medical_training_data"
+
+
+def _parse_data_sampling_sequence_colons(value):
+    if value is None:
+        return list(DATA_SAMPLING_SEQUENCE_COLONS)
+    selected_colons = []
+    for raw_colon_id in str(value).split(","):
+        colon_id = raw_colon_id.strip().lower()
+        if not colon_id:
+            continue
+        if colon_id.isdigit():
+            colon_id = f"c{colon_id}"
+        elif colon_id.startswith("colon") and colon_id[5:].isdigit():
+            colon_id = f"c{colon_id[5:]}"
+        if colon_id not in selected_colons:
+            selected_colons.append(colon_id)
+    if not selected_colons:
+        raise ValueError("No valid colon ids found for --data_sampling_sequence_colons")
+    return selected_colons
 
 
 def _resolve_model_path(model_path):
@@ -121,12 +144,15 @@ def _write_anchor_sensitivity_summary(rows, csv_path, json_path):
 
 def _write_cross_colon_summary(rows, csv_path, json_path):
     fieldnames = [
+        "row_type",
         "colon_id",
         "task_id",
         "trial_id",
         "result_dir",
         "status",
+        "expected_episodes",
         "total_episodes",
+        "total_successes",
         "success_rate",
         "raw_mean_step_reward",
         "normalized_mean_step_reward",
@@ -146,6 +172,44 @@ def _write_cross_colon_summary(rows, csv_path, json_path):
         writer.writerows(rows)
     with open(json_path, "w") as f:
         json.dump(rows, f, indent=2)
+
+
+def _write_data_sampling_sequence_summary(rows, csv_path, json_path):
+    fieldnames = [
+        "colon_id",
+        "trial_id",
+        "result_dir",
+        "medical_data_dir",
+        "init_from_csv",
+        "init_endpose_from_csv",
+        "status",
+        "target_reaches",
+        "total_env_steps",
+        "model_path",
+    ]
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    with open(json_path, "w") as f:
+        json.dump(rows, f, indent=2)
+
+
+def _weighted_mean(rows, key):
+    weighted_sum = 0.0
+    total_weight = 0
+    for row in rows:
+        value = row.get(key)
+        weight = row.get("total_episodes") or 0
+        if value is None or weight is None:
+            continue
+        try:
+            weighted_sum += float(value) * int(weight)
+            total_weight += int(weight)
+        except (TypeError, ValueError):
+            continue
+    return weighted_sum / total_weight if total_weight else None
 
 
 def _load_json_if_exists(path):
@@ -691,14 +755,16 @@ def _run_cross_colon_launcher_if_requested():
     Launch cross-colon transfer evaluations before importing Isaac/Kit.
 
     Each child process loads the same checkpoint through --continual_training
-    with constrained actions and stops after a fixed number of completed
-    episodes, matching the sensitivity-test launchers.
+    with constrained actions. For each colon/task, the launcher runs repeated
+    trials; each trial uses five parallel copies of the same colon and stops
+    after each environment completes the requested number of episodes.
     """
     early_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     early_parser.add_argument("--cross_colon", action="store_true")
     early_parser.add_argument("--model_path", type=str, default=None)
     early_parser.add_argument("--seed", type=int, default=0)
-    early_parser.add_argument("--cross_colon_episodes", type=int, default=2)
+    early_parser.add_argument("--cross_colon_episodes", type=int, default=1)
+    early_parser.add_argument("--cross_colon_trials", type=int, default=CROSS_COLON2_TRIALS)
     early_parser.add_argument("--cross_colon_results_dir", type=str, default=None)
     early_args, _ = early_parser.parse_known_args()
 
@@ -744,87 +810,299 @@ def _run_cross_colon_launcher_if_requested():
     }
     base_child_args = _strip_controlled_cli_args(sys.argv[1:], value_options, flag_options)
     summary_rows = []
+    aggregate_rows = []
     summary_csv = os.path.join(results_root, "cross_colon_summary.csv")
     summary_json = os.path.join(results_root, "cross_colon_summary.json")
+    aggregate_csv = os.path.join(results_root, "cross_colon_task_summary.csv")
+    aggregate_json = os.path.join(results_root, "cross_colon_task_summary.json")
     launched_num_envs = 5
-    per_env_target_episodes = max(
-        1,
-        int(np.ceil(early_args.cross_colon_episodes / launched_num_envs)),
-    )
+    per_env_target_episodes = max(1, int(early_args.cross_colon_episodes))
+    expected_episodes_per_trial = launched_num_envs * per_env_target_episodes
 
     for colon_id in CROSS_COLON_IDS:
         for task_id in CROSS_COLON_TASKS:
-            child_result_dir = os.path.join(results_root, f"colon-{colon_id}", f"task-{task_id}")
+            task_rows = []
+            for trial_id in range(1, int(early_args.cross_colon_trials) + 1):
+                child_result_dir = os.path.join(
+                    results_root,
+                    f"colon-{colon_id}",
+                    f"task-{task_id}",
+                    f"trial-{trial_id}",
+                )
+                child_cmd = [
+                    sys.executable,
+                    os.path.abspath(__file__),
+                    *base_child_args,
+                    "--continual_training",
+                    "--clip_actions",
+                    "--model_path",
+                    early_args.model_path,
+                    "--num_envs",
+                    str(launched_num_envs),
+                    "--colon_id",
+                    colon_id,
+                    "--task_id",
+                    task_id,
+                    "--result_dir",
+                    child_result_dir,
+                    "--continual_training_target_episodes",
+                    str(per_env_target_episodes),
+                ]
+
+                logging.info(
+                    "Cross-colon transfer: colon=%s task=%s trial=%s/%s "
+                    "episodes_per_env=%s expected_total=%s constrained=True",
+                    colon_id,
+                    task_id,
+                    trial_id,
+                    early_args.cross_colon_trials,
+                    per_env_target_episodes,
+                    expected_episodes_per_trial,
+                )
+                logging.info("Command: %s", " ".join(child_cmd))
+                completed = subprocess.run(child_cmd)
+
+                run_status = _load_json_if_exists(os.path.join(child_result_dir, "run_status.json"))
+                metrics = _load_json_if_exists(os.path.join(child_result_dir, "training_metrics_summary.json"))
+                final_metrics = {
+                    key.removeprefix("final_"): value
+                    for key, value in metrics.items()
+                    if key.startswith("final_")
+                }
+                total_episodes = metrics.get("total_episodes")
+                total_successes = metrics.get("total_successes")
+                success_rate = metrics.get("success_rate")
+                row = {
+                    "row_type": "trial",
+                    "colon_id": colon_id,
+                    "task_id": task_id,
+                    "trial_id": trial_id,
+                    "result_dir": child_result_dir,
+                    "status": run_status.get("status", "failed" if completed.returncode else "unknown"),
+                    "expected_episodes": expected_episodes_per_trial,
+                    "total_episodes": total_episodes,
+                    "total_successes": total_successes,
+                    "success_rate": success_rate,
+                    "raw_mean_step_reward": final_metrics.get("raw_mean_step_reward"),
+                    "normalized_mean_step_reward": final_metrics.get("normalized_mean_step_reward"),
+                    "mean_s_c": final_metrics.get("mean_s_c"),
+                    "mean_s_1": final_metrics.get("mean_s_1"),
+                    "mean_s_2": final_metrics.get("mean_s_2"),
+                    "mean_s_3": final_metrics.get("mean_s_3"),
+                    "mean_s_o": final_metrics.get("mean_s_o"),
+                    "normalized_progress": final_metrics.get("normalized_progress"),
+                    "roi_alignment_rate": final_metrics.get("roi_alignment_rate"),
+                    "lumen_visible_ratio": final_metrics.get("lumen_visible_ratio"),
+                }
+                summary_rows.append(row)
+                task_rows.append(row)
+                _write_cross_colon_summary(summary_rows, summary_csv, summary_json)
+
+                if completed.returncode != 0:
+                    logging.error(
+                        "Cross-colon transfer run failed for colon=%s task=%s trial=%s with exit code %s",
+                        colon_id,
+                        task_id,
+                        trial_id,
+                        completed.returncode,
+                    )
+                    sys.exit(completed.returncode)
+
+            aggregate_episodes = sum(int(row.get("total_episodes") or 0) for row in task_rows)
+            aggregate_successes = sum(int(row.get("total_successes") or 0) for row in task_rows)
+            aggregate_row = {
+                "row_type": "aggregate",
+                "colon_id": colon_id,
+                "task_id": task_id,
+                "trial_id": "all",
+                "result_dir": os.path.join(results_root, f"colon-{colon_id}", f"task-{task_id}"),
+                "status": "completed",
+                "expected_episodes": expected_episodes_per_trial * int(early_args.cross_colon_trials),
+                "total_episodes": aggregate_episodes,
+                "total_successes": aggregate_successes,
+                "success_rate": aggregate_successes / aggregate_episodes if aggregate_episodes else 0.0,
+                "raw_mean_step_reward": _weighted_mean(task_rows, "raw_mean_step_reward"),
+                "normalized_mean_step_reward": _weighted_mean(task_rows, "normalized_mean_step_reward"),
+                "mean_s_c": _weighted_mean(task_rows, "mean_s_c"),
+                "mean_s_1": _weighted_mean(task_rows, "mean_s_1"),
+                "mean_s_2": _weighted_mean(task_rows, "mean_s_2"),
+                "mean_s_3": _weighted_mean(task_rows, "mean_s_3"),
+                "mean_s_o": _weighted_mean(task_rows, "mean_s_o"),
+                "normalized_progress": _weighted_mean(task_rows, "normalized_progress"),
+                "roi_alignment_rate": _weighted_mean(task_rows, "roi_alignment_rate"),
+                "lumen_visible_ratio": _weighted_mean(task_rows, "lumen_visible_ratio"),
+            }
+            aggregate_rows.append(aggregate_row)
+            _write_cross_colon_summary(aggregate_rows, aggregate_csv, aggregate_json)
+
+    logging.info("Cross-colon transfer summary saved to: %s", summary_csv)
+    logging.info("Cross-colon aggregate summary saved to: %s", aggregate_csv)
+    sys.exit(0)
+
+
+def _run_data_sampling_sequence_launcher_if_requested():
+    """
+    Launch the requested data-sampling sequence before importing Isaac/Kit.
+
+    Colon assets are constructed at app startup, so the robust way to "switch"
+    colons is to run one child Isaac process per sampling trial.
+    """
+    early_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    early_parser.add_argument("--data_sampling_sequence", action="store_true")
+    early_parser.add_argument("--data_sampling", action="store_true")
+    early_parser.add_argument("--continual_training", action="store_true")
+    early_parser.add_argument("--continual_learning", action="store_true")
+    early_parser.add_argument("--model_path", type=str, default=None)
+    early_parser.add_argument("--seed", type=int, default=0)
+    early_parser.add_argument("--num_envs", type=int, default=2)
+    early_parser.add_argument("--task_id", type=str, default="t1")
+    early_parser.add_argument("--data_sampling_sequence_repeats", type=int, default=DATA_SAMPLING_SEQUENCE_REPEATS)
+    early_parser.add_argument("--data_sampling_sequence_colons", type=str, default=",".join(DATA_SAMPLING_SEQUENCE_COLONS))
+    early_parser.add_argument("--data_sampling_sequence_results_dir", type=str, default=None)
+    early_parser.add_argument("--medical_data_dir", type=str, default=DEFAULT_MEDICAL_DATA_DIR)
+    early_args, _ = early_parser.parse_known_args()
+
+    if not early_args.data_sampling_sequence:
+        return
+    if not early_args.data_sampling:
+        raise SystemExit("--data_sampling_sequence requires --data_sampling")
+    if early_args.continual_learning:
+        early_args.continual_training = True
+    if early_args.continual_training and early_args.model_path is None:
+        raise SystemExit("--model_path is required for --data_sampling_sequence with --continual_training")
+    if early_args.model_path is not None:
+        try:
+            early_args.model_path = _resolve_model_path(early_args.model_path)
+        except FileNotFoundError as exc:
+            raise SystemExit(str(exc)) from exc
+    try:
+        sequence_colons = _parse_data_sampling_sequence_colons(early_args.data_sampling_sequence_colons)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_root = early_args.data_sampling_sequence_results_dir or os.path.join(
+        "data_sampling_sequence_results",
+        f"sampling_sequence_seed-{early_args.seed}_{timestamp}",
+    )
+    os.makedirs(results_root, exist_ok=True)
+    sequence_name = os.path.basename(os.path.normpath(results_root))
+    safe_sequence_name = "".join(
+        ch if ch.isalnum() or ch in "._-" else "-"
+        for ch in sequence_name
+    ) or f"sampling_sequence_seed-{early_args.seed}_{timestamp}"
+    medical_sequence_root = os.path.join(
+        os.path.abspath(os.path.expanduser(early_args.medical_data_dir)),
+        safe_sequence_name,
+    )
+    os.makedirs(medical_sequence_root, exist_ok=True)
+
+    value_options = {
+        "--data_sampling_sequence_repeats",
+        "--data_sampling_sequence_colons",
+        "--data_sampling_sequence_results_dir",
+        "--data_sampling_target_reaches",
+        "--medical_data_dir",
+        "--medical_run_dir",
+        "--model_path",
+        "--result_dir",
+        "--colon_id",
+        "--task_id",
+        "--num_envs",
+    }
+    flag_options = {
+        "--data_sampling_sequence",
+        "--train",
+        "--test",
+        "--data_sampling",
+        "--continual_training",
+        "--continual_learning",
+    }
+    base_child_args = _strip_controlled_cli_args(sys.argv[1:], value_options, flag_options)
+    summary_rows = []
+    summary_csv = os.path.join(results_root, "data_sampling_sequence_summary.csv")
+    summary_json = os.path.join(results_root, "data_sampling_sequence_summary.json")
+
+    repeats = max(1, int(early_args.data_sampling_sequence_repeats))
+    for colon_id in sequence_colons:
+        colon_suffix = colon_id[1:] if colon_id.lower().startswith("c") else colon_id
+        for trial_id in range(1, repeats + 1):
+            child_result_dir = os.path.join(results_root, f"colon-{colon_id}", f"trial-{trial_id}")
+            child_medical_run_dir = os.path.join(
+                medical_sequence_root,
+                f"sampling_colon{colon_suffix}",
+                f"trial-{trial_id}",
+            )
             child_cmd = [
                 sys.executable,
                 os.path.abspath(__file__),
                 *base_child_args,
-                "--continual_training",
-                "--clip_actions",
-                "--model_path",
-                early_args.model_path,
-                "--num_envs",
-                str(launched_num_envs),
+                "--data_sampling",
                 "--colon_id",
                 colon_id,
                 "--task_id",
-                task_id,
+                early_args.task_id,
+                "--num_envs",
+                str(early_args.num_envs),
                 "--result_dir",
                 child_result_dir,
-                "--stop_after_episodes",
-                str(early_args.cross_colon_episodes),
-                "--continual_training_target_episodes",
-                str(per_env_target_episodes),
+                "--data_sampling_target_reaches",
+                "1",
+                "--medical_data_dir",
+                early_args.medical_data_dir,
+                "--medical_run_dir",
+                child_medical_run_dir,
             ]
+            if early_args.continual_training:
+                child_cmd.append("--continual_training")
+            if early_args.model_path is not None:
+                child_cmd.extend(["--model_path", early_args.model_path])
 
             logging.info(
-                "Cross-colon transfer: colon=%s task=%s episodes=%s num_envs=5 constrained=True",
+                "Data-sampling sequence: colon=%s trial=%s/%s target=sampling_colon%s",
                 colon_id,
-                task_id,
-                early_args.cross_colon_episodes,
+                trial_id,
+                repeats,
+                colon_suffix,
             )
             logging.info("Command: %s", " ".join(child_cmd))
             completed = subprocess.run(child_cmd)
 
             run_status = _load_json_if_exists(os.path.join(child_result_dir, "run_status.json"))
-            metrics = _load_json_if_exists(os.path.join(child_result_dir, "training_metrics_summary.json"))
-            final_metrics = {
-                key.removeprefix("final_"): value
-                for key, value in metrics.items()
-                if key.startswith("final_")
-            }
+            child_status = run_status.get("status", "failed" if completed.returncode else "unknown")
             row = {
                 "colon_id": colon_id,
-                "task_id": task_id,
-                "trial_id": 1,
+                "trial_id": trial_id,
                 "result_dir": child_result_dir,
-                "status": run_status.get("status", "failed" if completed.returncode else "unknown"),
-                "total_episodes": metrics.get("total_episodes"),
-                "success_rate": metrics.get("success_rate"),
-                "raw_mean_step_reward": final_metrics.get("raw_mean_step_reward"),
-                "normalized_mean_step_reward": final_metrics.get("normalized_mean_step_reward"),
-                "mean_s_c": final_metrics.get("mean_s_c"),
-                "mean_s_1": final_metrics.get("mean_s_1"),
-                "mean_s_2": final_metrics.get("mean_s_2"),
-                "mean_s_3": final_metrics.get("mean_s_3"),
-                "mean_s_o": final_metrics.get("mean_s_o"),
-                "normalized_progress": final_metrics.get("normalized_progress"),
-                "roi_alignment_rate": final_metrics.get("roi_alignment_rate"),
-                "lumen_visible_ratio": final_metrics.get("lumen_visible_ratio"),
+                "medical_data_dir": run_status.get("medical_data_dir", child_medical_run_dir),
+                "init_from_csv": run_status.get("init_from_csv"),
+                "init_endpose_from_csv": run_status.get("init_endpose_from_csv"),
+                "status": child_status,
+                "target_reaches": run_status.get("target_reaches"),
+                "total_env_steps": run_status.get("total_env_steps"),
+                "model_path": run_status.get("model_path", early_args.model_path),
             }
             summary_rows.append(row)
-            _write_cross_colon_summary(summary_rows, summary_csv, summary_json)
+            _write_data_sampling_sequence_summary(summary_rows, summary_csv, summary_json)
 
             if completed.returncode != 0:
                 logging.error(
-                    "Cross-colon transfer run failed for colon=%s task=%s with exit code %s",
+                    "Data-sampling sequence child failed for colon=%s trial=%s with exit code %s",
                     colon_id,
-                    task_id,
+                    trial_id,
                     completed.returncode,
                 )
                 sys.exit(completed.returncode)
+            if child_status != "completed":
+                logging.error(
+                    "Data-sampling sequence child did not complete target reach for colon=%s trial=%s: status=%s",
+                    colon_id,
+                    trial_id,
+                    child_status,
+                )
+                sys.exit(1)
 
-    logging.info("Cross-colon transfer summary saved to: %s", summary_csv)
+    logging.info("Data-sampling sequence summary saved to: %s", summary_csv)
     sys.exit(0)
 
 
@@ -833,6 +1111,7 @@ _run_parameter_sensitivity_launcher_if_requested()
 _run_anchor_sensitivity_launcher_if_requested()
 _run_cross_colon2_launcher_if_requested()
 _run_cross_colon_launcher_if_requested()
+_run_data_sampling_sequence_launcher_if_requested()
 
 from isaaclab.app import AppLauncher
 
@@ -844,10 +1123,26 @@ parser.add_argument("--continual_training", action="store_true",
 parser.add_argument("--continual_learning", action="store_true",
                     help="Alias for --continual_training")
 parser.add_argument("--data_sampling", action="store_true",
-                    help="Run autonomous data-sampling mode with random actions projected into the constrained action space")
+                    help="Run autonomous data-sampling mode. By default it uses random actions; with --model_path or --continual_training it uses deterministic policy actions without training updates.")
+parser.add_argument("--data_sampling_sequence", action="store_true",
+                    help="Run data sampling in sequence: c1 twice, c3 twice, c4 twice, c5 twice, skipping c2")
+parser.add_argument("--data_sampling_sequence_repeats", type=int, default=DATA_SAMPLING_SEQUENCE_REPEATS,
+                    help="Number of successful sampling trials per colon in --data_sampling_sequence")
+parser.add_argument("--data_sampling_sequence_colons", type=str, default=",".join(DATA_SAMPLING_SEQUENCE_COLONS),
+                    help="Comma-separated colon ids for --data_sampling_sequence, e.g. c5 or c1,c3,c4,c5")
+parser.add_argument("--data_sampling_sequence_results_dir", type=str, default=None,
+                    help="Output root for --data_sampling_sequence child runs")
+parser.add_argument("--data_sampling_target_reaches", type=int, default=None,
+                    help="Stop this data-sampling run after this many fresh target-reached events")
 parser.add_argument("--model_path", type=str, default=None,
-                    help="Path to the trained model to load for testing or continual training (e.g., ./models/ppo_arc_20260118_173006/ppo_arc_checkpoint_20260118_173006_2050000_steps.zip)")
+                    help="Path to the trained model to load for testing, continual training, or policy-guided data sampling")
 parser.add_argument("--test_episodes", type=int, default=1, help="Number of episodes to run in test mode")
+parser.add_argument("--print_actions", action="store_true",
+                    help="Print and save deterministic policy actions during evaluation")
+parser.add_argument("--print_action_steps", type=int, default=50,
+                    help="Maximum number of vectorized environment steps to print when --print_actions is enabled")
+parser.add_argument("--sampling_deterministic_actions", action=argparse.BooleanOptionalAction, default=False,
+                    help="Use deterministic policy actions in policy-guided data sampling. Default is false to match continual-training rollout action selection.")
 parser.add_argument("--benchmark", action="store_true", help="benchmark a couple of steps using viztracer")
 parser.add_argument("--num_envs", type=int, default=2, help="Number of parallel environments")
 parser.add_argument("--clip_actions", action=argparse.BooleanOptionalAction, default=None,
@@ -908,10 +1203,10 @@ parser.add_argument("--cross_colon", action="store_true",
                     help="Run cross-colon transfer evaluation on Colons 2-5 and Tasks t1-t4 with 5 parallel envs")
 parser.add_argument("--cross_colon_eval_only", action="store_true",
                     help=argparse.SUPPRESS)
-parser.add_argument("--cross_colon_episodes", type=int, default=2,
-                    help="Completed episodes per colon/task child run for --cross_colon")
+parser.add_argument("--cross_colon_episodes", type=int, default=1,
+                    help="Completed episodes per parallel environment in each --cross_colon trial")
 parser.add_argument("--cross_colon_trials", type=int, default=CROSS_COLON2_TRIALS,
-                    help="Number of repeated child runs per task for cross-colon transfer")
+                    help="Number of repeated child trials per colon/task for cross-colon transfer")
 parser.add_argument("--cross_colon_results_dir", type=str, default=None,
                     help="Output root for cross-colon transfer launchers")
 parser.add_argument("--youngs_modulus", type=float, default=None,
@@ -926,6 +1221,14 @@ parser.add_argument("--trajectory_save_interval", type=int, default=1,
                     help="Save trajectory metadata every N completed episodes per environment")
 parser.add_argument("--save_trajectory_images", action=argparse.BooleanOptionalAction, default=True,
                     help="Save per-frame camera PNGs in trajectory_data")
+parser.add_argument("--medical_data_dir", type=str, default=DEFAULT_MEDICAL_DATA_DIR,
+                    help="Root directory for medical-simulator data saved during --data_sampling")
+parser.add_argument("--medical_run_dir", type=str, default=None,
+                    help="Exact run directory for medical-simulator data saved during --data_sampling")
+parser.add_argument("--disable_medical_data_save", action="store_true",
+                    help="Disable medical-simulator dataset writing during --data_sampling")
+parser.add_argument("--medical_save_images", action=argparse.BooleanOptionalAction, default=True,
+                    help="Save RGB PNG frames for the medical-simulator dataset during --data_sampling")
 
 # Append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -934,20 +1237,44 @@ AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 if args_cli.continual_learning:
     args_cli.continual_training = True
+
+# --data_sampling can be combined with --continual_training to reuse the
+# checkpoint-loading/policy-action path without entering model.learn().
+continual_training_mode = args_cli.continual_training and not args_cli.data_sampling
+policy_guided_data_sampling = args_cli.data_sampling and (
+    args_cli.continual_training or args_cli.model_path is not None
+)
+random_data_sampling = args_cli.data_sampling and not policy_guided_data_sampling
+continual_training_action_mode = continual_training_mode or policy_guided_data_sampling
+policy_sampling_deterministic = bool(args_cli.sampling_deterministic_actions)
+colon_id_normalized = str(args_cli.colon_id).lower()
+data_sampling_colon1_forward_only = (
+    args_cli.data_sampling and colon_id_normalized in {"c1", "colon1", "1"}
+)
+data_sampling_no_backward_recovery = (
+    args_cli.data_sampling and colon_id_normalized in {"c1", "colon1", "1", "c5", "colon5", "5"}
+)
+
 if args_cli.clip_actions is None:
     args_cli.clip_actions = args_cli.train or args_cli.test or args_cli.continual_training or args_cli.data_sampling
 
-active_modes = sum([args_cli.train, args_cli.test, args_cli.continual_training, args_cli.data_sampling])
+active_modes = sum([args_cli.train, args_cli.test, continual_training_mode, args_cli.data_sampling])
 if active_modes > 1:
-    parser.error("Only one of --train, --test, --continual_training, or --data_sampling can be enabled at a time")
+    parser.error(
+        "Only one of --train, --test, --continual_training, or --data_sampling can be enabled at a time. "
+        "The supported exception is --data_sampling --continual_training --model_path, which runs "
+        "policy-guided sampling without training updates."
+    )
 
 # Validate test mode arguments
 if args_cli.test and args_cli.model_path is None:
     parser.error("--model_path is required when using --test mode")
 
 # Validate continual training mode arguments
-if args_cli.continual_training and args_cli.model_path is None:
+if continual_training_mode and args_cli.model_path is None:
     parser.error("--model_path is required when using --continual_training mode")
+if args_cli.data_sampling and args_cli.continual_training and args_cli.model_path is None:
+    parser.error("--model_path is required when using --data_sampling with --continual_training")
 if args_cli.model_path is not None:
     try:
         args_cli.model_path = _resolve_model_path(args_cli.model_path)
@@ -992,6 +1319,17 @@ with open(os.path.join(result_dir, "prelaunch_status.json"), "w") as f:
             "youngs_modulus_pa": args_cli.youngs_modulus * 1e6 if args_cli.youngs_modulus is not None else None,
             "poisson_ratio": args_cli.poisson_ratio,
             "anchor_setting": args_cli.anchor_setting,
+            "continual_training_mode": bool(continual_training_mode),
+            "continual_training_action_mode": bool(continual_training_action_mode),
+            "policy_guided_data_sampling": bool(policy_guided_data_sampling),
+            "random_data_sampling": bool(random_data_sampling),
+            "sampling_deterministic_actions": bool(policy_sampling_deterministic),
+            "model_path": args_cli.model_path,
+            "medical_data_dir": args_cli.medical_data_dir,
+            "medical_run_dir": args_cli.medical_run_dir,
+            "medical_data_save": bool(args_cli.data_sampling and not args_cli.disable_medical_data_save),
+            "data_sampling_colon1_forward_only": bool(data_sampling_colon1_forward_only),
+            "data_sampling_no_backward_recovery": bool(data_sampling_no_backward_recovery),
         },
         f,
         indent=2,
@@ -1108,8 +1446,8 @@ if robot_config["robot_type"] == "capsule":
 else:
     env_spacing = 5
 
-def _select_task_pose_csv(colon_id, task_id, suffix, num_envs):
-    if int(num_envs) == 1:
+def _select_task_pose_csv(colon_id, task_id, suffix, num_envs, use_single_env=True):
+    if use_single_env and int(num_envs) == 1:
         single_env_csv = f"./saved_states/env1_{colon_id}{task_id}_{suffix}.csv"
         if os.path.exists(single_env_csv):
             logging.info("Using single-env %s-pose CSV: %s", suffix, single_env_csv)
@@ -1135,8 +1473,38 @@ def _select_task_pose_csv(colon_id, task_id, suffix, num_envs):
     return fallback_csv
 
 
-task_startpose_csv = _select_task_pose_csv(args_cli.colon_id, args_cli.task_id, "start", args_cli.num_envs)
-task_endpose_csv = _select_task_pose_csv(args_cli.colon_id, args_cli.task_id, "end", args_cli.num_envs)
+def _select_sampling_endpose_csv(colon_id, task_id, num_envs):
+    colon_suffix = colon_id[1:] if colon_id.lower().startswith("c") else colon_id
+    sampling_csv = f"./saved_states/sampling_colon{colon_suffix}.csv"
+    if os.path.exists(sampling_csv):
+        logging.info("Using data-sampling end-pose CSV: %s", sampling_csv)
+        return sampling_csv
+
+    logging.warning(
+        "Data-sampling end-pose CSV does not exist: %s. Falling back to task end pose.",
+        sampling_csv,
+    )
+    return _select_task_pose_csv(colon_id, task_id, "end", num_envs)
+
+
+use_task_startpose_csv = args_cli.train or args_cli.test or continual_training_action_mode or random_data_sampling
+use_task_endpose_csv = args_cli.train or args_cli.test or continual_training_action_mode
+if use_task_startpose_csv:
+    task_startpose_csv = _select_task_pose_csv(
+        args_cli.colon_id,
+        args_cli.task_id,
+        "start",
+        args_cli.num_envs,
+        use_single_env=not args_cli.data_sampling,
+    )
+else:
+    task_startpose_csv = None
+if args_cli.data_sampling:
+    task_endpose_csv = _select_sampling_endpose_csv(args_cli.colon_id, args_cli.task_id, args_cli.num_envs)
+elif use_task_endpose_csv:
+    task_endpose_csv = _select_task_pose_csv(args_cli.colon_id, args_cli.task_id, "end", args_cli.num_envs)
+else:
+    task_endpose_csv = None
 
 env_config = {
     "discrete_action_space" : False, # currently unsupported TODO: Figure out if this is something we want to be determinable from the outside, or if it is a property of the robot implementation.
@@ -1149,20 +1517,37 @@ env_config = {
     "replicate_physics" : False,
     "action_scale" : 0.001,
     "translation_action_scale" : 0.001,
-    "rotation_action_scale" : 0.01,
+    "rotation_action_scale" : 0.02 if random_data_sampling else 0.01,
+    "forward_increment": 0.0005 if args_cli.data_sampling else 0.001,
     "debug_vis" : False,
-    "episode_length_s" : 40.0 if (args_cli.train or args_cli.test or args_cli.continual_training or args_cli.data_sampling) else 20000000.0,
+    "episode_length_s" : 40.0 if use_task_endpose_csv else 20000000.0,
     "constraint_point_A": 1,  # Distance from robot tip to constraint point A along the robot's local z-axis
-    "init_from_csv": task_startpose_csv if (args_cli.train or args_cli.test or args_cli.continual_training or args_cli.data_sampling) else None,
-    "init_endpose_from_csv": task_endpose_csv if (args_cli.train or args_cli.test or args_cli.continual_training or args_cli.data_sampling) else None,
+    "init_from_csv": task_startpose_csv,
+    "init_endpose_from_csv": task_endpose_csv,
     "random_initial_configuration": False,  # Use straight configuration (especially for teleoperation mode)
     "clip_actions": args_cli.clip_actions,
     "disable_movement_constraints": not args_cli.clip_actions,  # Back-compat: tie movement constraints to clip_actions
     "use_txt_files_for_attachments": True,  # Use txt files to load precise vertex indices for colon attachments
     "anchor_setting": args_cli.anchor_setting,
     "disable_lumen_visibility_reset": args_cli.test,  # Disable lumen visibility counter reset in test mode
-    "teleoperate_mode": not args_cli.train and not args_cli.test and not args_cli.continual_training and not args_cli.data_sampling,
-    "data_sampling_mode": args_cli.data_sampling,
+    "teleoperate_mode": not args_cli.train and not args_cli.test and not continual_training_action_mode and not random_data_sampling,
+    "data_sampling_mode": random_data_sampling,
+    "data_sampling_policy_actions": policy_guided_data_sampling,
+    "data_sampling_random_actions": random_data_sampling,
+    "use_continual_training_action_logic": continual_training_action_mode,
+    "disable_automatic_resets": args_cli.data_sampling,
+    "disable_recovery_mode": data_sampling_no_backward_recovery,
+    "highlight_recover_coverage_threshold": 0.9 if args_cli.data_sampling else 0.5,
+    "wall_recovery_brightness_threshold": 0.85,
+    "wall_recover_consecutive_threshold": 5 if random_data_sampling else 3,
+    "lumen_visibility_threshold": -0.55 if random_data_sampling else -0.4,
+    "lumen_negative_threshold": 35 if random_data_sampling else 20,
+    "backward_increment": 0.0008 if random_data_sampling else 0.001,
+    "backward_duration_s": 0.2 if random_data_sampling else 1.0,
+    "max_wall_recovery_s": 0.6 if random_data_sampling else 1.0,
+    "backward_rotation_scale": 1.0 * 0.01 if random_data_sampling else 0.5 * 0.01,
+    "reorient_steps": 3 if random_data_sampling else 12,
+    "reorient_rotation_scale": 1.5 * 0.01 if random_data_sampling else 0.01,
     "target_depth_region_fraction": 0.7,
     "colon_init_rot": (0.7071, 0.0, -0.7071, 0.0),
     "robot_init_rot": (0.0, 0.7071, 0.0, 0.7071),
@@ -1190,12 +1575,13 @@ reward_config = {
     "reward_lambda_o": args_cli.reward_lambda_o,
     "reward_beta": args_cli.reward_beta,
     "train_with_normalized_reward": args_cli.train_with_normalized_reward,
+    "alignment_threshold": 0.7,
     # Vanilla PPO (--no-clip_actions) resets and penalizes when lumen visibility is low.
     "reset_on_low_lumen_visibility": not args_cli.clip_actions,
     "low_lumen_visibility_threshold": -0.4,
     "low_lumen_reset_penalty": -1.0,
     # Parameters for calculating max_episode_length (used for success criterion)
-    "episode_length_s": 40.0 if (args_cli.train or args_cli.test or args_cli.continual_training) else 2000000.0,
+    "episode_length_s": 40.0 if use_task_endpose_csv else 2000000.0,
     "decimation": 2,
     "dt": 1.0 / 240.0,
     "success_alignment_ratio": 0.9,  # 90% of steps must have center_alignment > 0.85
@@ -1387,6 +1773,24 @@ config = {
         "cross_colon_eval_only": bool(args_cli.cross_colon_eval_only),
         "cross_colon_episodes": args_cli.cross_colon_episodes,
         "cross_colon_trials": args_cli.cross_colon_trials,
+        "continual_training_mode": bool(continual_training_mode),
+        "continual_training_action_mode": bool(continual_training_action_mode),
+        "policy_guided_data_sampling": bool(policy_guided_data_sampling),
+        "random_data_sampling": bool(random_data_sampling),
+        "sampling_deterministic_actions": bool(policy_sampling_deterministic),
+        "data_sampling_colon1_forward_only": bool(data_sampling_colon1_forward_only),
+        "data_sampling_no_backward_recovery": bool(data_sampling_no_backward_recovery),
+        "model_path": args_cli.model_path,
+        "data_sampling_sequence": bool(args_cli.data_sampling_sequence),
+        "data_sampling_sequence_repeats": args_cli.data_sampling_sequence_repeats,
+        "data_sampling_sequence_colons": args_cli.data_sampling_sequence_colons,
+        "data_sampling_target_reaches": args_cli.data_sampling_target_reaches,
+        "medical_data_dir": args_cli.medical_data_dir,
+        "medical_run_dir": args_cli.medical_run_dir,
+        "medical_data_save": bool(args_cli.data_sampling and not args_cli.disable_medical_data_save),
+        "medical_save_images": bool(args_cli.medical_save_images),
+        "init_from_csv": task_startpose_csv,
+        "init_endpose_from_csv": task_endpose_csv,
     },
 }
 with open(os.path.join(result_dir, "config.json"), "w") as f:
@@ -1453,8 +1857,230 @@ def _float_from_info(info, key):
     return float(value)
 
 
+def _numpy_from_value(value):
+    if value is None:
+        return None
+    if hasattr(value, "detach"):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+def _sanitize_dataset_component(value):
+    parts = [
+        part
+        for part in os.path.normpath(str(value)).split(os.sep)
+        if part not in ("", ".", "..")
+    ]
+    safe_parts = []
+    for part in parts[-4:]:
+        safe = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in part)
+        if safe:
+            safe_parts.append(safe)
+    return "__".join(safe_parts) if safe_parts else "run"
+
+
+def _image_to_uint8_hwc(image):
+    image_np = _numpy_from_value(image)
+    if image_np is None:
+        return None
+    image_np = np.asarray(image_np)
+    if image_np.ndim == 3 and image_np.shape[0] in (1, 3, 4):
+        image_np = np.transpose(image_np, (1, 2, 0))
+    if image_np.ndim == 2:
+        image_np = np.repeat(image_np[:, :, None], 3, axis=2)
+    if image_np.ndim == 3 and image_np.shape[2] == 1:
+        image_np = np.repeat(image_np, 3, axis=2)
+    if image_np.ndim == 3 and image_np.shape[2] > 4:
+        image_np = image_np[:, :, :3]
+    if image_np.dtype != np.uint8:
+        if image_np.size and np.nanmax(image_np) <= 1.0:
+            image_np = image_np * 255.0
+        image_np = np.nan_to_num(image_np, nan=0.0, posinf=255.0, neginf=0.0)
+        image_np = np.clip(image_np, 0, 255).astype(np.uint8)
+    return image_np
+
+
+def _batched_action_array(actions, num_envs):
+    actions_np = _numpy_from_value(actions)
+    if actions_np is None:
+        return None
+    actions_np = np.asarray(actions_np, dtype=np.float64)
+    if actions_np.ndim == 1:
+        actions_np = actions_np.reshape(1, -1)
+    else:
+        actions_np = actions_np.reshape(actions_np.shape[0], -1)
+    if actions_np.shape[0] == 1 and num_envs > 1:
+        actions_np = np.repeat(actions_np, num_envs, axis=0)
+    return actions_np
+
+
+def _base_isaac_env(vec_env):
+    base_env = getattr(vec_env, "unwrapped", None)
+    return base_env() if callable(base_env) else base_env
+
+
+class MedicalTrainingDataWriter:
+    """Stream synchronized data-sampling frames, actions, rewards, and ROI labels."""
+
+    def __init__(self, save_root, result_dir, config, action_dim, save_images=True, run_dir=None):
+        self.save_root = os.path.abspath(os.path.expanduser(save_root))
+        if run_dir is None:
+            self.run_id = _sanitize_dataset_component(result_dir)
+            self.run_dir = os.path.join(self.save_root, self.run_id)
+        else:
+            self.run_dir = os.path.abspath(os.path.expanduser(run_dir))
+            self.run_id = os.path.relpath(self.run_dir, self.save_root)
+        self.save_images = bool(save_images)
+        self.action_dim = int(action_dim)
+        self.sample_index = 0
+
+        os.makedirs(self.run_dir, exist_ok=True)
+        self.env_dirs = {}
+        self.env_image_dirs = {}
+        self.env_csv_paths = {}
+        self.env_sample_indices = {}
+        for env_idx in range(int(config["env_config"]["num_envs"])):
+            env_dir = os.path.join(self.run_dir, f"env_{env_idx:03d}")
+            image_dir = os.path.join(env_dir, "images")
+            os.makedirs(env_dir, exist_ok=True)
+            os.makedirs(image_dir, exist_ok=True)
+            self.env_dirs[env_idx] = env_dir
+            self.env_image_dirs[env_idx] = image_dir
+            self.env_csv_paths[env_idx] = os.path.join(env_dir, "samples.csv")
+            self.env_sample_indices[env_idx] = 0
+
+        metadata = {
+            "dataset_type": "sim4medical_training_data",
+            "run_id": self.run_id,
+            "result_dir": result_dir,
+            "colon_id": config["run_config"]["colon_id"],
+            "task_id": config["run_config"]["task_id"],
+            "seed": config["run_config"]["seed"],
+            "model_path": config["run_config"].get("model_path"),
+            "action_columns": [f"action_{idx}" for idx in range(self.action_dim)],
+            "policy_action_columns": [f"policy_action_{idx}" for idx in range(self.action_dim)],
+            "action_definition": "Executed post-constraint action at the same timestep as the saved image and reward.",
+            "roi_definition": "ROI centroid from the high-depth lumen region, relative to image center. x>0 is right, y>0 is down.",
+            "csv_layout": "One samples.csv per environment directory. image_path is relative to that environment directory.",
+            "env_csv_paths": {
+                f"env_{env_idx:03d}": os.path.relpath(csv_path, self.run_dir)
+                for env_idx, csv_path in self.env_csv_paths.items()
+            },
+        }
+        with open(os.path.join(self.run_dir, "metadata.json"), "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        self.fieldnames = [
+            "sample_index",
+            "vec_step",
+            "env_idx",
+            "image_path",
+            "normalized_reward",
+            "raw_step_reward",
+            "env_reward",
+            "roi_relative_x",
+            "roi_relative_y",
+            "roi_center_x_px",
+            "roi_center_y_px",
+            "roi_distance_from_center",
+            "center_alignment",
+            "roi_aligned",
+            "lumen_visible",
+            "goal_reached",
+            "colon_id",
+            "task_id",
+        ]
+        self.fieldnames.extend(f"action_{idx}" for idx in range(self.action_dim))
+        self.fieldnames.extend(f"policy_action_{idx}" for idx in range(self.action_dim))
+
+        self._csv_files = {}
+        self._writers = {}
+        for env_idx, csv_path in self.env_csv_paths.items():
+            csv_file = open(csv_path, "w", newline="")
+            writer = csv.DictWriter(csv_file, fieldnames=self.fieldnames)
+            writer.writeheader()
+            csv_file.flush()
+            self._csv_files[env_idx] = csv_file
+            self._writers[env_idx] = writer
+
+    def _action_fields(self, prefix, values):
+        row = {}
+        values = [] if values is None else np.asarray(values, dtype=np.float64).reshape(-1).tolist()
+        for idx in range(self.action_dim):
+            row[f"{prefix}_{idx}"] = float(values[idx]) if idx < len(values) else None
+        return row
+
+    def write_step(self, vec_step, policy_actions, executed_actions, rewards, infos, base_env, colon_id, task_id):
+        rgb_images = _numpy_from_value(getattr(base_env, "_camera_data", None)) if base_env is not None else None
+        policy_actions_np = _batched_action_array(policy_actions, len(infos))
+        executed_actions_np = _batched_action_array(executed_actions, len(infos))
+        rewards_np = np.asarray(rewards, dtype=np.float64).reshape(-1)
+
+        for env_idx, info in enumerate(infos):
+            image_rel_path = ""
+            if self.save_images and rgb_images is not None and env_idx < len(rgb_images):
+                frame_name = f"frame_{int(vec_step):08d}.png"
+                image_abs_path = os.path.join(self.env_image_dirs[env_idx], frame_name)
+                image_rel_path = os.path.relpath(image_abs_path, self.env_dirs[env_idx])
+                image_np = _image_to_uint8_hwc(rgb_images[env_idx])
+                if image_np is not None:
+                    Image.fromarray(image_np).save(image_abs_path)
+
+            normalized_reward = _float_from_info(info, "normalized_step_reward")
+            if normalized_reward is None and env_idx < len(rewards_np):
+                normalized_reward = float(np.clip(rewards_np[env_idx], -1.0, 1.0))
+
+            row = {
+                "sample_index": int(self.env_sample_indices.get(env_idx, 0)),
+                "vec_step": int(vec_step),
+                "env_idx": int(env_idx),
+                "image_path": image_rel_path,
+                "normalized_reward": normalized_reward,
+                "raw_step_reward": _float_from_info(info, "raw_step_reward"),
+                "env_reward": float(rewards_np[env_idx]) if env_idx < len(rewards_np) else None,
+                "roi_relative_x": _float_from_info(info, "roi_relative_x"),
+                "roi_relative_y": _float_from_info(info, "roi_relative_y"),
+                "roi_center_x_px": _float_from_info(info, "roi_center_x_px"),
+                "roi_center_y_px": _float_from_info(info, "roi_center_y_px"),
+                "roi_distance_from_center": _float_from_info(info, "roi_distance_from_center"),
+                "center_alignment": _float_from_info(info, "center_alignment"),
+                "roi_aligned": _float_from_info(info, "roi_aligned"),
+                "lumen_visible": _float_from_info(info, "lumen_visible"),
+                "goal_reached": bool(info.get("goal_reached", False)),
+                "colon_id": colon_id,
+                "task_id": task_id,
+            }
+            executed_values = executed_actions_np[env_idx] if executed_actions_np is not None and env_idx < len(executed_actions_np) else None
+            policy_values = policy_actions_np[env_idx] if policy_actions_np is not None and env_idx < len(policy_actions_np) else None
+            row.update(self._action_fields("action", executed_values))
+            row.update(self._action_fields("policy_action", policy_values))
+            self._writers[env_idx].writerow(row)
+            self.env_sample_indices[env_idx] = self.env_sample_indices.get(env_idx, 0) + 1
+            self.sample_index += 1
+        for csv_file in self._csv_files.values():
+            csv_file.flush()
+
+    def close(self):
+        for csv_file in self._csv_files.values():
+            csv_file.flush()
+            csv_file.close()
+        self._csv_files = {}
+        self._writers = {}
+
+
 def run_deterministic_evaluation(model, env, num_episodes, output_dir):
     os.makedirs(output_dir, exist_ok=True)
+    action_log_file = None
+    action_log_writer = None
+    if args_cli.print_actions:
+        action_log_path = os.path.join(output_dir, "printed_actions.csv")
+        action_log_file = open(action_log_path, "w", newline="")
+        action_dim = int(np.prod(env.action_space.shape))
+        fieldnames = ["vec_step", "env_idx"] + [f"action_{idx}" for idx in range(action_dim)]
+        action_log_writer = csv.DictWriter(action_log_file, fieldnames=fieldnames)
+        action_log_writer.writeheader()
+        logging.info("Printing deterministic policy actions and saving them to: %s", action_log_path)
+
     metric_keys = [
         "raw_step_reward",
         "normalized_step_reward",
@@ -1480,6 +2106,27 @@ def run_deterministic_evaluation(model, env, num_episodes, output_dir):
 
     while episodes_completed < num_episodes:
         action, _ = model.predict(obs, deterministic=True)
+        if args_cli.print_actions and total_steps < args_cli.print_action_steps * env.num_envs:
+            action_array = np.asarray(action)
+            if action_array.ndim == 1:
+                action_array = action_array.reshape(1, -1)
+            vec_step = total_steps // env.num_envs
+            for env_idx, action_values in enumerate(action_array):
+                flattened = np.asarray(action_values, dtype=np.float64).reshape(-1)
+                print(
+                    f"[ACTION] vec_step={vec_step} env={env_idx} "
+                    f"policy_action={flattened.tolist()}"
+                )
+                if action_log_writer is not None:
+                    action_log_writer.writerow(
+                        {
+                            "vec_step": int(vec_step),
+                            "env_idx": int(env_idx),
+                            **{f"action_{idx}": float(value) for idx, value in enumerate(flattened)},
+                        }
+                    )
+            if action_log_file is not None:
+                action_log_file.flush()
         obs, rewards, dones, infos = env.step(action)
         current_rewards += rewards
         current_lengths += 1
@@ -1540,13 +2187,16 @@ def run_deterministic_evaluation(model, env, num_episodes, output_dir):
     results_path = os.path.join(output_dir, "evaluation_metrics.json")
     with open(results_path, "w") as f:
         json.dump(results_summary, f, indent=2)
+    if action_log_file is not None:
+        action_log_file.close()
     logging.info(f"Evaluation metrics saved to: {results_path}")
     return results_summary
 
-# Select algorithm based on command line argument
-# For continual training, load the pre-trained model instead of creating a new one
-if args_cli.continual_training:
-    logging.info(f"Loading pre-trained model for continual training from: {args_cli.model_path}")
+# Select algorithm based on command line argument.
+# Continual training and policy-guided data sampling both load a checkpoint.
+if continual_training_mode or policy_guided_data_sampling:
+    load_context = "policy-guided data sampling" if policy_guided_data_sampling else "continual training"
+    logging.info(f"Loading pre-trained model for {load_context} from: {args_cli.model_path}")
     if args_cli.algo == "PPO":
         model = PPO.load(args_cli.model_path, env=env, device=device, tensorboard_log=tensorboard_log)
     elif args_cli.algo == "SAC":
@@ -1559,7 +2209,7 @@ if args_cli.continual_training:
         model = DDPG.load(args_cli.model_path, env=env, device=device, tensorboard_log=tensorboard_log)
     else:
         raise ValueError(f"Unknown algorithm: {args_cli.algo}")
-    logging.info("Pre-trained model loaded successfully. Ready for continual training.")
+    logging.info(f"Pre-trained model loaded successfully. Ready for {load_context}.")
 elif args_cli.algo == "PPO":
     model = PPO(
         "MultiInputPolicy",
@@ -1682,7 +2332,7 @@ logging.debug(model.policy.features_extractor)
 
 continual_training_target_episodes = max(1, int(args_cli.continual_training_target_episodes))
 
-if args_cli.continual_training:
+if continual_training_mode:
     max_episode_steps = int(getattr(env.unwrapped, "max_episode_length", 0))
     if max_episode_steps > 0:
         min_steps_before_training = continual_training_target_episodes * max_episode_steps + 1
@@ -1726,7 +2376,7 @@ if args_cli.continual_training:
                 )
                 model.learning_starts = desired_learning_starts
 
-if args_cli.continual_training and args_cli.cross_colon_eval_only:
+if continual_training_mode and args_cli.cross_colon_eval_only:
     logging.info(
         "Running cross-colon evaluation only: colon=%s task=%s episodes=%s. No training updates.",
         args_cli.colon_id,
@@ -1747,7 +2397,7 @@ if args_cli.continual_training and args_cli.cross_colon_eval_only:
             f,
             indent=2,
         )
-elif args_cli.train or args_cli.continual_training:
+elif args_cli.train or continual_training_mode:
     checkpoint_callback = CheckpointCallback(
         save_freq=10000, # Save every 10k steps
         save_path=model_save_path,
@@ -1799,7 +2449,7 @@ elif args_cli.train or args_cli.continual_training:
                 verbose=1,
             )
         )
-    if args_cli.continual_training:
+    if continual_training_mode:
         callbacks.append(
             FreezeLearningUntilAllEnvsNEpisodesCallback(
                 target_episodes=continual_training_target_episodes,
@@ -1872,14 +2522,131 @@ elif args_cli.test:
     run_deterministic_evaluation(model, env, args_cli.test_episodes, result_dir)
 elif args_cli.data_sampling:
     logging.info("Starting data sampling mode...")
+    if policy_guided_data_sampling:
+        logging.info(
+            "Using %s policy actions from %s. No model updates or checkpoint saves will be performed.",
+            "deterministic" if policy_sampling_deterministic else "continual-training-style stochastic",
+            args_cli.model_path,
+        )
+    else:
+        logging.info("Using random actions generated inside the environment.")
+    logging.info("Press 'G' to save the current robot configuration.")
+    from arcgym.utils.keyboard import FPVKeyboard
+    from arcgym.utils.robot_state_io import save_robot_state
+
+    sampling_keyboard = FPVKeyboard(lin_sensitivity=1, rot_sensitivity=1)
+    sampling_keyboard.add_callback("G", lambda: save_robot_state(env))
+    sampling_keyboard.reset()
+
     obs = env.reset()
     zero_actions = np.zeros((env.num_envs,) + env.action_space.shape, dtype=np.float32)
+    total_steps = 0
+    target_reaches_completed = 0
+    target_reach_goal = args_cli.data_sampling_target_reaches
+    previous_goal_reached = np.zeros(env.num_envs, dtype=bool)
+    sampling_status = "completed"
+    medical_writer = None
+    action_dim = int(np.prod(env.action_space.shape))
+    if not args_cli.disable_medical_data_save:
+        medical_writer = MedicalTrainingDataWriter(
+            save_root=args_cli.medical_data_dir,
+            result_dir=result_dir,
+            config=config,
+            action_dim=action_dim,
+            save_images=args_cli.medical_save_images,
+            run_dir=args_cli.medical_run_dir,
+        )
+        logging.info("Medical training data will be saved to: %s", medical_writer.run_dir)
+
+    def _info_bool(info, key):
+        value = info.get(key, False)
+        if hasattr(value, "item"):
+            value = value.item()
+        elif isinstance(value, np.ndarray):
+            value = value.reshape(-1)[0] if value.size else False
+        return bool(value)
 
     try:
         while simulation_app.is_running():
-            obs, reward, done, info = env.step(zero_actions)
+            sampling_keyboard.advance()
+            vec_step = total_steps // env.num_envs
+            if policy_guided_data_sampling:
+                actions, _ = model.predict(obs, deterministic=policy_sampling_deterministic)
+            else:
+                actions = zero_actions
+            obs, reward, done, info = env.step(actions)
+            if medical_writer is not None:
+                base_env = _base_isaac_env(env)
+                executed_actions = getattr(base_env, "actions", actions) if base_env is not None else actions
+                medical_writer.write_step(
+                    vec_step=vec_step,
+                    policy_actions=actions,
+                    executed_actions=executed_actions,
+                    rewards=reward,
+                    infos=info,
+                    base_env=base_env,
+                    colon_id=args_cli.colon_id,
+                    task_id=args_cli.task_id,
+                )
+            total_steps += env.num_envs
+            goal_reached = np.asarray([_info_bool(env_info, "goal_reached") for env_info in info], dtype=bool)
+            fresh_reaches = goal_reached & ~previous_goal_reached
+            if fresh_reaches.any():
+                target_reaches_completed += int(fresh_reaches.sum())
+                reached_envs = np.where(fresh_reaches)[0].tolist()
+                logging.info(
+                    "Data sampling target reached in envs %s (%s/%s)",
+                    reached_envs,
+                    target_reaches_completed,
+                    target_reach_goal if target_reach_goal is not None else "unbounded",
+                )
+            previous_goal_reached = goal_reached
+            if target_reach_goal is not None and target_reaches_completed >= target_reach_goal:
+                logging.info("Target reach quota met. Exiting data sampling run.")
+                break
     except KeyboardInterrupt:
+        sampling_status = "interrupted"
         logging.info("\nCtrl+C detected. Exiting data sampling mode.")
+    except Exception:
+        sampling_status = "failed"
+        logging.exception("Data sampling failed.")
+        raise
+    finally:
+        medical_data_run_dir = None
+        medical_samples = 0
+        if medical_writer is not None:
+            medical_data_run_dir = medical_writer.run_dir
+            medical_samples = int(medical_writer.sample_index)
+            medical_writer.close()
+        final_sampling_status = sampling_status
+        if (
+            final_sampling_status == "completed"
+            and target_reach_goal is not None
+            and target_reaches_completed < target_reach_goal
+        ):
+            final_sampling_status = "target_not_reached"
+        with open(os.path.join(result_dir, "run_status.json"), "w") as f:
+            json.dump(
+                {
+                    "status": final_sampling_status,
+                    "mode": "policy_guided_data_sampling" if policy_guided_data_sampling else "random_data_sampling",
+                    "model_path": args_cli.model_path if policy_guided_data_sampling else None,
+                    "deterministic": bool(policy_guided_data_sampling and policy_sampling_deterministic),
+                    "model_updates": False,
+                    "clip_actions": bool(args_cli.clip_actions),
+                    "data_sampling_colon1_forward_only": bool(data_sampling_colon1_forward_only),
+                    "data_sampling_no_backward_recovery": bool(data_sampling_no_backward_recovery),
+                    "init_from_csv": task_startpose_csv,
+                    "init_endpose_from_csv": task_endpose_csv,
+                    "target_reach_goal": target_reach_goal,
+                    "target_reaches": int(target_reaches_completed),
+                    "total_env_steps": int(total_steps),
+                    "medical_data_dir": medical_data_run_dir,
+                    "medical_samples": medical_samples,
+                },
+                f,
+                indent=2,
+            )
 else:
     from arcgym.utils.teleop_mode import run_teleoperation_mode
     run_teleoperation_mode(env, simulation_app, device=device)

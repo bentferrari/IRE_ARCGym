@@ -425,6 +425,11 @@ class Sb3VecEnvWrapper(VecEnv):
                 "raw_step_reward",
                 "normalized_step_reward",
                 "normalized_progress",
+                "roi_relative_x",
+                "roi_relative_y",
+                "roi_center_x_px",
+                "roi_center_y_px",
+                "roi_distance_from_center",
                 "roi_aligned",
                 "lumen_visible",
             ]

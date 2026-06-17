@@ -339,7 +339,7 @@ class FinalReward(RewardFunction):
     }
 
     def __init__(self, eps, reward_scale, center_weight=0.5, goal_weight=0.0, obstruction_weight=0.5,
-                 alignment_threshold=0.8, consecutive_negative_threshold=200, reset_penalty=-100.0,
+                 alignment_threshold=0.7, consecutive_negative_threshold=200, reset_penalty=-100.0,
                  episode_length_s=20.0, decimation=2, dt=1.0/240.0,
                  success_alignment_ratio=0.8, success_distance_threshold=0.1,
                  reward_variant=None, reward_wc=None, reward_wo=None, reward_lambda_o=1.0,
@@ -523,6 +523,11 @@ class FinalReward(RewardFunction):
             "raw_step_reward": [],
             "normalized_step_reward": [],
             "normalized_progress": [],
+            "roi_relative_x": [],
+            "roi_relative_y": [],
+            "roi_center_x_px": [],
+            "roi_center_y_px": [],
+            "roi_distance_from_center": [],
             "roi_aligned": [],
             "lumen_visible": [],
         }
@@ -643,6 +648,8 @@ class FinalReward(RewardFunction):
             deepest_point_deviation = np.sqrt((high_centroid_row - img_center_row)**2 +
                                              (high_centroid_col - img_center_col)**2)
             deepest_point_normalized = deepest_point_deviation / max_center_distance
+            roi_relative_y = (high_centroid_row - img_center_row) / max(img_center_row, 1e-6)
+            roi_relative_x = (high_centroid_col - img_center_col) / max(img_center_col, 1e-6)
 
             # print(f"Depth stats - min: {min_depth:.3f}, max: {max_depth:.3f}, mean: {mean_depth:.3f}, "
             #       f"variance: {depth_variance:.6f}, high_depth_ratio: {high_depth_ratio:.3f}, "
@@ -806,6 +813,11 @@ class FinalReward(RewardFunction):
             metric_accumulators["raw_step_reward"].append(float(raw_reward))
             metric_accumulators["normalized_step_reward"].append(float(normalized_reward))
             metric_accumulators["normalized_progress"].append(float(np.clip(reward_components['goal_progress'], 0.0, 1.0)))
+            metric_accumulators["roi_relative_x"].append(float(np.clip(roi_relative_x, -1.0, 1.0)))
+            metric_accumulators["roi_relative_y"].append(float(np.clip(roi_relative_y, -1.0, 1.0)))
+            metric_accumulators["roi_center_x_px"].append(float(high_centroid_col))
+            metric_accumulators["roi_center_y_px"].append(float(high_centroid_row))
+            metric_accumulators["roi_distance_from_center"].append(float(np.clip(deepest_point_normalized, 0.0, 1.0)))
             metric_accumulators["roi_aligned"].append(1.0 if center_alignment > self.alignment_threshold else 0.0)
             metric_accumulators["lumen_visible"].append(1.0 if s_o > -0.15 else 0.0)
 
