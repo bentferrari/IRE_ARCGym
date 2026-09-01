@@ -596,7 +596,7 @@ class ColonModel:
                                         [-1.0, 0.0, 0.0]
                                         ]).to(device)
         else:
-            entry_pos = torch.tensor([-0.1629, -0.8524, -1.8750]).to(device)
+            entry_pos = torch.tensor([5.6430,  -1.3124, -2.2]).to(device)
             delta_trans = torch.tensor([[0.0, 0.0, 0.0],
                                         [0.0, 5, 0.0],
                                         [-5, 0.0, 0.0],

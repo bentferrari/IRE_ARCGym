@@ -50,7 +50,6 @@ def spawn_from_mesh_file(
     # For deformable bodies, PhysX FEM ignores the parent Xform's orientation when
     # initialising the simulation mesh. Bake the rotation into the vertices directly.
     if cfg.deformable_props is not None and orientation is not None:
-        import numpy as np
         w, x, y, z = orientation
         rot_matrix = trimesh.transformations.quaternion_matrix([w, x, y, z])
         mesh.apply_transform(rot_matrix)
@@ -168,4 +167,3 @@ class MeshFileCfg(FileCfg):
     """Physics material properties. Defaults to the default rigid body material."""
 
     physics_material_path: str = "PhysicsMaterial"
-

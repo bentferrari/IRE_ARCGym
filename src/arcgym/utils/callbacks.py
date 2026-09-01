@@ -335,6 +335,7 @@ class RewardAblationMetricsCallback(BaseCallback):
         self.rows = []
         self.total_episodes = 0
         self.total_successes = 0
+        self.episode_successes = []
         self._csv_file = None
         self._writer = None
         self._latest_row = None
@@ -358,6 +359,7 @@ class RewardAblationMetricsCallback(BaseCallback):
             "roi_alignment_rate",
             "lumen_visible_ratio",
             "success_rate",
+            "success_rate_recent_100ep",
             "episodes",
         ]
         self._csv_file = open(self.csv_path, "w", newline="")
@@ -381,6 +383,7 @@ class RewardAblationMetricsCallback(BaseCallback):
 
     def _build_row(self, rewards, metric_values):
         success_rate = self.total_successes / self.total_episodes if self.total_episodes else 0.0
+        recent_successes = self.episode_successes[-100:]
         return {
             "timestep": int(self.num_timesteps),
             "reward_variant": self.reward_variant,
@@ -397,6 +400,7 @@ class RewardAblationMetricsCallback(BaseCallback):
             "roi_alignment_rate": float(np.mean(metric_values["roi_aligned"])) if metric_values["roi_aligned"] else None,
             "lumen_visible_ratio": float(np.mean(metric_values["lumen_visible"])) if metric_values["lumen_visible"] else None,
             "success_rate": success_rate,
+            "success_rate_recent_100ep": float(np.mean(recent_successes)) if recent_successes else 0.0,
             "episodes": int(self.total_episodes),
         }
 
@@ -418,6 +422,7 @@ class RewardAblationMetricsCallback(BaseCallback):
             if done and isinstance(info, dict) and "episode" in info:
                 self.total_episodes += 1
                 is_success = bool(info.get("goal_reached", False))
+                self.episode_successes.append(1 if is_success else 0)
                 if is_success:
                     self.total_successes += 1
 
@@ -1062,6 +1067,89 @@ class StopAfterTotalEpisodesCallback(BaseCallback):
             return False
 
         return True
+
+
+class BestAndLastRewardCheckpointCallback(BaseCallback):
+    """Keep only rolling-return best and most-recent training checkpoints."""
+
+    def __init__(self, save_dir, name_prefix="ppo_arc", window_episodes=10, verbose=0):
+        super().__init__(verbose)
+        self.save_dir = Path(save_dir)
+        self.name_prefix = str(name_prefix)
+        self.window_episodes = max(1, int(window_episodes))
+        self.episode_returns = []
+        self.best_score = None
+        self._full_window_initialized = False
+
+    @property
+    def best_path(self):
+        return self.save_dir / f"{self.name_prefix}_best"
+
+    @property
+    def last_path(self):
+        return self.save_dir / f"{self.name_prefix}_last"
+
+    def _save_metadata(self, path, score):
+        with path.open("w") as file:
+            json.dump(
+                {
+                    "selection_metric": f"mean_episode_return_recent_{self.window_episodes}ep",
+                    "score": float(score),
+                    "episodes_observed": len(self.episode_returns),
+                    "timesteps": int(self.num_timesteps),
+                },
+                file,
+                indent=2,
+            )
+
+    def _save_last(self):
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.model.save(str(self.last_path))
+        recent = self.episode_returns[-self.window_episodes:]
+        score = float(np.mean(recent)) if recent else 0.0
+        self._save_metadata(self.save_dir / f"{self.name_prefix}_last_metrics.json", score)
+
+    def _save_best(self, score):
+        self.model.save(str(self.best_path))
+        self._save_metadata(self.save_dir / f"{self.name_prefix}_best_metrics.json", score)
+        self.best_score = float(score)
+        if self.verbose > 0:
+            print(
+                "BestAndLastRewardCheckpointCallback: new best mean episode return "
+                f"{score:.6g} at {len(self.episode_returns)} episodes"
+            )
+
+    def _on_step(self) -> bool:
+        dones = self.locals.get("dones")
+        infos = self.locals.get("infos")
+        if dones is None or infos is None:
+            return True
+
+        completed = False
+        for done, info in zip(dones, infos):
+            if not done or "episode" not in info:
+                continue
+            episode = info.get("episode", {})
+            self.episode_returns.append(float(episode.get("r", 0.0)))
+            completed = True
+
+        if not completed:
+            return True
+
+        self._save_last()
+        score = float(np.mean(self.episode_returns[-self.window_episodes:]))
+        if self.best_score is None:
+            self._save_best(score)
+        if len(self.episode_returns) >= self.window_episodes:
+            if not self._full_window_initialized:
+                self._full_window_initialized = True
+                self._save_best(score)
+            elif score > self.best_score:
+                self._save_best(score)
+        return True
+
+    def _on_training_end(self) -> None:
+        self._save_last()
 
 
 class TrajectoryDataSaver(BaseCallback):

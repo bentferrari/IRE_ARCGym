@@ -8,7 +8,7 @@ NUM_ENVS="${NUM_ENVS:-5}"
 ALGO="${ALGO:-PPO}"
 TEST_EPISODES="${TEST_EPISODES:-5}"
 TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-1e7}"
-ABLATION_EPISODES="${ABLATION_EPISODES:-300}"
+ABLATION_EPISODES="${ABLATION_EPISODES:-}"
 
 # Additional args are forwarded to arc_env_rl.py, e.g.:
 #   ./scripts/run_reward_ablation.sh --reward_beta 0.7
@@ -23,6 +23,14 @@ case "${TASK_ID}" in
     exit 1
     ;;
 esac
+
+if [[ -z "${ABLATION_EPISODES}" ]]; then
+  if [[ "${TASK_ID}" == "t2" ]]; then
+    ABLATION_EPISODES=30
+  else
+    ABLATION_EPISODES=300
+  fi
+fi
 
 # Colon/task selection uses both:
 #   saved_states/${COLON_ID}${TASK_ID}_start.csv

@@ -6,17 +6,14 @@ import torch
 
 from arcgym.utils.keyboard import FPVKeyboard
 from arcgym.utils.robot_state_io import save_robot_state
-from arcgym.utils.vlm_guidance_client import VLMGuidanceClient
 
-
-def run_teleoperation_mode(env, simulation_app, device="cuda", headless=False):
+def run_teleoperation_mode(env, simulation_app, device="cuda"):
     """Run the environment in teleoperation mode.
 
     Args:
         env: The environment to run teleoperation on.
         simulation_app: The Isaac Sim simulation application.
         device: Device to run on (default: "cuda").
-        headless: Whether Isaac is running without a display.
     """
     logging.info("Starting teleoperation mode...")
     logging.info("Use keyboard to control the robot. Press 'C' to reset, 'G' to save state.")
@@ -41,16 +38,6 @@ def run_teleoperation_mode(env, simulation_app, device="cuda", headless=False):
     teleop_interface.add_callback("G", lambda: save_robot_state(env, save_dir=save_dir))
 
     env_id = 0
-    vlm_guidance = None
-    if os.environ.get("VLM_GUIDANCE_ENABLE", "1") != "0":
-        default_show_window = "0" if headless else "1"
-        vlm_guidance = VLMGuidanceClient(
-            server_url=os.environ.get("VLM_GUIDANCE_URL", "http://127.0.0.1:8765/predict"),
-            update_interval=int(os.environ.get("VLM_GUIDANCE_INTERVAL", "5")),
-            async_mode=os.environ.get("VLM_GUIDANCE_ASYNC", "1") != "0",
-            show_window=os.environ.get("VLM_GUIDANCE_SHOW_WINDOW", default_show_window) != "0",
-            sync_display=os.environ.get("VLM_GUIDANCE_SYNC_DISPLAY", "1") != "0",
-        )
 
     # Reset environment and teleop interface
     env.reset()
@@ -76,22 +63,6 @@ def run_teleoperation_mode(env, simulation_app, device="cuda", headless=False):
 
                     # Apply actions to environment
                     obs, reward, done, info = env.step(actions)
-                    if vlm_guidance is not None:
-                        try:
-                            rgb = obs.get("rgb") if isinstance(obs, dict) else None
-                            if rgb is None and hasattr(env, "render"):
-                                rgb = env.render()
-                            vlm_response = vlm_guidance.maybe_update(
-                                rgb=rgb,
-                                action_6dof=teleop_actions,
-                                reward=reward,
-                            )
-                            if vlm_response and vlm_response.get("ok") and vlm_response.get("client_new_response"):
-                                guidance = vlm_response.get("guidance", {})
-                                coaching = vlm_response.get("coaching", "")
-                                logging.info("VLM guidance: %s | %s", guidance, coaching)
-                        except Exception as exc:
-                            logging.warning("VLM guidance update failed: %s", exc)
 
                     logging.info(f"{reward[env_id].item():.03f}, {done[env_id]}")
 

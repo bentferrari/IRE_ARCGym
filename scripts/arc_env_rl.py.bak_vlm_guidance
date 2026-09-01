@@ -41,7 +41,7 @@ CROSS_COLON2_TRIALS = 2
 CROSS_COLON_IDS = ["c2", "c3", "c4", "c5"]
 CROSS_COLON_TASKS = ["t1", "t2", "t3", "t4"]
 DATA_SAMPLING_SEQUENCE_COLONS = ["c1", "c3", "c4", "c5"]
-DATA_SAMPLING_SEQUENCE_REPEATS = 1
+DATA_SAMPLING_SEQUENCE_REPEATS = 2
 DEFAULT_MEDICAL_DATA_DIR = "/home/guanglin/data_arcgym1/sim4medical_training_data"
 
 
@@ -176,8 +176,8 @@ def _write_cross_colon_summary(rows, csv_path, json_path):
 
 def _write_data_sampling_sequence_summary(rows, csv_path, json_path):
     fieldnames = [
-        "sequence_index",
         "colon_id",
+        "trial_id",
         "result_dir",
         "medical_data_dir",
         "init_from_csv",
@@ -253,7 +253,7 @@ def _run_reward_ablation_launcher_if_requested():
     early_parser.add_argument("--ablation_t2", action="store_true")
     early_parser.add_argument("--ablation_t3", action="store_true")
     early_parser.add_argument("--ablation_t4", action="store_true")
-    early_parser.add_argument("--ablation_episodes", type=int, default=None)
+    early_parser.add_argument("--ablation_episodes", type=int, default=300)
     early_parser.add_argument("--colon_id", type=str, default="c1")
     early_args, _ = early_parser.parse_known_args()
 
@@ -291,9 +291,6 @@ def _run_reward_ablation_launcher_if_requested():
     }
     base_child_args = _strip_controlled_cli_args(sys.argv[1:], value_options, flag_options)
     selected_task_id = selected_tasks[0]
-    target_episodes = early_args.ablation_episodes
-    if target_episodes is None:
-        target_episodes = 30 if selected_task_id == "t2" else 300
 
     for run_index, (variant, constrained) in enumerate(ABLATION_REWARD_RUNS, start=1):
         child_cmd = [
@@ -308,7 +305,7 @@ def _run_reward_ablation_launcher_if_requested():
             "--reward_variant",
             variant,
             "--stop_after_episodes",
-            str(target_episodes),
+            str(early_args.ablation_episodes),
         ]
         if constrained:
             child_cmd.append("--clip_actions")
@@ -948,7 +945,7 @@ def _run_data_sampling_sequence_launcher_if_requested():
     Launch the requested data-sampling sequence before importing Isaac/Kit.
 
     Colon assets are constructed at app startup, so the robust way to "switch"
-    colons is to run one child Isaac process per colon, sequentially.
+    colons is to run one child Isaac process per sampling trial.
     """
     early_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     early_parser.add_argument("--data_sampling_sequence", action="store_true")
@@ -969,11 +966,6 @@ def _run_data_sampling_sequence_launcher_if_requested():
         return
     if not early_args.data_sampling:
         raise SystemExit("--data_sampling_sequence requires --data_sampling")
-    if int(early_args.data_sampling_sequence_repeats) != 1:
-        raise SystemExit(
-            "Continuous data sampling now runs each colon exactly once; "
-            "--data_sampling_sequence_repeats must be 1"
-        )
     if early_args.continual_learning:
         early_args.continual_training = True
     if early_args.continual_training and early_args.model_path is None:
@@ -1031,79 +1023,84 @@ def _run_data_sampling_sequence_launcher_if_requested():
     summary_csv = os.path.join(results_root, "data_sampling_sequence_summary.csv")
     summary_json = os.path.join(results_root, "data_sampling_sequence_summary.json")
 
-    for sequence_index, colon_id in enumerate(sequence_colons):
+    repeats = max(1, int(early_args.data_sampling_sequence_repeats))
+    for colon_id in sequence_colons:
         colon_suffix = colon_id[1:] if colon_id.lower().startswith("c") else colon_id
-        child_result_dir = os.path.join(results_root, f"colon-{colon_id}")
-        child_medical_run_dir = os.path.join(
-            medical_sequence_root,
-            f"sampling_colon{colon_suffix}",
-        )
-        child_cmd = [
-            sys.executable,
-            os.path.abspath(__file__),
-            *base_child_args,
-            "--data_sampling",
-            "--colon_id",
-            colon_id,
-            "--task_id",
-            early_args.task_id,
-            "--num_envs",
-            str(early_args.num_envs),
-            "--result_dir",
-            child_result_dir,
-            "--data_sampling_target_reaches",
-            "1",
-            "--medical_data_dir",
-            early_args.medical_data_dir,
-            "--medical_run_dir",
-            child_medical_run_dir,
-        ]
-        if early_args.continual_training:
-            child_cmd.append("--continual_training")
-        if early_args.model_path is not None:
-            child_cmd.extend(["--model_path", early_args.model_path])
-
-        logging.info(
-            "Continuous data sampling %s/%s: colon=%s target=sampling_colon%s",
-            sequence_index + 1,
-            len(sequence_colons),
-            colon_id,
-            colon_suffix,
-        )
-        logging.info("Command: %s", " ".join(child_cmd))
-        completed = subprocess.run(child_cmd)
-
-        run_status = _load_json_if_exists(os.path.join(child_result_dir, "run_status.json"))
-        child_status = run_status.get("status", "failed" if completed.returncode else "unknown")
-        row = {
-            "sequence_index": sequence_index + 1,
-            "colon_id": colon_id,
-            "result_dir": child_result_dir,
-            "medical_data_dir": run_status.get("medical_data_dir", child_medical_run_dir),
-            "init_from_csv": run_status.get("init_from_csv"),
-            "init_endpose_from_csv": run_status.get("init_endpose_from_csv"),
-            "status": child_status,
-            "target_reaches": run_status.get("target_reaches"),
-            "total_env_steps": run_status.get("total_env_steps"),
-            "model_path": run_status.get("model_path", early_args.model_path),
-        }
-        summary_rows.append(row)
-        _write_data_sampling_sequence_summary(summary_rows, summary_csv, summary_json)
-
-        if completed.returncode != 0:
-            logging.error(
-                "Continuous data sampling failed for colon=%s with exit code %s",
-                colon_id,
-                completed.returncode,
+        for trial_id in range(1, repeats + 1):
+            child_result_dir = os.path.join(results_root, f"colon-{colon_id}", f"trial-{trial_id}")
+            child_medical_run_dir = os.path.join(
+                medical_sequence_root,
+                f"sampling_colon{colon_suffix}",
+                f"trial-{trial_id}",
             )
-            sys.exit(completed.returncode)
-        if child_status != "completed":
-            logging.error(
-                "Continuous data sampling did not complete target reach for colon=%s: status=%s",
+            child_cmd = [
+                sys.executable,
+                os.path.abspath(__file__),
+                *base_child_args,
+                "--data_sampling",
+                "--colon_id",
                 colon_id,
-                child_status,
+                "--task_id",
+                early_args.task_id,
+                "--num_envs",
+                str(early_args.num_envs),
+                "--result_dir",
+                child_result_dir,
+                "--data_sampling_target_reaches",
+                "1",
+                "--medical_data_dir",
+                early_args.medical_data_dir,
+                "--medical_run_dir",
+                child_medical_run_dir,
+            ]
+            if early_args.continual_training:
+                child_cmd.append("--continual_training")
+            if early_args.model_path is not None:
+                child_cmd.extend(["--model_path", early_args.model_path])
+
+            logging.info(
+                "Data-sampling sequence: colon=%s trial=%s/%s target=sampling_colon%s",
+                colon_id,
+                trial_id,
+                repeats,
+                colon_suffix,
             )
-            sys.exit(1)
+            logging.info("Command: %s", " ".join(child_cmd))
+            completed = subprocess.run(child_cmd)
+
+            run_status = _load_json_if_exists(os.path.join(child_result_dir, "run_status.json"))
+            child_status = run_status.get("status", "failed" if completed.returncode else "unknown")
+            row = {
+                "colon_id": colon_id,
+                "trial_id": trial_id,
+                "result_dir": child_result_dir,
+                "medical_data_dir": run_status.get("medical_data_dir", child_medical_run_dir),
+                "init_from_csv": run_status.get("init_from_csv"),
+                "init_endpose_from_csv": run_status.get("init_endpose_from_csv"),
+                "status": child_status,
+                "target_reaches": run_status.get("target_reaches"),
+                "total_env_steps": run_status.get("total_env_steps"),
+                "model_path": run_status.get("model_path", early_args.model_path),
+            }
+            summary_rows.append(row)
+            _write_data_sampling_sequence_summary(summary_rows, summary_csv, summary_json)
+
+            if completed.returncode != 0:
+                logging.error(
+                    "Data-sampling sequence child failed for colon=%s trial=%s with exit code %s",
+                    colon_id,
+                    trial_id,
+                    completed.returncode,
+                )
+                sys.exit(completed.returncode)
+            if child_status != "completed":
+                logging.error(
+                    "Data-sampling sequence child did not complete target reach for colon=%s trial=%s: status=%s",
+                    colon_id,
+                    trial_id,
+                    child_status,
+                )
+                sys.exit(1)
 
     logging.info("Data-sampling sequence summary saved to: %s", summary_csv)
     sys.exit(0)
@@ -1128,9 +1125,9 @@ parser.add_argument("--continual_learning", action="store_true",
 parser.add_argument("--data_sampling", action="store_true",
                     help="Run autonomous data-sampling mode. By default it uses random actions; with --model_path or --continual_training it uses deterministic policy actions without training updates.")
 parser.add_argument("--data_sampling_sequence", action="store_true",
-                    help="Run continuous data sampling once each for c1, c3, c4, and c5, skipping c2")
+                    help="Run data sampling in sequence: c1 twice, c3 twice, c4 twice, c5 twice, skipping c2")
 parser.add_argument("--data_sampling_sequence_repeats", type=int, default=DATA_SAMPLING_SEQUENCE_REPEATS,
-                    help="Deprecated compatibility option; continuous sampling requires exactly 1")
+                    help="Number of successful sampling trials per colon in --data_sampling_sequence")
 parser.add_argument("--data_sampling_sequence_colons", type=str, default=",".join(DATA_SAMPLING_SEQUENCE_COLONS),
                     help="Comma-separated colon ids for --data_sampling_sequence, e.g. c5 or c1,c3,c4,c5")
 parser.add_argument("--data_sampling_sequence_results_dir", type=str, default=None,
@@ -1140,10 +1137,6 @@ parser.add_argument("--data_sampling_target_reaches", type=int, default=None,
 parser.add_argument("--model_path", type=str, default=None,
                     help="Path to the trained model to load for testing, continual training, or policy-guided data sampling")
 parser.add_argument("--test_episodes", type=int, default=1, help="Number of episodes to run in test mode")
-parser.add_argument("--evaluation_episode_length_s", type=float, default=None,
-                    help="Evaluation-only episode timeout in simulated seconds; training remains at 40 seconds")
-parser.add_argument("--training_seed", type=int, default=None,
-                    help="Training-seed metadata when evaluating an existing policy with a separate evaluation seed")
 parser.add_argument("--print_actions", action="store_true",
                     help="Print and save deterministic policy actions during evaluation")
 parser.add_argument("--print_action_steps", type=int, default=50,
@@ -1156,10 +1149,6 @@ parser.add_argument("--clip_actions", action=argparse.BooleanOptionalAction, def
                     help="Enable action constraints (clipping/projection/masks)")
 parser.add_argument("--algo", type=str, default="PPO", choices=["PPO", "SAC", "TD3", "A2C", "DDPG"],
                     help="RL algorithm to use (default: PPO)")
-parser.add_argument("--ppo_n_steps", type=int, default=2048,
-                    help="PPO rollout steps per environment (1600 with 5 envs gives exact 8000-transition rollouts)")
-parser.add_argument("--ppo_batch_size", type=int, default=1024,
-                    help="PPO minibatch size (1000 divides an 8000-transition rollout exactly)")
 parser.add_argument("--reward_variant", type=str, default=None,
                     choices=["center_only", "depth_existence", "deep_area", "lumen_evidence", "full_reward"],
                     help="Reward ablation variant. Omit to preserve the legacy full reward behavior.")
@@ -1178,8 +1167,6 @@ parser.add_argument("--colon_id", type=str, default="c1",
                     help="Colon id. Selects the colon mesh and saved_states/{colon_id}{task_id}_start.csv/_end.csv when present.")
 parser.add_argument("--task_id", type=str, default="t1",
                     help="Task id metadata. Also selects saved_states/{colon_id}{task_id}_start.csv and _end.csv when present.")
-parser.add_argument("--rigid_colon", action=argparse.BooleanOptionalAction, default=False,
-                    help="Use a fixed rigid colon instead of the default deformable FEM colon")
 parser.add_argument("--eval_after_train", action="store_true",
                     help="Run deterministic evaluation after training and write evaluation_metrics.json")
 parser.add_argument("--total_timesteps", type=float, default=1e7,
@@ -1187,13 +1174,13 @@ parser.add_argument("--total_timesteps", type=float, default=1e7,
 parser.add_argument("--ablation_t1", action="store_true",
                     help="Run the six reward-ablation trainings for task 1, stopping each after 300 completed episodes")
 parser.add_argument("--ablation_t2", action="store_true",
-                    help="Run the six reward-ablation trainings for task 2, stopping each after 30 completed episodes")
+                    help="Run the six reward-ablation trainings for task 2, stopping each after 300 completed episodes")
 parser.add_argument("--ablation_t3", action="store_true",
                     help="Run the six reward-ablation trainings for task 3, stopping each after 300 completed episodes")
 parser.add_argument("--ablation_t4", action="store_true",
                     help="Run the six reward-ablation trainings for task 4, stopping each after 300 completed episodes")
-parser.add_argument("--ablation_episodes", type=int, default=None,
-                    help="Completed episodes per reward-ablation child (default: 30 for T2, 300 otherwise)")
+parser.add_argument("--ablation_episodes", type=int, default=300,
+                    help="Number of completed episodes to train each reward variant in --ablation_t* mode")
 parser.add_argument("--stop_after_episodes", type=int, default=None,
                     help="Stop a training run after this many completed episodes across all environments")
 parser.add_argument("--continual_training_target_episodes", type=int, default=1,
@@ -1230,10 +1217,6 @@ parser.add_argument("--result_dir", type=str, default=None,
                     help="Override the automatically generated result directory")
 parser.add_argument("--disable_video", action="store_true",
                     help="Disable RecordVideo output during training/evaluation")
-parser.add_argument("--checkpoint_save_freq", type=int, default=10000,
-                    help="Checkpoint interval in callback steps; use 0 to save only the final model")
-parser.add_argument("--save_best_and_last_only", action="store_true",
-                    help="Overwrite best/last checkpoints at episode completions instead of accumulating periodic checkpoints")
 parser.add_argument("--trajectory_save_interval", type=int, default=1,
                     help="Save trajectory metadata every N completed episodes per environment")
 parser.add_argument("--save_trajectory_images", action=argparse.BooleanOptionalAction, default=True,
@@ -1245,30 +1228,7 @@ parser.add_argument("--medical_run_dir", type=str, default=None,
 parser.add_argument("--disable_medical_data_save", action="store_true",
                     help="Disable medical-simulator dataset writing during --data_sampling")
 parser.add_argument("--medical_save_images", action=argparse.BooleanOptionalAction, default=True,
-                    help="Save uint8 RGB camera PNG frames during --data_sampling")
-parser.add_argument(
-    "--medical_centerline_root",
-    type=str,
-    default=os.path.join("src", "arcgym", "assets", "colons", "centerlines"),
-    help=(
-        "Root containing sampling_colonN/centerline.csv files. The CSV coordinates "
-        "must be in the source OBJ mesh frame."
-    ),
-)
-parser.add_argument(
-    "--medical_centerline_scale",
-    type=float,
-    default=None,
-    help="Optional source-mesh to simulator-world scale override (default: use the colon asset scale)",
-)
-parser.add_argument(
-    "--medical_centerline_lookahead_offsets",
-    type=str,
-    default="0.01,0.025,0.05,0.10,0.20,0.40,0.70,1.00",
-    help="Strictly increasing comma-separated centerline look-ahead arc offsets in metres",
-)
-parser.add_argument("--medical_csv_flush_interval", type=int, default=100,
-                    help="Flush each environment CSV after this many rows")
+                    help="Save RGB PNG frames for the medical-simulator dataset during --data_sampling")
 
 # Append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -1277,30 +1237,6 @@ AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 if args_cli.continual_learning:
     args_cli.continual_training = True
-if args_cli.medical_centerline_scale is not None and args_cli.medical_centerline_scale <= 0.0:
-    parser.error("--medical_centerline_scale must be positive")
-if args_cli.medical_csv_flush_interval < 1:
-    parser.error("--medical_csv_flush_interval must be at least 1")
-if args_cli.checkpoint_save_freq < 0:
-    parser.error("--checkpoint_save_freq must be nonnegative")
-if args_cli.ppo_n_steps < 1:
-    parser.error("--ppo_n_steps must be positive")
-if args_cli.ppo_batch_size < 1:
-    parser.error("--ppo_batch_size must be positive")
-if args_cli.evaluation_episode_length_s is not None and args_cli.evaluation_episode_length_s <= 0:
-    parser.error("--evaluation_episode_length_s must be positive")
-try:
-    medical_lookahead_offsets = [
-        float(value.strip())
-        for value in args_cli.medical_centerline_lookahead_offsets.split(",")
-        if value.strip()
-    ]
-except ValueError:
-    parser.error("--medical_centerline_lookahead_offsets must contain only numbers")
-if not medical_lookahead_offsets or any(value <= 0 for value in medical_lookahead_offsets):
-    parser.error("--medical_centerline_lookahead_offsets must contain positive values")
-if any(right <= left for left, right in zip(medical_lookahead_offsets, medical_lookahead_offsets[1:])):
-    parser.error("--medical_centerline_lookahead_offsets must be strictly increasing")
 
 # --data_sampling can be combined with --continual_training to reuse the
 # checkpoint-loading/policy-action path without entering model.learn().
@@ -1318,7 +1254,6 @@ data_sampling_colon1_forward_only = (
 data_sampling_no_backward_recovery = (
     args_cli.data_sampling and colon_id_normalized in {"c1", "colon1", "1", "c5", "colon5", "5"}
 )
-disable_recovery_mode = data_sampling_no_backward_recovery or bool(args_cli.rigid_colon)
 
 if args_cli.clip_actions is None:
     args_cli.clip_actions = args_cli.train or args_cli.test or args_cli.continual_training or args_cli.data_sampling
@@ -1353,9 +1288,8 @@ timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 algo_name = args_cli.algo.lower()
 reward_variant_label = args_cli.reward_variant or "legacy_full_reward"
 constraint_label = "constrained" if args_cli.clip_actions else "nonconstrained"
-colon_physics_label = "rigid" if args_cli.rigid_colon else "deformable"
 run_name = (
-    f"{algo_name}_{reward_variant_label}_{constraint_label}_{colon_physics_label}_"
+    f"{algo_name}_{reward_variant_label}_{constraint_label}_"
     f"colon-{args_cli.colon_id}_task-{args_cli.task_id}_seed-{args_cli.seed}_{timestamp}"
 )
 result_dir = args_cli.result_dir or os.path.join("./reward_ablation_results", run_name)
@@ -1404,45 +1338,10 @@ with open(os.path.join(result_dir, "prelaunch_status.json"), "w") as f:
 # Enable cameras (needed for camera sensors)
 args_cli.enable_cameras = True
 
-# Isaac Sim 4.5 can stall while starting the off-screen renderer when a
-# workstation exposes both the NVIDIA render GPU and an integrated GPU.  Keep
-# this workaround local to headless dataset sampling: select the same GPU as
-# Isaac Lab's --device argument and prevent renderer multi-GPU auto-selection.
-# User-supplied Kit settings are retained and take precedence because they are
-# appended after these defaults.
-if args_cli.data_sampling and args_cli.headless:
-    render_gpu = 0
-    if str(args_cli.device).startswith("cuda:"):
-        render_gpu = int(str(args_cli.device).split(":", maxsplit=1)[1])
-    headless_sampling_kit_args = [
-        f"--/renderer/activeGpu={render_gpu}",
-        "--/renderer/multiGpu/enabled=false",
-        "--/renderer/multiGpu/autoEnable=false",
-    ]
-    if args_cli.kit_args:
-        headless_sampling_kit_args.append(args_cli.kit_args)
-    args_cli.kit_args = " ".join(headless_sampling_kit_args)
-
-    # Compatibility fallback for Isaac Sim 4.5 + Isaac Lab 2.1 on Blackwell:
-    # the dedicated `isaaclab.python.headless.rendering.kit` experience can
-    # finish loading its extensions and then hang in SimulationApp startup.
-    # The regular camera experience uses the renderer path that is already
-    # known to work on this host.  SimulationApp still receives headless=True
-    # (and AppLauncher sets hide_ui=True), so no application window is shown.
-    # Preserve an explicitly requested experience for debugging/overrides.
-    if not args_cli.experience:
-        args_cli.experience = "isaaclab.python.rendering.kit"
-
 # Launch omniverse app
-print(
-    f"[ARCGym] Launching Isaac Sim (headless={bool(args_cli.headless)}, "
-    f"cameras={bool(args_cli.enable_cameras)})...",
-    flush=True,
-)
 app_launcher = AppLauncher(args_cli)
 
 simulation_app = app_launcher.app
-print("[ARCGym] Isaac Sim launch complete.", flush=True)
 
 import gymnasium as gym
 
@@ -1456,7 +1355,6 @@ from arcgym.utils.callbacks import (
     RewardAblationMetricsCallback,
     TrajectoryDataSaver,
     SuccessRateDataSaver,
-    BestAndLastRewardCheckpointCallback,
     StopAfterAllEnvsNEpisodesCallback,
     StopAfterTotalEpisodesCallback,
 )
@@ -1504,8 +1402,7 @@ device = args_cli.device
 learning_config = {
     "total_timesteps": args_cli.total_timesteps,
     "learning_rate" : 1e-4,
-    "batch_size" : args_cli.ppo_batch_size,
-    "ppo_n_steps": args_cli.ppo_n_steps,
+    "batch_size" : 1024,
     "verbose" : True,
 }
 robot_config = {
@@ -1529,7 +1426,7 @@ robot_config = {
     "max_angular_velocity": 10,
     #"link_density" : 0.1,
     # Camera and light configuration
-    "camera_resolution" : (int(os.environ.get("ARC_CAMERA_HEIGHT", "256")), int(os.environ.get("ARC_CAMERA_WIDTH", "256"))),
+    "camera_resolution" : (84, 84),
     "front_camera_focal_length" : 5.0, 
     "front_camera_focus_distance" : 10.0, 
     "front_camera_horizontal_aperture" : 20, 
@@ -1609,10 +1506,6 @@ elif use_task_endpose_csv:
 else:
     task_endpose_csv = None
 
-episode_length_s = 40.0 if use_task_endpose_csv else 20000000.0
-if args_cli.test and args_cli.evaluation_episode_length_s is not None:
-    episode_length_s = args_cli.evaluation_episode_length_s
-
 env_config = {
     "discrete_action_space" : False, # currently unsupported TODO: Figure out if this is something we want to be determinable from the outside, or if it is a property of the robot implementation.
     "use_pose" : False,
@@ -1621,14 +1514,13 @@ env_config = {
     "env_spacing" : env_spacing,
     "num_envs" : args_cli.num_envs,
     "colon_id": args_cli.colon_id,
-    "rigid_colon": bool(args_cli.rigid_colon),
     "replicate_physics" : False,
     "action_scale" : 0.001,
     "translation_action_scale" : 0.001,
     "rotation_action_scale" : 0.02 if random_data_sampling else 0.01,
     "forward_increment": 0.0005 if args_cli.data_sampling else 0.001,
     "debug_vis" : False,
-    "episode_length_s" : episode_length_s,
+    "episode_length_s" : 40.0 if use_task_endpose_csv else 20000000.0,
     "constraint_point_A": 1,  # Distance from robot tip to constraint point A along the robot's local z-axis
     "init_from_csv": task_startpose_csv,
     "init_endpose_from_csv": task_endpose_csv,
@@ -1644,9 +1536,7 @@ env_config = {
     "data_sampling_random_actions": random_data_sampling,
     "use_continual_training_action_logic": continual_training_action_mode,
     "disable_automatic_resets": args_cli.data_sampling,
-    # A rigid colon cannot deform in response to contact, so do not replace the
-    # learned policy command with scripted backing/reorientation actions.
-    "disable_recovery_mode": disable_recovery_mode,
+    "disable_recovery_mode": data_sampling_no_backward_recovery,
     "highlight_recover_coverage_threshold": 0.9 if args_cli.data_sampling else 0.5,
     "wall_recovery_brightness_threshold": 0.85,
     "wall_recover_consecutive_threshold": 5 if random_data_sampling else 3,
@@ -1691,7 +1581,7 @@ reward_config = {
     "low_lumen_visibility_threshold": -0.4,
     "low_lumen_reset_penalty": -1.0,
     # Parameters for calculating max_episode_length (used for success criterion)
-    "episode_length_s": episode_length_s,
+    "episode_length_s": 40.0 if use_task_endpose_csv else 2000000.0,
     "decimation": 2,
     "dt": 1.0 / 240.0,
     "success_alignment_ratio": 0.9,  # 90% of steps must have center_alignment > 0.85
@@ -1861,20 +1751,14 @@ config = {
         "algorithm": args_cli.algo,
         "reward_variant": reward_variant_label,
         "constrained": bool(args_cli.clip_actions),
-        "rigid_colon": bool(args_cli.rigid_colon),
-        "recovery_mode_disabled": bool(disable_recovery_mode),
         "colon_id": args_cli.colon_id,
         "task_id": args_cli.task_id,
-        "seed": args_cli.training_seed if args_cli.training_seed is not None else args_cli.seed,
-        "training_seed": args_cli.training_seed if args_cli.training_seed is not None else args_cli.seed,
-        "evaluation_seed": args_cli.seed,
+        "seed": args_cli.seed,
         "timestamp": timestamp,
         "result_dir": result_dir,
         "train_with_normalized_reward": bool(args_cli.train_with_normalized_reward),
         "stop_after_episodes": args_cli.stop_after_episodes,
         "disable_video": bool(args_cli.disable_video),
-        "checkpoint_save_freq": args_cli.checkpoint_save_freq,
-        "save_best_and_last_only": bool(args_cli.save_best_and_last_only),
         "trajectory_save_interval": args_cli.trajectory_save_interval,
         "save_trajectory_images": bool(args_cli.save_trajectory_images),
         "youngs_modulus_mpa": args_cli.youngs_modulus,
@@ -1905,10 +1789,6 @@ config = {
         "medical_run_dir": args_cli.medical_run_dir,
         "medical_data_save": bool(args_cli.data_sampling and not args_cli.disable_medical_data_save),
         "medical_save_images": bool(args_cli.medical_save_images),
-        "medical_centerline_root": args_cli.medical_centerline_root,
-        "medical_centerline_scale": args_cli.medical_centerline_scale,
-        "medical_centerline_lookahead_offsets_m": medical_lookahead_offsets,
-        "medical_csv_flush_interval": args_cli.medical_csv_flush_interval,
         "init_from_csv": task_startpose_csv,
         "init_endpose_from_csv": task_endpose_csv,
     },
@@ -2039,189 +1919,10 @@ def _base_isaac_env(vec_env):
     return base_env() if callable(base_env) else base_env
 
 
-def _normalize_quaternion_wxyz(quaternion):
-    quaternion = np.asarray(quaternion, dtype=np.float64)
-    norm = np.linalg.norm(quaternion, axis=-1, keepdims=True)
-    return quaternion / np.maximum(norm, 1e-12)
-
-
-def _quaternion_conjugate_wxyz(quaternion):
-    result = np.asarray(quaternion, dtype=np.float64).copy()
-    result[..., 1:] *= -1.0
-    return result
-
-
-def _quaternion_multiply_wxyz(left, right):
-    left = np.asarray(left, dtype=np.float64)
-    right = np.asarray(right, dtype=np.float64)
-    lw, lx, ly, lz = np.moveaxis(left, -1, 0)
-    rw, rx, ry, rz = np.moveaxis(right, -1, 0)
-    return np.stack(
-        (
-            lw * rw - lx * rx - ly * ry - lz * rz,
-            lw * rx + lx * rw + ly * rz - lz * ry,
-            lw * ry - lx * rz + ly * rw + lz * rx,
-            lw * rz + lx * ry - ly * rx + lz * rw,
-        ),
-        axis=-1,
-    )
-
-
-def _rotate_vectors_wxyz(quaternion, vectors):
-    """Rotate vectors by a wxyz quaternion, with NumPy broadcasting."""
-    quaternion = _normalize_quaternion_wxyz(quaternion)
-    vectors = np.asarray(vectors, dtype=np.float64)
-    q_vector = quaternion[..., 1:]
-    q_scalar = quaternion[..., :1]
-    cross = np.cross(q_vector, vectors)
-    return vectors + 2.0 * (q_scalar * cross + np.cross(q_vector, cross))
-
-
-def _inverse_rotate_vectors_wxyz(quaternion, vectors):
-    return _rotate_vectors_wxyz(_quaternion_conjugate_wxyz(quaternion), vectors)
-
-
-def _relative_camera_pose(previous_position, previous_quaternion, position, quaternion):
-    """Return T_previous_camera_current_camera in the previous ROS camera frame."""
-    previous_quaternion = _normalize_quaternion_wxyz(previous_quaternion)
-    quaternion = _normalize_quaternion_wxyz(quaternion)
-    translation = _inverse_rotate_vectors_wxyz(
-        previous_quaternion,
-        np.asarray(position, dtype=np.float64) - np.asarray(previous_position, dtype=np.float64),
-    )
-    rotation = _normalize_quaternion_wxyz(
-        _quaternion_multiply_wxyz(_quaternion_conjugate_wxyz(previous_quaternion), quaternion)
-    )
-    # q and -q encode the same rotation. Canonicalizing avoids discontinuous labels.
-    if rotation[0] < 0.0:
-        rotation = -rotation
-    return translation, rotation
-
-
-def _quaternion_to_rotation_matrix_wxyz(quaternion):
-    w, x, y, z = _normalize_quaternion_wxyz(quaternion)
-    return np.asarray(
-        [
-            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
-            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
-            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
-        ],
-        dtype=np.float64,
-    )
-
-
-def _load_centerline_csv(path):
-    table = np.genfromtxt(path, delimiter=",", names=True, dtype=np.float64)
-    if table.dtype.names is None or not {"x", "y", "z"}.issubset(table.dtype.names):
-        raise ValueError(f"Centerline CSV must have x,y,z columns: {path}")
-    points = np.column_stack((table["x"], table["y"], table["z"]))
-    points = np.atleast_2d(points)
-    if len(points) < 2 or not np.isfinite(points).all():
-        raise ValueError(f"Centerline must contain at least two finite points: {path}")
-    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
-    keep = np.concatenate(([True], segment_lengths > 1e-10))
-    points = points[keep]
-    if len(points) < 2:
-        raise ValueError(f"Centerline contains no non-zero-length segments: {path}")
-    return points
-
-
-class CenterlineConditioner:
-    """Express a static reference centerline locally in the current ROS camera frame."""
-
-    def __init__(
-        self,
-        source_path,
-        mesh_scale,
-        colon_position,
-        colon_quaternion,
-        lookahead_count,
-        lookahead_spacing,
-    ):
-        self.source_path = os.path.abspath(os.path.expanduser(source_path))
-        source_points = _load_centerline_csv(self.source_path) * float(mesh_scale)
-        rotation = _quaternion_to_rotation_matrix_wxyz(colon_quaternion)
-        # Deformable-mesh rotation is baked into the source vertices by isaac_mesh.py.
-        # Translation is applied later from the colon asset's actual root_pos_w.
-        self.reference_points = source_points @ rotation.T
-        self.fallback_colon_position = np.asarray(colon_position, dtype=np.float64)
-        self.lookahead_count = int(lookahead_count)
-        self.lookahead_spacing = float(lookahead_spacing)
-        self._oriented_points = {}
-
-    @staticmethod
-    def _arc_lengths(points):
-        return np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))))
-
-    def _points_for_environment(self, env_idx, colon_world_position, camera_position):
-        if env_idx not in self._oriented_points:
-            points = self.reference_points + np.asarray(colon_world_position, dtype=np.float64)
-            # The extraction route has no anatomical direction. Sampling begins near
-            # the insertion side, so orient the route from the nearer endpoint.
-            if np.linalg.norm(camera_position - points[-1]) < np.linalg.norm(camera_position - points[0]):
-                points = points[::-1].copy()
-            self._oriented_points[env_idx] = points
-        return self._oriented_points[env_idx]
-
-    def condition(self, env_idx, colon_world_position, camera_position, camera_quaternion_ros):
-        points = self._points_for_environment(env_idx, colon_world_position, camera_position)
-        starts = points[:-1]
-        segments = np.diff(points, axis=0)
-        squared_lengths = np.einsum("ij,ij->i", segments, segments)
-        fractions = np.einsum("ij,ij->i", camera_position - starts, segments) / np.maximum(
-            squared_lengths, 1e-12
-        )
-        fractions = np.clip(fractions, 0.0, 1.0)
-        projections = starts + fractions[:, None] * segments
-        segment_idx = int(np.argmin(np.linalg.norm(projections - camera_position, axis=1)))
-        closest_world = projections[segment_idx]
-
-        arc = self._arc_lengths(points)
-        progress_m = float(arc[segment_idx] + fractions[segment_idx] * np.sqrt(squared_lengths[segment_idx]))
-        total_length_m = float(arc[-1])
-        target_arc = np.minimum(
-            progress_m + np.arange(self.lookahead_count, dtype=np.float64) * self.lookahead_spacing,
-            total_length_m,
-        )
-        lookahead_world = np.column_stack(
-            [np.interp(target_arc, arc, points[:, dimension]) for dimension in range(3)]
-        )
-
-        tangent_world = segments[segment_idx] / max(np.sqrt(squared_lengths[segment_idx]), 1e-12)
-        closest_camera = _inverse_rotate_vectors_wxyz(
-            camera_quaternion_ros, closest_world - camera_position
-        )
-        tangent_camera = _inverse_rotate_vectors_wxyz(camera_quaternion_ros, tangent_world)
-        lookahead_camera = _inverse_rotate_vectors_wxyz(
-            camera_quaternion_ros, lookahead_world - camera_position
-        )
-        return {
-            "centerline_progress_m": progress_m,
-            "centerline_progress_normalized": progress_m / max(total_length_m, 1e-12),
-            "centerline_remaining_m": max(0.0, total_length_m - progress_m),
-            "centerline_lateral_distance_m": float(np.linalg.norm(closest_world - camera_position)),
-            "centerline_closest_camera": closest_camera,
-            "centerline_tangent_camera": tangent_camera,
-            "centerline_lookahead_camera": lookahead_camera,
-        }
-
-
 class MedicalTrainingDataWriter:
-    """Stream WAM transitions with relative camera pose and local centerline context."""
+    """Stream synchronized data-sampling frames, actions, rewards, and ROI labels."""
 
-    def __init__(
-        self,
-        save_root,
-        result_dir,
-        config,
-        action_dim,
-        centerline_path,
-        centerline_scale,
-        centerline_lookahead_points,
-        centerline_lookahead_spacing,
-        save_images=True,
-        run_dir=None,
-    ):
+    def __init__(self, save_root, result_dir, config, action_dim, save_images=True, run_dir=None):
         self.save_root = os.path.abspath(os.path.expanduser(save_root))
         if run_dir is None:
             self.run_id = _sanitize_dataset_component(result_dir)
@@ -2232,20 +1933,6 @@ class MedicalTrainingDataWriter:
         self.save_images = bool(save_images)
         self.action_dim = int(action_dim)
         self.sample_index = 0
-        self.previous_camera_poses = {}
-        self.env_episode_ids = {}
-        self.env_episode_steps = {}
-
-        colon_position = config["env_config"].get("colon_init_pos", (0.5, 0.5, 0.1))
-        colon_quaternion = config["env_config"].get("colon_init_rot", (1.0, 0.0, 0.0, 0.0))
-        self.centerline = CenterlineConditioner(
-            source_path=centerline_path,
-            mesh_scale=centerline_scale,
-            colon_position=colon_position,
-            colon_quaternion=colon_quaternion,
-            lookahead_count=centerline_lookahead_points,
-            lookahead_spacing=centerline_lookahead_spacing,
-        )
 
         os.makedirs(self.run_dir, exist_ok=True)
         self.env_dirs = {}
@@ -2261,12 +1948,9 @@ class MedicalTrainingDataWriter:
             self.env_image_dirs[env_idx] = image_dir
             self.env_csv_paths[env_idx] = os.path.join(env_dir, "samples.csv")
             self.env_sample_indices[env_idx] = 0
-            self.env_episode_ids[env_idx] = 0
-            self.env_episode_steps[env_idx] = 0
 
         metadata = {
-            "dataset_type": "centerline_conditioned_wam_transitions",
-            "schema_version": 2,
+            "dataset_type": "sim4medical_training_data",
             "run_id": self.run_id,
             "result_dir": result_dir,
             "colon_id": config["run_config"]["colon_id"],
@@ -2275,27 +1959,8 @@ class MedicalTrainingDataWriter:
             "model_path": config["run_config"].get("model_path"),
             "action_columns": [f"action_{idx}" for idx in range(self.action_dim)],
             "policy_action_columns": [f"policy_action_{idx}" for idx in range(self.action_dim)],
-            "action_definition": (
-                "Executed post-constraint action that produced the current row from the previous row. "
-                "Rows with relative_pose_valid=false must not be used as transition targets."
-            ),
+            "action_definition": "Executed post-constraint action at the same timestep as the saved image and reward.",
             "roi_definition": "ROI centroid from the high-depth lumen region, relative to image center. x>0 is right, y>0 is down.",
-            "camera_pose_definition": (
-                "camera_world_* is the diagnostic camera-to-world pose in Isaac Lab ROS camera convention "
-                "(camera +x right, +y down, +z forward), quaternion wxyz."
-            ),
-            "relative_pose_definition": (
-                "delta_camera_* is inv(T_world_camera_previous) @ T_world_camera_current; "
-                "translation and rotation are expressed in the previous ROS camera frame."
-            ),
-            "centerline_definition": (
-                "An undeformed reference centerline transformed from the source OBJ mesh frame into the "
-                "current ROS camera frame. Look-ahead point 0 is the closest projected centerline point."
-            ),
-            "centerline_source_path": self.centerline.source_path,
-            "centerline_mesh_to_world_scale": float(centerline_scale),
-            "centerline_lookahead_points": int(centerline_lookahead_points),
-            "centerline_lookahead_spacing_m": float(centerline_lookahead_spacing),
             "csv_layout": "One samples.csv per environment directory. image_path is relative to that environment directory.",
             "env_csv_paths": {
                 f"env_{env_idx:03d}": os.path.relpath(csv_path, self.run_dir)
@@ -2309,34 +1974,7 @@ class MedicalTrainingDataWriter:
             "sample_index",
             "vec_step",
             "env_idx",
-            "episode_id",
-            "episode_step",
             "image_path",
-            "relative_pose_valid",
-            "camera_world_x",
-            "camera_world_y",
-            "camera_world_z",
-            "camera_world_quat_w",
-            "camera_world_quat_x",
-            "camera_world_quat_y",
-            "camera_world_quat_z",
-            "delta_camera_x",
-            "delta_camera_y",
-            "delta_camera_z",
-            "delta_camera_quat_w",
-            "delta_camera_quat_x",
-            "delta_camera_quat_y",
-            "delta_camera_quat_z",
-            "centerline_progress_m",
-            "centerline_progress_normalized",
-            "centerline_remaining_m",
-            "centerline_lateral_distance_m",
-            "centerline_closest_camera_x",
-            "centerline_closest_camera_y",
-            "centerline_closest_camera_z",
-            "centerline_tangent_camera_x",
-            "centerline_tangent_camera_y",
-            "centerline_tangent_camera_z",
             "normalized_reward",
             "raw_step_reward",
             "env_reward",
@@ -2354,10 +1992,6 @@ class MedicalTrainingDataWriter:
         ]
         self.fieldnames.extend(f"action_{idx}" for idx in range(self.action_dim))
         self.fieldnames.extend(f"policy_action_{idx}" for idx in range(self.action_dim))
-        for point_idx in range(self.centerline.lookahead_count):
-            self.fieldnames.extend(
-                f"centerline_lookahead_{point_idx}_{axis}" for axis in ("x", "y", "z")
-            )
 
         self._csv_files = {}
         self._writers = {}
@@ -2376,47 +2010,11 @@ class MedicalTrainingDataWriter:
             row[f"{prefix}_{idx}"] = float(values[idx]) if idx < len(values) else None
         return row
 
-    def write_step(
-        self,
-        vec_step,
-        policy_actions,
-        executed_actions,
-        rewards,
-        dones,
-        infos,
-        base_env,
-        colon_id,
-        task_id,
-    ):
+    def write_step(self, vec_step, policy_actions, executed_actions, rewards, infos, base_env, colon_id, task_id):
         rgb_images = _numpy_from_value(getattr(base_env, "_camera_data", None)) if base_env is not None else None
         policy_actions_np = _batched_action_array(policy_actions, len(infos))
         executed_actions_np = _batched_action_array(executed_actions, len(infos))
         rewards_np = np.asarray(rewards, dtype=np.float64).reshape(-1)
-        dones_np = np.asarray(dones, dtype=bool).reshape(-1)
-
-        camera = getattr(getattr(base_env, "robot", None), "egocamera", None)
-        camera_data = getattr(camera, "data", None)
-        camera_positions = _numpy_from_value(getattr(camera_data, "pos_w", None))
-        camera_quaternions = _numpy_from_value(getattr(camera_data, "quat_w_ros", None))
-        if camera_positions is None or camera_quaternions is None:
-            raise RuntimeError(
-                "Centerline-conditioned WAM sampling requires egocamera.data.pos_w and quat_w_ros"
-            )
-        camera_positions = np.asarray(camera_positions, dtype=np.float64)
-        camera_quaternions = _normalize_quaternion_wxyz(camera_quaternions)
-
-        scene = getattr(base_env, "scene", None)
-        env_origins = _numpy_from_value(getattr(scene, "env_origins", None))
-        if env_origins is None:
-            env_origins = np.zeros((len(infos), 3), dtype=np.float64)
-        env_origins = np.asarray(env_origins, dtype=np.float64)
-        colon_asset = getattr(getattr(base_env, "colon", None), "colon_body", None)
-        colon_positions = _numpy_from_value(
-            getattr(getattr(colon_asset, "data", None), "root_pos_w", None)
-        )
-        if colon_positions is None:
-            colon_positions = env_origins + self.centerline.fallback_colon_position
-        colon_positions = np.asarray(colon_positions, dtype=np.float64)
 
         for env_idx, info in enumerate(infos):
             image_rel_path = ""
@@ -2432,59 +2030,11 @@ class MedicalTrainingDataWriter:
             if normalized_reward is None and env_idx < len(rewards_np):
                 normalized_reward = float(np.clip(rewards_np[env_idx], -1.0, 1.0))
 
-            camera_position = camera_positions[env_idx]
-            camera_quaternion = camera_quaternions[env_idx]
-            previous_pose = self.previous_camera_poses.get(env_idx)
-            relative_pose_valid = previous_pose is not None
-            if relative_pose_valid:
-                delta_position, delta_quaternion = _relative_camera_pose(
-                    previous_pose[0], previous_pose[1], camera_position, camera_quaternion
-                )
-            else:
-                delta_position = np.zeros(3, dtype=np.float64)
-                delta_quaternion = np.asarray((1.0, 0.0, 0.0, 0.0), dtype=np.float64)
-
-            colon_position = (
-                colon_positions[env_idx]
-                if env_idx < len(colon_positions)
-                else self.centerline.fallback_colon_position
-            )
-            centerline = self.centerline.condition(
-                env_idx, colon_position, camera_position, camera_quaternion
-            )
-
             row = {
                 "sample_index": int(self.env_sample_indices.get(env_idx, 0)),
                 "vec_step": int(vec_step),
                 "env_idx": int(env_idx),
-                "episode_id": int(self.env_episode_ids.get(env_idx, 0)),
-                "episode_step": int(self.env_episode_steps.get(env_idx, 0)),
                 "image_path": image_rel_path,
-                "relative_pose_valid": bool(relative_pose_valid),
-                "camera_world_x": float(camera_position[0]),
-                "camera_world_y": float(camera_position[1]),
-                "camera_world_z": float(camera_position[2]),
-                "camera_world_quat_w": float(camera_quaternion[0]),
-                "camera_world_quat_x": float(camera_quaternion[1]),
-                "camera_world_quat_y": float(camera_quaternion[2]),
-                "camera_world_quat_z": float(camera_quaternion[3]),
-                "delta_camera_x": float(delta_position[0]),
-                "delta_camera_y": float(delta_position[1]),
-                "delta_camera_z": float(delta_position[2]),
-                "delta_camera_quat_w": float(delta_quaternion[0]),
-                "delta_camera_quat_x": float(delta_quaternion[1]),
-                "delta_camera_quat_y": float(delta_quaternion[2]),
-                "delta_camera_quat_z": float(delta_quaternion[3]),
-                "centerline_progress_m": centerline["centerline_progress_m"],
-                "centerline_progress_normalized": centerline["centerline_progress_normalized"],
-                "centerline_remaining_m": centerline["centerline_remaining_m"],
-                "centerline_lateral_distance_m": centerline["centerline_lateral_distance_m"],
-                "centerline_closest_camera_x": float(centerline["centerline_closest_camera"][0]),
-                "centerline_closest_camera_y": float(centerline["centerline_closest_camera"][1]),
-                "centerline_closest_camera_z": float(centerline["centerline_closest_camera"][2]),
-                "centerline_tangent_camera_x": float(centerline["centerline_tangent_camera"][0]),
-                "centerline_tangent_camera_y": float(centerline["centerline_tangent_camera"][1]),
-                "centerline_tangent_camera_z": float(centerline["centerline_tangent_camera"][2]),
                 "normalized_reward": normalized_reward,
                 "raw_step_reward": _float_from_info(info, "raw_step_reward"),
                 "env_reward": float(rewards_np[env_idx]) if env_idx < len(rewards_np) else None,
@@ -2504,23 +2054,9 @@ class MedicalTrainingDataWriter:
             policy_values = policy_actions_np[env_idx] if policy_actions_np is not None and env_idx < len(policy_actions_np) else None
             row.update(self._action_fields("action", executed_values))
             row.update(self._action_fields("policy_action", policy_values))
-            for point_idx, point in enumerate(centerline["centerline_lookahead_camera"]):
-                for axis_idx, axis in enumerate(("x", "y", "z")):
-                    row[f"centerline_lookahead_{point_idx}_{axis}"] = float(point[axis_idx])
             self._writers[env_idx].writerow(row)
             self.env_sample_indices[env_idx] = self.env_sample_indices.get(env_idx, 0) + 1
-            self.env_episode_steps[env_idx] = self.env_episode_steps.get(env_idx, 0) + 1
             self.sample_index += 1
-
-            if env_idx < len(dones_np) and dones_np[env_idx]:
-                self.previous_camera_poses.pop(env_idx, None)
-                self.env_episode_ids[env_idx] = self.env_episode_ids.get(env_idx, 0) + 1
-                self.env_episode_steps[env_idx] = 0
-            else:
-                self.previous_camera_poses[env_idx] = (
-                    camera_position.copy(),
-                    camera_quaternion.copy(),
-                )
         for csv_file in self._csv_files.values():
             csv_file.flush()
 
@@ -2622,8 +2158,6 @@ def run_deterministic_evaluation(model, env, num_episodes, output_dir):
         "model_path": args_cli.model_path,
         "test_episodes": int(num_episodes),
         "episodes_completed": int(episodes_completed),
-        "episode_length_s": float(env_config["episode_length_s"]),
-        "max_episode_steps": int(getattr(env.unwrapped, "max_episode_length", 0)),
         "total_env_steps": int(total_steps),
         "success_rate": float(np.mean(episode_successes)) if episode_successes else 0.0,
         "normalized_progress": mean_or_none("normalized_progress"),
@@ -2645,12 +2179,9 @@ def run_deterministic_evaluation(model, env, num_episodes, output_dir):
         "episode_successes": episode_successes,
         "reward_variant": reward_variant_label,
         "constrained": bool(args_cli.clip_actions),
-        "rigid_colon": bool(args_cli.rigid_colon),
         "colon_id": args_cli.colon_id,
         "task_id": args_cli.task_id,
-        "seed": args_cli.training_seed if args_cli.training_seed is not None else args_cli.seed,
-        "training_seed": args_cli.training_seed if args_cli.training_seed is not None else args_cli.seed,
-        "evaluation_seed": args_cli.seed,
+        "seed": args_cli.seed,
         "algorithm": args_cli.algo,
     }
     results_path = os.path.join(output_dir, "evaluation_metrics.json")
@@ -2690,7 +2221,7 @@ elif args_cli.algo == "PPO":
         seed=args_cli.seed,
         learning_rate=learning_config["learning_rate"],
         batch_size=learning_config["batch_size"],
-        n_steps=learning_config["ppo_n_steps"],
+        n_steps=2048,
         clip_range=0.2,
         ent_coef=0.1,
         n_epochs=64,
@@ -2867,6 +2398,12 @@ if continual_training_mode and args_cli.cross_colon_eval_only:
             indent=2,
         )
 elif args_cli.train or continual_training_mode:
+    checkpoint_callback = CheckpointCallback(
+        save_freq=10000, # Save every 10k steps
+        save_path=model_save_path,
+        name_prefix=f"{algo_name}_arc_checkpoint_{timestamp}"
+    )
+
     log_callback = LogEveryNTimesteps(n_steps=500)
 
     per_env_reward_callback = PerEnvRewardCallback(
@@ -2898,30 +2435,13 @@ elif args_cli.train or continual_training_mode:
     )
 
     callbacks = [
+        checkpoint_callback,
         log_callback,
         per_env_reward_callback,
         reward_ablation_callback,
         trajectory_callback,
         success_rate_callback,
     ]
-    if args_cli.save_best_and_last_only:
-        callbacks.append(
-            BestAndLastRewardCheckpointCallback(
-                save_dir=model_save_path,
-                name_prefix=f"{algo_name}_arc",
-                window_episodes=10,
-                verbose=1,
-            )
-        )
-    if args_cli.checkpoint_save_freq > 0:
-        callbacks.insert(
-            0,
-            CheckpointCallback(
-                save_freq=args_cli.checkpoint_save_freq,
-                save_path=model_save_path,
-                name_prefix=f"{algo_name}_arc_checkpoint_{timestamp}",
-            ),
-        )
     if args_cli.stop_after_episodes is not None:
         callbacks.append(
             StopAfterTotalEpisodesCallback(
@@ -2966,11 +2486,7 @@ elif args_cli.train or continual_training_mode:
                     logging.warning(f"Callback finalization failed for {type(callback).__name__}: {exc}")
 
     final_suffix = "failed" if training_error is not None else "interrupted" if interrupted else "final"
-    final_model_path = (
-        os.path.join(model_save_path, f"{algo_name}_arc_last")
-        if args_cli.save_best_and_last_only
-        else os.path.join(model_save_path, f"{algo_name}_arc_{final_suffix}_{timestamp}")
-    )
+    final_model_path = os.path.join(model_save_path, f"{algo_name}_arc_{final_suffix}_{timestamp}")
     model.save(final_model_path)
     logging.info(f"{final_suffix.capitalize()} model saved to: {final_model_path}")
     run_status = {
@@ -3032,41 +2548,13 @@ elif args_cli.data_sampling:
     medical_writer = None
     action_dim = int(np.prod(env.action_space.shape))
     if not args_cli.disable_medical_data_save:
-        from arcgym.utils.wam_sampling import RGBWAMDatasetWriter
-
-        colon_suffix = (
-            args_cli.colon_id[1:]
-            if args_cli.colon_id.lower().startswith("c")
-            else args_cli.colon_id
-        )
-        centerline_path = os.path.join(
-            os.path.abspath(os.path.expanduser(args_cli.medical_centerline_root)),
-            f"sampling_colon{colon_suffix}",
-            "centerline.csv",
-        )
-        if not os.path.isfile(centerline_path):
-            raise FileNotFoundError(
-                f"Centerline-conditioned sampling requires {centerline_path}. "
-                "Generate the files with: python scripts/extract_colon_centerlines.py "
-                f"--output-root {args_cli.medical_centerline_root}"
-            )
-        centerline_scale = args_cli.medical_centerline_scale
-        if centerline_scale is None:
-            centerline_scale = 0.001 if robot_config["robot_type"] == "capsule" else 0.01
-        base_env = _base_isaac_env(env)
-        medical_writer = RGBWAMDatasetWriter(
+        medical_writer = MedicalTrainingDataWriter(
             save_root=args_cli.medical_data_dir,
             result_dir=result_dir,
-            run_dir=args_cli.medical_run_dir,
             config=config,
             action_dim=action_dim,
-            base_env=base_env,
-            centerline_path=centerline_path,
-            centerline_scale=centerline_scale,
-            lookahead_offsets_m=medical_lookahead_offsets,
-            save_rgb=args_cli.medical_save_images,
-            flush_interval=args_cli.medical_csv_flush_interval,
-            repository_root=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            save_images=args_cli.medical_save_images,
+            run_dir=args_cli.medical_run_dir,
         )
         logging.info("Medical training data will be saved to: %s", medical_writer.run_dir)
 
@@ -3089,26 +2577,12 @@ elif args_cli.data_sampling:
             obs, reward, done, info = env.step(actions)
             if medical_writer is not None:
                 base_env = _base_isaac_env(env)
-                executed_actions = getattr(
-                    base_env, "data_sampling_executed_actions", getattr(base_env, "actions", actions)
-                ) if base_env is not None else actions
-                stored_policy_actions = getattr(
-                    base_env, "data_sampling_policy_actions", actions
-                ) if base_env is not None else actions
-                pre_constraint_actions = getattr(
-                    base_env, "data_sampling_pre_constraint_actions", executed_actions
-                ) if base_env is not None else executed_actions
-
-                # Timeline: the environment has just executed action_i and refreshed
-                # RGB_i/camera_pose_i. Therefore this row stores action_i and the
-                # post-step frame i; its source observation/conditioning is row i-1.
+                executed_actions = getattr(base_env, "actions", actions) if base_env is not None else actions
                 medical_writer.write_step(
                     vec_step=vec_step,
-                    policy_actions=stored_policy_actions,
-                    pre_constraint_actions=pre_constraint_actions,
+                    policy_actions=actions,
                     executed_actions=executed_actions,
                     rewards=reward,
-                    dones=done,
                     infos=info,
                     base_env=base_env,
                     colon_id=args_cli.colon_id,
@@ -3175,7 +2649,7 @@ elif args_cli.data_sampling:
             )
 else:
     from arcgym.utils.teleop_mode import run_teleoperation_mode
-    run_teleoperation_mode(env, simulation_app, device=device, headless=bool(args_cli.headless))
+    run_teleoperation_mode(env, simulation_app, device=device)
 
 try:
     env.close()

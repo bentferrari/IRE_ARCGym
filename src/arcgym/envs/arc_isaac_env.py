@@ -307,7 +307,7 @@ class ARCIsaacEnv(DirectRLEnv):
             cfg1=self.config,
             init_pos=colon_init_pos,
             init_rot=colon_init_rot,
-            is_rigid=False,
+            is_rigid=bool(self.env_config.get("rigid_colon", False)),
         )
 
         # Pass colon reference to robot for stress calculation
@@ -504,6 +504,15 @@ class ARCIsaacEnv(DirectRLEnv):
         if self.env_config.get("data_sampling_random_actions", self.env_config.get("data_sampling_mode", False)):
             actions = 2.0 * torch.rand_like(actions) - 1.0
 
+        # Sampling-only provenance. These buffers do not participate in control;
+        # they expose the actual raw command and scaled pre-constraint command so
+        # the dataset can distinguish policy output from the executed action.
+        if self.env_config.get("data_sampling_mode", False) or self.env_config.get(
+            "data_sampling_policy_actions", False
+        ):
+            self.data_sampling_policy_actions = actions.detach().clone()
+            self._data_sampling_cached_substep_action = None
+
         scaled_actions = actions.clone()
 
         robot_type = self.robot_config.get("robot_type", "magnetic_endoscope")
@@ -526,6 +535,12 @@ class ARCIsaacEnv(DirectRLEnv):
         # Store the scaled actions BEFORE clipping for reward computation
         # This ensures PPO trains on the actions it actually outputs
         self.actions = scaled_actions
+        if self.env_config.get("data_sampling_mode", False) or self.env_config.get(
+            "data_sampling_policy_actions", False
+        ):
+            self.data_sampling_pre_constraint_actions = (
+                scaled_actions.detach().clone() * int(self.cfg.decimation)
+            )
 
         # Update lumen visibility counter and trigger backward motion if needed
         self._update_lumen_visibility_tracking()
@@ -862,6 +877,19 @@ class ARCIsaacEnv(DirectRLEnv):
 
         actions_to_apply = self.actions.clone()
         robot_type = self.robot_config.get("robot_type", "magnetic_endoscope")
+        data_sampling = self.env_config.get("data_sampling_mode", False) or self.env_config.get(
+            "data_sampling_policy_actions", False
+        )
+
+        # DirectRLEnv invokes _apply_action once per physics substep. In sampling,
+        # constrain the command once and replay it across all substeps so one CSV
+        # row has one unambiguous aggregate physical action.
+        cached_sampling_action = getattr(self, "_data_sampling_cached_substep_action", None)
+        if data_sampling and cached_sampling_action is not None:
+            actions_to_apply = cached_sampling_action.clone()
+            self.actions = actions_to_apply
+            self.robot.apply_action(actions_to_apply)
+            return
 
         # Determine forward/translate action index based on robot type
         # 4-DOF: [translate, twist, yaw, pitch] - translate is index 0
@@ -886,6 +914,11 @@ class ARCIsaacEnv(DirectRLEnv):
         # CRITICAL: Update self.actions to the executed version for reward computation
         # This ensures PPO learns about the actions that were actually executed
         self.actions = actions_to_apply
+        if data_sampling:
+            self._data_sampling_cached_substep_action = actions_to_apply.detach().clone()
+            self.data_sampling_executed_actions = (
+                actions_to_apply.detach().clone() * int(self.cfg.decimation)
+            )
 
         # Pass to robot (actions are already constrained)
         self.robot.apply_action(actions_to_apply)
